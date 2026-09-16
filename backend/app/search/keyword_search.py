@@ -14,6 +14,7 @@ Search strategy per function:
   3. LIKE fallback (FTS5 virtual table missing or corrupt) — last resort
 """
 import re
+import math
 from typing import List, Dict, Any
 from app.database.session import db_all
 from app.search.constants import STOPWORDS
@@ -25,8 +26,18 @@ def extract_query_tokens(query: str) -> List[str]:
 
 
 def _rank_to_score(rank: float) -> float:
-    """Convert FTS5 rank (negative BM25) to a [0, 1) relevance score."""
-    return round(1.0 / (1.0 + abs(float(rank))), 4)
+    """Convert FTS5 rank (negative BM25) to a [0, 1) relevance score.
+
+    FTS5 rank is negative BM25: lower (more negative) = stronger match.
+    Uses log-scale so the score grows with BM25 magnitude:
+      abs(rank) = 0.10  →  ~0.19  (weak hit)
+      abs(rank) = 1.0   →  ~0.50  (moderate hit)
+      abs(rank) = 5.0   →  ~0.83  (strong hit)
+      abs(rank) = 10.0  →  ~0.91  (very strong hit)
+    Formula: log1p(v) / (1 + log1p(v)) where v = abs(rank)
+    """
+    v = abs(float(rank))
+    return round(min(0.99, math.log1p(v) / (1.0 + math.log1p(v))), 4)
 
 
 def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:

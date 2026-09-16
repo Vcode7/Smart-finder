@@ -23,6 +23,7 @@ from app.search.context_expander import expand_document_chunk, expand_transcript
 from app.search.face_detector import detect_faces_in_image, search_face_embeddings
 from app.search.query_understanding import understand_multimodal_query, generate_enhanced_internet_query, detect_file_category
 from app.search.multimodal_retrieval import search_by_multimodal_signals, search_by_text
+from app.search.constants import COMPOSITE_MIN_SCORE
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -326,9 +327,18 @@ async def smart_search(request: Request):
     ]
     all_local_matches.sort(key=lambda x: x.get("relevanceScore", 0), reverse=True)
 
-    # 2. Extract context & generate enriched query
+    # 2. Determine internet search query.
+    # IMPORTANT: anchor to the original user text query when present.
+    # Local matches are used only for supplemental entity enrichment (image/doc-upload case).
+    # Previously the LLM was free to replace the query with the top local match title,
+    # causing query bleed (e.g., "narendra modi" → "SSC Chairman S Kishore").
     enhanced = await generate_enhanced_internet_query(signals, all_local_matches)
-    target_internet_query = enhanced.get("primaryQuery") or query_text or "AI Research Intelligence"
+    if query_text.strip():
+        # Text query present — user intent is explicit; keep it as the primary anchor
+        target_internet_query = query_text.strip()
+    else:
+        # Image/document upload with no text — use LLM-enriched query from local context
+        target_internet_query = enhanced.get("primaryQuery") or "AI Research Intelligence"
 
     # 3. Multi-category internet search (if enabled)
     internet_web = []
@@ -408,18 +418,17 @@ async def smart_search(request: Request):
                 })
 
     # 4. Relative Similarity Threshold Filtering
-    all_scores = [m.get("relevanceScore", 0.0) for m in all_local_matches]
-    if enable_internet:
-        all_scores.extend([
-            it.get("relevanceScore", 0.0)
-            for it in (internet_web + internet_news + internet_papers + internet_videos + internet_images)
-        ])
-    top_score = max(all_scores, default=0.0)
-    min_score = max(0.0, round(top_score - relative_threshold, 4))
+    # IMPORTANT: compute top_score from LOCAL results only.
+    # Internet results use hardcoded scores (0.88-0.92); mixing them would raise min_score
+    # to ~0.72 and wipe all local results that scored below that bar.
+    local_only_scores = [m.get("relevanceScore", 0.0) for m in all_local_matches]
+    top_local_score = max(local_only_scores, default=0.0)
+    # Floor at COMPOSITE_MIN_SCORE to avoid over-filtering when index has few results
+    min_score = max(COMPOSITE_MIN_SCORE, round(top_local_score - relative_threshold, 4))
 
     total_before = len(all_local_matches) + (len(internet_web) + len(internet_news) + len(internet_papers) + len(internet_videos) + len(internet_images) if enable_internet else 0)
 
-    # Apply threshold filtering to local results
+    # Apply threshold filtering to local results only
     filtered_documents = [d for d in local_res.get("documents", []) if d.get("relevanceScore", 0.0) >= min_score]
     filtered_videos = [v for v in local_res.get("videos", []) if v.get("relevanceScore", 0.0) >= min_score]
     filtered_images = [i for i in local_res.get("images", []) if i.get("relevanceScore", 0.0) >= min_score]
@@ -427,20 +436,15 @@ async def smart_search(request: Request):
     all_local_matches = [m for m in all_local_matches if m.get("relevanceScore", 0.0) >= min_score]
     local_total = len(filtered_documents) + len(filtered_videos) + len(filtered_images) + len(filtered_audio)
 
-    # Apply threshold filtering to internet results if enabled
+    # Internet results are pre-ranked by provider — no threshold filtering needed
     if enable_internet:
-        internet_web = [it for it in internet_web if it.get("relevanceScore", 0.0) >= min_score]
-        internet_news = [it for it in internet_news if it.get("relevanceScore", 0.0) >= min_score]
-        internet_papers = [it for it in internet_papers if it.get("relevanceScore", 0.0) >= min_score]
-        internet_videos = [it for it in internet_videos if it.get("relevanceScore", 0.0) >= min_score]
-        internet_images = [it for it in internet_images if it.get("relevanceScore", 0.0) >= min_score]
         internet_total = len(internet_web) + len(internet_news) + len(internet_papers) + len(internet_videos) + len(internet_images)
     else:
         internet_total = 0
 
     total_after = local_total + internet_total
 
-    print(f"[SmartSearch Threshold] top_score={top_score:.4f}, configured_threshold={relative_threshold:.4f}, min_score={min_score:.4f}, results_before={total_before}, results_after={total_after}")
+    print(f"[SmartSearch Threshold] top_local_score={top_local_score:.4f}, configured_threshold={relative_threshold:.4f}, min_score={min_score:.4f}, results_before={total_before}, results_after={total_after}")
 
     discovery_trace = {
         "inputType": signals.get("queryType"),

@@ -1,6 +1,10 @@
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
+
+# Number of FAISS candidates to retrieve for scoring.
+# Decoupled from output limit so results ranked 10-50 are not silently dropped.
+_FAISS_RECALL_K = 50
 from app.database.session import db_all, db_get
 from app.search.model_pipeline import (
     get_text_embedding,
@@ -107,7 +111,20 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
         max_img_vec = max(image_vec_scores, default=0.0)
         max_face_vec = max(face_vec_scores, default=0.0)
         max_phash = max(phash_scores, default=0.0)
-        max_fts = max(fts_scores, default=0.0)
+
+        # Per-source FTS score: best chunk score + small soft-max boost
+        # when multiple strong chunks match (rewards broad textual coverage).
+        if fts_scores:
+            raw_max_fts = max(fts_scores)
+            if len(fts_scores) > 1:
+                # Soft boost: up to +0.05 proportional to how many extra chunks matched
+                extra = min(len(fts_scores) - 1, 5)  # cap at 5 extra chunks
+                boost = 0.01 * extra * (1.0 - raw_max_fts)  # shrinks as score approaches 1
+                max_fts = min(0.99, raw_max_fts + boost)
+            else:
+                max_fts = raw_max_fts
+        else:
+            max_fts = 0.0
 
         # Baseline vector / semantic score
         # Only fold face score into vector_score when the query actually carries a face signal (#9)
@@ -120,12 +137,20 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
         elif sig.get("is_face_match") and max_face_vec > 0.0:
             composite_score = max_face_vec
         elif vector_score > 0.0 and lexical_score > 0.0:
-            # Weights already sum to 1.0 — no synergy inflation (audit #9)
-            composite_score = min(0.99, (0.70 * vector_score) + (0.30 * lexical_score))
+            # Max-fusion with small synergy bonus.
+            # A weighted average (0.70*vec + 0.30*lex) penalises documents that have
+            # both strong signals — e.g. FAISS=0.50, FTS=0.71 only scored 0.563, worse
+            # than a competitor with FTS=0.666 alone. Instead:
+            #   base = max(vector, lexical)       — never punish a strong signal
+            #   bonus = 0.10 * min(vec, lex) * gap_to_1  — small reward for agreement
+            base = max(vector_score, lexical_score)
+            bonus = 0.10 * min(vector_score, lexical_score) * (1.0 - base)
+            composite_score = min(0.99, base + bonus)
         elif vector_score > 0.0:
             composite_score = vector_score
         elif lexical_score > 0.0:
-            composite_score = lexical_score * 0.85
+            # No penalty — FTS is a real signal calibrated to [0, 1) by log-scale formula.
+            composite_score = lexical_score
         elif max_phash > 0.0:
             composite_score = max_phash
         else:
@@ -261,7 +286,7 @@ async def search_by_text(query_text: str, limit: int = 30) -> Dict[str, Any]:
             get_signal(s["id"])["title_score"] = t_score
 
     # 2. SQLite FTS5 Keyword Search (Preserves exact/keyword search!)
-    fts_doc_matches = search_document_chunks(clean_query, limit=limit)
+    fts_doc_matches = search_document_chunks(clean_query, limit=max(30, limit))
     for m in fts_doc_matches:
         sid = m["sourceId"]
         sig = get_signal(sid)
@@ -269,7 +294,7 @@ async def search_by_text(query_text: str, limit: int = 30) -> Dict[str, Any]:
         if m.get("text"):
             sig["snippets"].append(m["text"])
 
-    fts_tr_matches = search_transcripts(clean_query, limit=limit)
+    fts_tr_matches = search_transcripts(clean_query, limit=max(30, limit))
     for m in fts_tr_matches:
         sid = m["sourceId"]
         sig = get_signal(sid)
@@ -280,10 +305,12 @@ async def search_by_text(query_text: str, limit: int = 30) -> Dict[str, Any]:
             sig["timestamps"].append(float(m["startTime"]))
 
     # 3. FAISS Vector Search: Text Space (Qwen3-Embedding-0.6B)
+    # _FAISS_RECALL_K is decoupled from output limit — always retrieve 50 candidates
+    # so documents ranked 11-50 in FAISS are not silently dropped before scoring.
     faiss_mgr = get_faiss_manager()
     query_text_vec = get_text_embedding(clean_query)
     if query_text_vec is not None:  # None-safe: skip FAISS if model unavailable (audit #1)
-        text_matches = faiss_mgr.search_text(query_text_vec, top_k=limit, min_score=TEXT_MIN_SCORE)
+        text_matches = faiss_mgr.search_text(query_text_vec, top_k=_FAISS_RECALL_K, min_score=TEXT_MIN_SCORE)
         for m in text_matches:
             sid = m["source_id"]
             sig = get_signal(sid)
@@ -299,7 +326,7 @@ async def search_by_text(query_text: str, limit: int = 30) -> Dict[str, Any]:
     # 4. FAISS Vector Search: Image Space (Jina CLIP v2 Text Encoder)
     clip_text_vec = get_multimodal_text_embedding(clean_query)
     if clip_text_vec:  # None-safe (audit #1)
-        image_matches = faiss_mgr.search_image(clip_text_vec, top_k=limit, min_score=IMAGE_MIN_SCORE)
+        image_matches = faiss_mgr.search_image(clip_text_vec, top_k=_FAISS_RECALL_K, min_score=IMAGE_MIN_SCORE)
         for m in image_matches:
             sid = m["source_id"]
             sig = get_signal(sid)
