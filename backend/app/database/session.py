@@ -61,3 +61,23 @@ def run_migrations() -> None:
                 if "fts5" not in msg and "duplicate column" not in msg:
                     print(f"[DB] Notice on migration: {msg}")
         conn.commit()
+
+
+def get_app_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Retrieve an application setting value from SQLite."""
+    try:
+        row = db_get("SELECT value FROM app_settings WHERE key = ?", (key,))
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def set_app_setting(key: str, value: str) -> None:
+    """Save an application setting value to SQLite (upsert)."""
+    db_run(
+        """INSERT INTO app_settings (key, value, updated_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')""",
+        (key, value)
+    )
+

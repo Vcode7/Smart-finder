@@ -75,3 +75,6 @@ workspace/.vscode*
 
 .env.production
 */.env.production
+
+venv
+backend/venv

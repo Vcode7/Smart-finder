@@ -1,21 +1,33 @@
-import re
-from typing import List, Dict, Any, Set
-from app.database.session import db_all
+"""
+app/search/keyword_search.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+SQLite FTS5 keyword search for document chunks and video transcripts.
 
-STOPWORDS: Set[str] = {
-    "a", "an", "the", "is", "are", "was", "were", "and", "or", "but", "if", "in", "on",
-    "at", "to", "for", "with", "about", "against", "between", "into", "through", "during",
-    "before", "after", "above", "below", "from", "up", "down", "of", "off", "over", "under",
-    "again", "further", "then", "once", "here", "there", "when", "where", "why", "how",
-    "all", "any", "both", "each", "few", "more", "most", "other", "some", "such", "no",
-    "nor", "not", "only", "own", "same", "so", "than", "too", "very", "can", "will", "just",
-    "don", "should", "now", "this", "that", "these", "those"
-}
+Scoring: Uses real BM25-derived `rank` from FTS5 (NOT a fabricated position score).
+  - FTS5 rank is negative; lower (more negative) = less relevant.
+  - rank_score = 1 / (1 + abs(rank))  → maps to (0, 1], higher is better.
+  - OR-path also blends token_ratio: 0.70 * rank_score + 0.30 * token_ratio
+
+Search strategy per function:
+  1. AND query (all tokens required) — best precision
+  2. OR query (any token, scored by token coverage) — wider recall
+  3. LIKE fallback (FTS5 virtual table missing or corrupt) — last resort
+"""
+import re
+from typing import List, Dict, Any
+from app.database.session import db_all
+from app.search.constants import STOPWORDS
+
 
 def extract_query_tokens(query: str) -> List[str]:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", query.lower())
-    tokens = [w for w in cleaned.split() if len(w) >= 2 and w not in STOPWORDS]
-    return tokens
+    return [w for w in cleaned.split() if len(w) >= 2 and w not in STOPWORDS]
+
+
+def _rank_to_score(rank: float) -> float:
+    """Convert FTS5 rank (negative BM25) to a [0, 1) relevance score."""
+    return round(1.0 / (1.0 + abs(float(rank))), 4)
+
 
 def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     clean_q = query.strip()
@@ -26,7 +38,7 @@ def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     if not tokens:
         return []
 
-    # 1. Strict FTS5 AND query
+    # 1. Strict FTS5 AND query (all tokens required)
     if len(tokens) > 1:
         strict_fts = " AND ".join([f'"{t}"*' for t in tokens])
         try:
@@ -46,14 +58,14 @@ def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                         "sourceId": r["source_id"],
                         "docId": r["doc_id"],
                         "type": "chunk",
-                        "score": round(0.75 + 0.25 * max(0.0, 1.0 - (i / max(limit, 1))), 4)
+                        "score": _rank_to_score(r["rank"]),
                     }
-                    for i, r in enumerate(rows)
+                    for r in rows
                 ]
         except Exception:
             pass
 
-    # 2. Standard FTS5 OR query
+    # 2. Standard FTS5 OR query (blend rank + token coverage)
     try:
         or_fts = " OR ".join([f'"{t}"*' for t in tokens])
         rows = db_all(
@@ -66,25 +78,25 @@ def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
         )
         if rows:
             results = []
-            for i, r in enumerate(rows):
+            for r in rows:
                 lower_text = r["chunk_text"].lower()
                 matched = [t for t in tokens if t in lower_text]
                 token_ratio = len(matched) / len(tokens)
-                rank_decay = max(0.0, 1.0 - (i / max(limit, 1)))
-                score = round((token_ratio * 0.75) + (rank_decay * 0.25), 4)
+                rank_score = _rank_to_score(r["rank"])
+                score = round(0.70 * rank_score + 0.30 * token_ratio, 4)
                 results.append({
                     "id": r["chunk_id"],
                     "text": r["chunk_text"],
                     "sourceId": r["source_id"],
                     "docId": r["doc_id"],
                     "type": "chunk",
-                    "score": score
+                    "score": score,
                 })
             return results
     except Exception:
         pass
 
-    # 3. Fallback: LIKE query on document_chunks
+    # 3. Fallback: LIKE query on document_chunks (FTS5 unavailable)
     try:
         like_clauses = " AND ".join(["chunk_text LIKE ?"] * len(tokens))
         params = tuple([f"%{t}%" for t in tokens] + [limit])
@@ -104,7 +116,6 @@ def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                     LIMIT ?""",
                 params
             )
-
         results = []
         for r in rows:
             lower_text = r["chunk_text"].lower()
@@ -117,12 +128,13 @@ def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                 "docId": r["doc_id"],
                 "pageNum": r.get("page_num", 1),
                 "type": "chunk",
-                "score": round(token_ratio * 0.85, 4)
+                "score": round(token_ratio * 0.85, 4),
             })
         return results
     except Exception as e:
         print(f"[KeywordSearch] Document search error: {e}")
         return []
+
 
 def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     clean_q = query.strip()
@@ -155,9 +167,9 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                         "startTime": r["start_time"],
                         "endTime": r["end_time"],
                         "type": "transcript",
-                        "score": round(0.75 + 0.25 * max(0.0, 1.0 - (i / max(limit, 1))), 4)
+                        "score": _rank_to_score(r["rank"]),
                     }
-                    for i, r in enumerate(rows)
+                    for r in rows
                 ]
         except Exception:
             pass
@@ -175,12 +187,12 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
         )
         if rows:
             results = []
-            for i, r in enumerate(rows):
+            for r in rows:
                 lower_text = r["text"].lower()
                 matched = [t for t in tokens if t in lower_text]
                 token_ratio = len(matched) / len(tokens)
-                rank_decay = max(0.0, 1.0 - (i / max(limit, 1)))
-                score = round((token_ratio * 0.75) + (rank_decay * 0.25), 4)
+                rank_score = _rank_to_score(r["rank"])
+                score = round(0.70 * rank_score + 0.30 * token_ratio, 4)
                 results.append({
                     "id": r["transcript_id"],
                     "text": r["text"],
@@ -189,7 +201,7 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                     "startTime": r["start_time"],
                     "endTime": r["end_time"],
                     "type": "transcript",
-                    "score": score
+                    "score": score,
                 })
             return results
     except Exception:
@@ -215,7 +227,6 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                     LIMIT ?""",
                 params
             )
-
         results = []
         for r in rows:
             lower_text = r["text"].lower()
@@ -229,7 +240,7 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                 "startTime": r["start_time"],
                 "endTime": r["end_time"],
                 "type": "transcript",
-                "score": round(token_ratio * 0.85, 4)
+                "score": round(token_ratio * 0.85, 4),
             })
         return results
     except Exception as e:

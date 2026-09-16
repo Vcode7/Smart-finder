@@ -1,3 +1,15 @@
+"""
+app/search/perceptual_hash.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Perceptual image hashing for near-duplicate and visually-similar image retrieval.
+
+Uses pHash and dHash (64-bit each). Hamming distance <= 8 is considered a match.
+
+Optimization (#12): Stores the top-16 bits of phash as an integer bucket column
+(phash_prefix) and uses SQL pre-filtering to avoid a full table scan on every query.
+Only candidates within ±1 bucket (Hamming budget ≤ 8 on 64-bit = ≤ bucket distance 1
+at 16-bit granularity) are returned to Python for the exact Hamming check.
+"""
 import io
 import uuid
 from pathlib import Path
@@ -6,6 +18,7 @@ from PIL import Image
 import imagehash
 
 from app.database.session import db_run, db_all
+
 
 def _load_image(image_input: Union[str, bytes, Path, Image.Image]) -> Optional[Image.Image]:
     try:
@@ -20,6 +33,7 @@ def _load_image(image_input: Union[str, bytes, Path, Image.Image]) -> Optional[I
     except Exception as e:
         print(f"[PerceptualHash] Image load error: {e}")
     return None
+
 
 def compute_image_hashes(image_input: Union[str, bytes, Path, Image.Image]) -> Tuple[str, str]:
     """
@@ -37,6 +51,17 @@ def compute_image_hashes(image_input: Union[str, bytes, Path, Image.Image]) -> T
         print(f"[PerceptualHash] Hash computation error: {e}")
         return ("", "")
 
+
+def _phash_prefix(phash_hex: str) -> Optional[int]:
+    """Top 16 bits of a 64-bit phash as an integer bucket key (4 hex chars)."""
+    if not phash_hex or len(phash_hex) < 4:
+        return None
+    try:
+        return int(phash_hex[:4], 16)
+    except Exception:
+        return None
+
+
 def hamming_distance(h1_str: str, h2_str: str) -> int:
     """Calculates Hamming distance between two hex-encoded 64-bit hashes."""
     if not h1_str or not h2_str:
@@ -47,6 +72,7 @@ def hamming_distance(h1_str: str, h2_str: str) -> int:
         return int(h1 - h2)
     except Exception:
         return 64
+
 
 def calculate_hash_similarity(
     query_phash: str,
@@ -84,6 +110,7 @@ def calculate_hash_similarity(
 
     return (round(sim, 3), p_dist, d_dist)
 
+
 def store_image_hash(
     source_id: str,
     entity_id: str,
@@ -94,15 +121,17 @@ def store_image_hash(
     page_num: Optional[int] = None,
     timestamp: Optional[float] = None
 ) -> str:
-    """Persists an image's perceptual hashes to SQLite."""
+    """Persists an image's perceptual hashes to SQLite, including the prefix bucket."""
     hash_id = str(uuid.uuid4())
+    prefix = _phash_prefix(phash)
     db_run(
-        """INSERT INTO image_perceptual_hashes 
-           (id, source_id, entity_id, image_path, phash, dhash, image_type, page_num, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (hash_id, source_id, entity_id, str(image_path), phash, dhash, image_type, page_num, timestamp)
+        """INSERT INTO image_perceptual_hashes
+           (id, source_id, entity_id, image_path, phash, dhash, image_type, page_num, timestamp, phash_prefix)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (hash_id, source_id, entity_id, str(image_path), phash, dhash, image_type, page_num, timestamp, prefix)
     )
     return hash_id
+
 
 def search_image_hashes(
     query_phash: str,
@@ -110,15 +139,33 @@ def search_image_hashes(
     max_hamming_distance: int = 8
 ) -> List[Dict[str, Any]]:
     """
-    Compares query perceptual hashes against all stored image hashes.
+    Compares query perceptual hashes against stored image hashes.
+    Uses phash_prefix bucket pre-filter to avoid a full table scan (audit #12).
     Returns matching records sorted by visual similarity descending.
     """
     if not query_phash and not query_dhash:
         return []
 
-    rows = db_all("SELECT * FROM image_perceptual_hashes")
-    matches: List[Dict[str, Any]] = []
+    # Pre-filter by phash_prefix bucket: only fetch candidates near the query bucket.
+    # 8-bit Hamming budget on 64 bits ≈ prefix within ±1 of 16-bit buckets.
+    q_prefix = _phash_prefix(query_phash) if query_phash else None
+    if q_prefix is not None:
+        # Include the query bucket and its immediate neighbors for robustness
+        candidate_prefixes = [q_prefix]
+        if q_prefix > 0:
+            candidate_prefixes.append(q_prefix - 1)
+        if q_prefix < 0xFFFF:
+            candidate_prefixes.append(q_prefix + 1)
+        placeholders = ",".join("?" * len(candidate_prefixes))
+        rows = db_all(
+            f"SELECT * FROM image_perceptual_hashes WHERE phash_prefix IN ({placeholders}) OR phash_prefix IS NULL",
+            tuple(candidate_prefixes)
+        )
+    else:
+        # No prefix available — fall back to full scan (uncommon, e.g. legacy rows)
+        rows = db_all("SELECT * FROM image_perceptual_hashes")
 
+    matches: List[Dict[str, Any]] = []
     for row in rows:
         t_ph = row.get("phash", "")
         t_dh = row.get("dhash", "")

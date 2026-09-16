@@ -45,7 +45,7 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> List[str
         start = end - overlap if end < len(clean) else end
     return [c for c in chunks if len(c) > 10]
 
-from app.search.keyword_search import STOPWORDS
+from app.search.constants import STOPWORDS, build_enriched_text, preview_text as _preview_text
 
 def is_noise_header(text: str) -> bool:
     clean = text.strip()
@@ -283,16 +283,54 @@ def process_document(source_id: str) -> None:
         try:
             import docx
             d = docx.Document(file_path)
-            paragraphs = [p.text for p in d.paragraphs if p.text.strip()]
-            full_text = "\n\n".join(paragraphs)
-            sections.append({
-                "id": str(uuid.uuid4()),
-                "section_title": "Document Content",
-                "section_text": full_text,
-                "page_num": 1,
-                "order_idx": 0
-            })
-            tracker.log_ingestion(f"Extracted {len(full_text):,} characters ({len(full_text.split()):,} words) from {len(paragraphs)} paragraphs")
+            current_heading = "Document Content"
+            current_paras = []
+            char_count = 0
+            section_idx = 0
+            estimated_page = 1
+            all_paras = []
+
+            for p in d.paragraphs:
+                text = p.text.strip()
+                if not text:
+                    continue
+                all_paras.append(text)
+                style_name = getattr(getattr(p, "style", None), "name", "").lower()
+                is_heading = style_name.startswith("heading") or style_name in ("title", "subtitle")
+
+                if is_heading and current_paras:
+                    sec_text = "\n\n".join(current_paras)
+                    sections.append({
+                        "id": str(uuid.uuid4()),
+                        "section_title": current_heading,
+                        "section_text": sec_text,
+                        "page_num": estimated_page,
+                        "order_idx": section_idx
+                    })
+                    section_idx += 1
+                    current_paras = []
+                    current_heading = text
+                else:
+                    current_paras.append(text)
+
+                char_count += len(text)
+                estimated_page = max(1, (char_count // 2500) + 1)
+
+            if current_paras:
+                sec_text = "\n\n".join(current_paras)
+                sections.append({
+                    "id": str(uuid.uuid4()),
+                    "section_title": current_heading,
+                    "section_text": sec_text,
+                    "page_num": estimated_page,
+                    "order_idx": section_idx
+                })
+
+            full_text = "\n\n".join(all_paras)
+            tracker.log_ingestion(
+                f"Extracted {len(full_text):,} characters ({len(full_text.split()):,} words) "
+                f"across {len(sections)} section(s) from {len(all_paras)} paragraphs"
+            )
         except Exception as e:
             tracker.finish(status="failed", error=str(e))
             raise RuntimeError(f"Failed to parse DOCX document: {e}") from e
@@ -426,38 +464,55 @@ def process_document(source_id: str) -> None:
             chunk_id = str(uuid.uuid4())
             ch = item["text"]
             sec_title = item["section_title"]
-            enriched_text = f"[{sec_title}] {ch}" if sec_title else ch
+            enriched_text = build_enriched_text(sec_title, ch)
             emb = get_text_embedding(enriched_text)
-            emb_blob = float_array_to_blob(emb)
+            needs_reembed = 0 if emb is not None else 1
+            emb_blob = float_array_to_blob(emb) if emb is not None else b""
 
             cursor.execute(
-                "INSERT INTO document_chunks (id, section_id, doc_id, source_id, chunk_text, chunk_order, page_num, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (chunk_id, item["section_id"], doc_id, source_id, enriched_text, idx, item["page_num"], emb_blob)
+                "INSERT INTO document_chunks (id, section_id, doc_id, source_id, chunk_text, chunk_order, page_num, embedding, needs_reembed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (chunk_id, item["section_id"], doc_id, source_id, enriched_text, idx, item["page_num"], emb_blob, needs_reembed)
             )
             try:
                 cursor.execute(
                     "INSERT INTO chunks_fts (chunk_text, chunk_id, source_id, doc_id) VALUES (?, ?, ?, ?)",
                     (enriched_text, chunk_id, source_id, doc_id)
                 )
-            except Exception:
-                pass
+            except Exception as fts_err:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[Processor] FTS5 insert failed for chunk {chunk_id}: {fts_err}"
+                )
+                # Mark fts_synced = 0 so a repair sweep can re-insert this chunk
+                try:
+                    cursor.execute(
+                        "UPDATE document_chunks SET fts_synced = 0 WHERE id = ?",
+                        (chunk_id,)
+                    )
+                except Exception:
+                    pass
 
-            # FAISS Text Index
-            faiss_mgr.add_text_vector(
-                source_id=source_id,
-                chunk_id=chunk_id,
-                vector=emb,
-                metadata={
-                    "type": "document_chunk",
-                    "filename": src["original_name"],
-                    "doc_id": doc_id,
-                    "chunk_order": idx,
-                    "page_num": item["page_num"],
-                    "section_title": sec_title,
-                    "keywords": item["keywords"],
-                    "preview": ch[:150]
-                }
-            )
+            if emb is not None:
+                faiss_mgr.add_text_vector(
+                    source_id=source_id,
+                    chunk_id=chunk_id,
+                    vector=emb,
+                    metadata={
+                        "type": "document_chunk",
+                        "filename": src["original_name"],
+                        "doc_id": doc_id,
+                        "chunk_order": idx,
+                        "page_num": item["page_num"],
+                        "section_title": sec_title,
+                        "keywords": item["keywords"],
+                        "preview": _preview_text(enriched_text)
+                    }
+                )
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[Processor] Skipping FAISS for chunk {chunk_id} — embedding unavailable (model not loaded)"
+                )
         conn.commit()
 
     tracker.counts["text_chunks_embedded"] = chunk_count
@@ -488,59 +543,71 @@ def process_document(source_id: str) -> None:
 
         # Run OCR on extracted image
         ocr_text = run_ocr(img_path)
-        if ocr_text.strip() and len(ocr_text.strip()) > 5:
+        ocr_words = ocr_text.strip().split()
+        if len(ocr_text.strip()) >= 20 and len(ocr_words) >= 3:  # raised threshold (was >5)
             total_ocr_chars += len(ocr_text.strip())
             total_ocr_chunks += 1
             ocr_chunk_id = str(uuid.uuid4())
-            ocr_content = f"[{img_title} - OCR Page {p_num}]: {ocr_text}"
+            # Fix: monotonic chunk_order using enumerate (was constant for all OCR chunks, audit #13)
+            ocr_order = chunk_count + len(extracted_images_records) + total_ocr_chunks
+            ocr_content = build_enriched_text(f"{img_title} - OCR Page {p_num}", ocr_text)
             ocr_emb = get_text_embedding(ocr_content)
+            ocr_needs_reembed = 0 if ocr_emb is not None else 1
             db_run(
-                "INSERT INTO document_chunks (id, doc_id, source_id, chunk_text, chunk_order, page_num, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (ocr_chunk_id, doc_id, source_id, ocr_content, chunk_count + len(extracted_images_records), p_num, float_array_to_blob(ocr_emb))
+                "INSERT INTO document_chunks (id, doc_id, source_id, chunk_text, chunk_order, page_num, embedding, needs_reembed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ocr_chunk_id, doc_id, source_id, ocr_content, ocr_order, p_num,
+                 float_array_to_blob(ocr_emb) if ocr_emb is not None else b"", ocr_needs_reembed)
             )
             try:
                 db_run(
                     "INSERT INTO chunks_fts (chunk_text, chunk_id, source_id, doc_id) VALUES (?, ?, ?, ?)",
                     (ocr_content, ocr_chunk_id, source_id, doc_id)
                 )
-            except Exception:
-                pass
+            except Exception as fts_err:
+                import logging
+                logging.getLogger(__name__).warning(f"[Processor] FTS5 insert failed for OCR chunk {ocr_chunk_id}: {fts_err}")
 
-            faiss_mgr.add_text_vector(
-                source_id=source_id,
-                chunk_id=ocr_chunk_id,
-                vector=ocr_emb,
-                metadata={
-                    "type": "document_ocr",
-                    "filename": src["original_name"],
-                    "page_num": p_num,
-                    "section_title": img_title,
-                    "keywords": img_kws,
-                    "preview": ocr_text[:150]
-                }
-            )
-            tracker.log_ocr(f"OCR Page {p_num} ({img_title}): extracted {len(ocr_text.strip())} chars -> embedded via Qwen3 & stored in FAISS text index")
+            if ocr_emb is not None:
+                faiss_mgr.add_text_vector(
+                    source_id=source_id,
+                    chunk_id=ocr_chunk_id,
+                    vector=ocr_emb,
+                    metadata={
+                        "type": "document_ocr",
+                        "filename": src["original_name"],
+                        "page_num": p_num,
+                        "section_title": img_title,
+                        "keywords": img_kws,
+                        "preview": _preview_text(ocr_content)
+                    }
+                )
+            tracker.log_ocr(f"OCR Page {p_num} ({img_title}): extracted {len(ocr_text.strip())} chars")
 
         # Generate real Jina CLIP embedding for extracted image
         clip_emb = get_image_embedding(img_path)
         img_id = img_rec["id"]
         img_type = img_rec.get("type", "document_image")
-        faiss_mgr.add_image_vector(
-            source_id=source_id,
-            entity_id=img_id,
-            vector=clip_emb,
-            metadata={
-                "type": img_type,
-                "filename": src["original_name"],
-                "page_num": p_num,
-                "section_title": img_title,
-                "keywords": img_kws,
-                "image_path": img_path
-            }
-        )
-        total_img_embs += 1
-        tracker.add_faiss_index("image.index (1024-dim)")
-        tracker.log_embedding(f"Embedded PDF image ({img_type}, Page {p_num}, '{img_title}') with real jinaai/jina-clip-v2 -> stored in FAISS image index")
+        if clip_emb is not None:
+            faiss_mgr.add_image_vector(
+                source_id=source_id,
+                entity_id=img_id,
+                vector=clip_emb,
+                metadata={
+                    "type": img_type,
+                    "filename": src["original_name"],
+                    "page_num": p_num,
+                    "section_title": img_title,
+                    "keywords": img_kws,
+                    "image_path": img_path
+                }
+            )
+            total_img_embs += 1
+            tracker.add_faiss_index("image.index (1024-dim)")
+        else:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[Processor] Skipping FAISS image vector for {img_path} — Jina CLIP unavailable"
+            )
 
         # Generate & store perceptual hashes (pHash + dHash)
         phash, dhash = compute_image_hashes(img_path)
@@ -655,19 +722,25 @@ def process_image(source_id: str) -> None:
     tracker.counts["image_embeddings_stored"] = 1
 
     # Add to FAISS Image Index
-    faiss_mgr.add_image_vector(
-        source_id=source_id,
-        entity_id=image_id,
-        vector=img_emb,
-        metadata={
-            "type": "image",
-            "filename": src["original_name"],
-            "image_path": file_path
-        }
-    )
-    tracker.add_faiss_index("image.index (1024-dim)")
+    if img_emb is not None:
+        faiss_mgr.add_image_vector(
+            source_id=source_id,
+            entity_id=image_id,
+            vector=img_emb,
+            metadata={
+                "type": "image",
+                "filename": src["original_name"],
+                "image_path": file_path
+            }
+        )
+        tracker.add_faiss_index("image.index (1024-dim)")
+        tracker.log_faiss(f"Inserted image vector into FAISS image index (current total: {faiss_mgr.image_index.ntotal})")
+    else:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[Processor] Skipping FAISS image vector for standalone image {file_path} — Jina CLIP unavailable"
+        )
     tracker.log_storage("Stored image record in SQLite images table")
-    tracker.log_faiss(f"Inserted image vector into FAISS image index (current total: {faiss_mgr.image_index.ntotal})")
 
     # Generate & store perceptual hashes for standalone image
     phash, dhash = compute_image_hashes(file_path)
@@ -688,23 +761,24 @@ def process_image(source_id: str) -> None:
         cursor = conn.cursor()
         for face in detected_faces:
             f_id = str(uuid.uuid4())
-            f_blob = float_array_to_blob(face["embedding"])
+            f_blob = float_array_to_blob(face["embedding"]) if face.get("embedding") is not None else b""
             bbox_json = json.dumps(face.get("box", []))
             cursor.execute(
                 "INSERT INTO face_embeddings (id, source_id, image_id, timestamp, embedding, confidence, bbox_json) VALUES (?, ?, ?, 0.0, ?, ?, ?)",
                 (f_id, source_id, image_id, f_blob, face.get("confidence", 0.9), bbox_json)
             )
-            faiss_mgr.add_face_vector(
-                source_id=source_id,
-                face_id=f_id,
-                vector=face["embedding"],
-                metadata={
-                    "type": "image_face",
-                    "filename": src["original_name"],
-                    "image_path": file_path,
-                    "box": face.get("box")
-                }
-            )
+            if face.get("embedding") is not None:
+                faiss_mgr.add_face_vector(
+                    source_id=source_id,
+                    face_id=f_id,
+                    vector=face["embedding"],
+                    metadata={
+                        "type": "image_face",
+                        "filename": src["original_name"],
+                        "image_path": file_path,
+                        "box": face.get("box")
+                    }
+                )
         conn.commit()
 
     if detected_faces:
@@ -724,28 +798,35 @@ def process_image(source_id: str) -> None:
         )
         chunk_id = str(uuid.uuid4())
         c_emb = get_text_embedding(doc_text)
+        c_needs_reembed = 0 if c_emb is not None else 1
         db_run(
-            "INSERT INTO document_chunks (id, doc_id, source_id, chunk_text, chunk_order, embedding) VALUES (?, ?, ?, ?, 0, ?)",
-            (chunk_id, doc_id, source_id, doc_text, float_array_to_blob(c_emb))
+            "INSERT INTO document_chunks (id, doc_id, source_id, chunk_text, chunk_order, embedding, needs_reembed) VALUES (?, ?, ?, ?, 0, ?, ?)",
+            (chunk_id, doc_id, source_id, doc_text, float_array_to_blob(c_emb) if c_emb is not None else b"", c_needs_reembed)
         )
         try:
             db_run(
                 "INSERT INTO chunks_fts (chunk_text, chunk_id, source_id, doc_id) VALUES (?, ?, ?, ?)",
                 (doc_text, chunk_id, source_id, doc_id)
             )
-        except Exception:
-            pass
+        except Exception as fts_err:
+            import logging
+            logging.getLogger(__name__).warning(f"[Processor] FTS5 insert failed for image OCR {chunk_id}: {fts_err}")
+            try:
+                db_run("UPDATE document_chunks SET fts_synced = 0 WHERE id = ?", (chunk_id,))
+            except Exception:
+                pass
 
-        faiss_mgr.add_text_vector(
-            source_id=source_id,
-            chunk_id=chunk_id,
-            vector=c_emb,
-            metadata={
-                "type": "image_ocr",
-                "filename": src["original_name"],
-                "preview": ocr_text[:150]
-            }
-        )
+        if c_emb is not None:
+            faiss_mgr.add_text_vector(
+                source_id=source_id,
+                chunk_id=chunk_id,
+                vector=c_emb,
+                metadata={
+                    "type": "image_ocr",
+                    "filename": src["original_name"],
+                    "preview": ocr_text[:150]
+                }
+            )
         tracker.counts["ocr_chunks"] = 1
         tracker.counts["text_chunks"] = 1
         tracker.counts["text_chunks_embedded"] = 1
@@ -835,31 +916,43 @@ def process_video(source_id: str) -> None:
         for tr in transcript_items:
             tr_id = str(uuid.uuid4())
             emb = get_text_embedding(tr["text"])
+            needs_reembed = 0 if emb is not None else 1
             cursor.execute(
-                "INSERT INTO video_transcripts (id, video_id, source_id, start_time, end_time, text, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tr_id, video_id, source_id, tr["start"], tr["end"], tr["text"], float_array_to_blob(emb))
+                "INSERT INTO video_transcripts (id, video_id, source_id, start_time, end_time, text, embedding, needs_reembed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (tr_id, video_id, source_id, tr["start"], tr["end"], tr["text"], float_array_to_blob(emb) if emb is not None else b"", needs_reembed)
             )
             try:
                 cursor.execute(
                     "INSERT INTO transcripts_fts (text, transcript_id, video_id, source_id, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?)",
                     (tr["text"], tr_id, video_id, source_id, tr["start"], tr["end"])
                 )
-            except Exception:
-                pass
+            except Exception as fts_err:
+                import logging
+                logging.getLogger(__name__).warning(f"[Processor] FTS5 insert failed for video transcript {tr_id}: {fts_err}")
+                try:
+                    cursor.execute("UPDATE video_transcripts SET fts_synced = 0 WHERE id = ?", (tr_id,))
+                except Exception:
+                    pass
 
-            faiss_mgr.add_text_vector(
-                source_id=source_id,
-                chunk_id=tr_id,
-                vector=emb,
-                metadata={
-                    "type": "video_transcript",
-                    "filename": src["original_name"],
-                    "video_id": video_id,
-                    "start": tr["start"],
-                    "end": tr["end"],
-                    "preview": tr["text"][:150]
-                }
-            )
+            if emb is not None:
+                faiss_mgr.add_text_vector(
+                    source_id=source_id,
+                    chunk_id=tr_id,
+                    vector=emb,
+                    metadata={
+                        "type": "video_transcript",
+                        "filename": src["original_name"],
+                        "video_id": video_id,
+                        "start": tr["start"],
+                        "end": tr["end"],
+                        "preview": tr["text"][:150]
+                    }
+                )
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[Processor] Skipping FAISS text vector for video transcript {tr_id} — embedding unavailable"
+                )
         conn.commit()
 
     tracker.counts["text_chunks"] = len(transcript_items)
@@ -871,7 +964,10 @@ def process_video(source_id: str) -> None:
     tracker.log_faiss(f"Inserted {len(transcript_items)} transcript vectors into FAISS text index (current index size: {faiss_mgr.text_index.ntotal})")
 
     # 2. Video Frame Sampling with 30-Frame Stride
-    stride_seconds = max(1.0, 30.0 / (fps if fps > 0 else 30.0))
+    # Correct stride: 30-frame stride in seconds, capped at 120 total frames
+    # Removed max(1.0, ...) clamp which broke high-fps content (audit #14)
+    stride_seconds = (30.0 / fps) if fps > 0 else 1.0
+    stride_seconds = max(0.25, stride_seconds)  # floor at 250ms for sanity
     sample_timestamps = []
     curr_t = 0.0
     while curr_t < duration:
@@ -910,20 +1006,26 @@ def process_video(source_id: str) -> None:
                     "frame_number": idx * 30,
                     "scene_id": idx + 1,
                     "frame_path": frame_file,
-                    "embedding": float_array_to_blob(emb)
+                    "embedding": float_array_to_blob(emb) if emb is not None else b""
                 })
 
-                faiss_mgr.add_image_vector(
-                    source_id=source_id,
-                    entity_id=frame_id,
-                    vector=emb,
-                    metadata={
-                        "type": "video_frame",
-                        "filename": src["original_name"],
-                        "timestamp": float(ts),
-                        "frame_path": frame_file
-                    }
-                )
+                if emb is not None:
+                    faiss_mgr.add_image_vector(
+                        source_id=source_id,
+                        entity_id=frame_id,
+                        vector=emb,
+                        metadata={
+                            "type": "video_frame",
+                            "filename": src["original_name"],
+                            "timestamp": float(ts),
+                            "frame_path": frame_file
+                        }
+                    )
+                else:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"[Processor] Skipping FAISS image vector for frame {frame_file} — Jina CLIP unavailable"
+                    )
 
                 # Store perceptual hashes for sampled video frame
                 phash, dhash = compute_image_hashes(frame_file)
@@ -938,9 +1040,10 @@ def process_video(source_id: str) -> None:
                         timestamp=float(ts)
                     )
 
-                # Run OCR on frame
+                # Run OCR on frame — only index if content is substantive
                 f_ocr = run_ocr(frame_file)
-                if f_ocr and len(f_ocr.strip()) > 4:
+                f_ocr_words = f_ocr.strip().split() if f_ocr else []
+                if f_ocr and len(f_ocr.strip()) >= 20 and len(f_ocr_words) >= 3:
                     total_ocr_frames += 1
                     f_ocr_id = str(uuid.uuid4())
                     ocr_line = f"[Video frame at {ts}s]: {f_ocr.strip()}"
@@ -950,43 +1053,46 @@ def process_video(source_id: str) -> None:
                             "INSERT INTO transcripts_fts (text, transcript_id, video_id, source_id, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?)",
                             (ocr_line, f_ocr_id, video_id, source_id, float(ts), float(ts + 1.0))
                         )
-                    except Exception:
-                        pass
-                    faiss_mgr.add_text_vector(
-                        source_id=source_id,
-                        chunk_id=f_ocr_id,
-                        vector=f_ocr_emb,
-                        metadata={
-                            "type": "video_frame_ocr",
-                            "filename": src["original_name"],
-                            "timestamp": float(ts),
-                            "preview": f_ocr[:150]
-                        }
-                    )
+                    except Exception as fts_err:
+                        import logging
+                        logging.getLogger(__name__).warning(f"[Processor] FTS5 insert failed for frame OCR {f_ocr_id}: {fts_err}")
+                    if f_ocr_emb is not None:
+                        faiss_mgr.add_text_vector(
+                            source_id=source_id,
+                            chunk_id=f_ocr_id,
+                            vector=f_ocr_emb,
+                            metadata={
+                                "type": "video_frame_ocr",
+                                "filename": src["original_name"],
+                                "timestamp": float(ts),
+                                "preview": f_ocr[:150]
+                            }
+                        )
 
                 # Run InsightFace face detection on frame
                 detected_faces = detect_and_embed_faces(frame_file)
                 for face in detected_faces:
                     total_faces += 1
                     f_id = str(uuid.uuid4())
-                    f_blob = float_array_to_blob(face["embedding"])
+                    f_blob = float_array_to_blob(face["embedding"]) if face.get("embedding") is not None else b""
                     bbox_json = json.dumps(face.get("box", []))
                     db_run(
                         "INSERT INTO face_embeddings (id, source_id, video_id, frame_id, timestamp, embedding, confidence, bbox_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (f_id, source_id, video_id, frame_id, float(ts), f_blob, face.get("confidence", 0.9), bbox_json)
                     )
-                    faiss_mgr.add_face_vector(
-                        source_id=source_id,
-                        face_id=f_id,
-                        vector=face["embedding"],
-                        metadata={
-                            "type": "video_face",
-                            "filename": src["original_name"],
-                            "timestamp": float(ts),
-                            "frame_path": frame_file,
-                            "box": face.get("box")
-                        }
-                    )
+                    if face.get("embedding") is not None:
+                        faiss_mgr.add_face_vector(
+                            source_id=source_id,
+                            face_id=f_id,
+                            vector=face["embedding"],
+                            metadata={
+                                "type": "video_face",
+                                "filename": src["original_name"],
+                                "timestamp": float(ts),
+                                "frame_path": frame_file,
+                                "box": face.get("box")
+                            }
+                        )
         except Exception as e:
             tracker.log_ingestion(f"Frame processing notice at {ts}s: {e}")
 
@@ -1001,7 +1107,30 @@ def process_video(source_id: str) -> None:
     tracker.log_face(f"Detected {total_faces} face(s) across {len(frames_records)} sampled frames")
 
     if frames_records:
-        thumb_path = frames_records[0]["frame_path"]
+        # Pick best-quality thumbnail by pixel variance + brightness (audit #27)
+        # Avoids using frames_records[0] which is often a dark/black frame at t=0s.
+        best_thumb = None
+        best_score = -1.0
+        try:
+            import numpy as np
+            for fr in frames_records[:min(12, len(frames_records))]:
+                fp = fr.get("frame_path", "")
+                if not fp or not Path(fp).exists():
+                    continue
+                with Image.open(fp).convert("L") as gray_img:
+                    arr = np.array(gray_img, dtype=np.float32)
+                variance = float(arr.var())
+                brightness = float(arr.mean())
+                # Penalize very dark frames (< 30 / 255) and very bright (overexposed > 240)
+                if brightness < 15 or brightness > 245:
+                    continue
+                thumb_score = variance * (1.0 - abs(brightness - 128) / 256.0)
+                if thumb_score > best_score:
+                    best_score = thumb_score
+                    best_thumb = fp
+        except Exception:
+            pass
+        thumb_path = best_thumb or frames_records[0]["frame_path"]
         db_run("UPDATE videos SET thumbnail_path = ? WHERE id = ?", (thumb_path, video_id))
 
     with get_db_context() as conn:
@@ -1088,30 +1217,42 @@ def process_audio(source_id: str) -> None:
         for tr in transcript_items:
             tr_id = str(uuid.uuid4())
             emb = get_text_embedding(tr["text"])
+            needs_reembed = 0 if emb is not None else 1
             cursor.execute(
-                "INSERT INTO video_transcripts (id, video_id, source_id, start_time, end_time, text, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tr_id, video_id, source_id, tr["start"], tr["end"], tr["text"], float_array_to_blob(emb))
+                "INSERT INTO video_transcripts (id, video_id, source_id, start_time, end_time, text, embedding, needs_reembed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (tr_id, video_id, source_id, tr["start"], tr["end"], tr["text"], float_array_to_blob(emb) if emb is not None else b"", needs_reembed)
             )
             try:
                 cursor.execute(
                     "INSERT INTO transcripts_fts (text, transcript_id, video_id, source_id, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?)",
                     (tr["text"], tr_id, video_id, source_id, tr["start"], tr["end"])
                 )
-            except Exception:
-                pass
+            except Exception as fts_err:
+                import logging
+                logging.getLogger(__name__).warning(f"[Processor] FTS5 insert failed for audio transcript {tr_id}: {fts_err}")
+                try:
+                    cursor.execute("UPDATE video_transcripts SET fts_synced = 0 WHERE id = ?", (tr_id,))
+                except Exception:
+                    pass
 
-            faiss_mgr.add_text_vector(
-                source_id=source_id,
-                chunk_id=tr_id,
-                vector=emb,
-                metadata={
-                    "type": "audio_transcript",
-                    "filename": src["original_name"],
-                    "start": tr["start"],
-                    "end": tr["end"],
-                    "preview": tr["text"][:150]
-                }
-            )
+            if emb is not None:
+                faiss_mgr.add_text_vector(
+                    source_id=source_id,
+                    chunk_id=tr_id,
+                    vector=emb,
+                    metadata={
+                        "type": "audio_transcript",
+                        "filename": src["original_name"],
+                        "start": tr["start"],
+                        "end": tr["end"],
+                        "preview": tr["text"][:150]
+                    }
+                )
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[Processor] Skipping FAISS text vector for audio transcript {tr_id} — embedding unavailable"
+                )
         conn.commit()
 
     tracker.add_sqlite_table("video_transcripts")

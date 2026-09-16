@@ -8,11 +8,12 @@ import {
   Sparkles, Plus, MessageSquare, Clock, Trash2,
   Pencil, Check, X, Upload, LogOut, User, Shield,
   PanelLeftClose, PanelLeftOpen, Globe, Database, Layers, Search,
-  Sun, Moon
+  Sun, Moon, Settings
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth';
 import { useChatStore } from '@/store/chat';
 import { useUIStore } from '@/store/ui';
+import { SettingsModal } from '@/components/modals/SettingsModal';
 import { toast } from 'sonner';
 
 import { formatDistanceToNow } from '@/lib/utils/date';
@@ -25,7 +26,7 @@ export function Sidebar({ sessionId }: { sessionId?: string } = {}) {
   const pathname = usePathname();
 
   const { user, logout } = useAuthStore();
-  const { theme, setTheme } = useUIStore();
+  const { theme, setTheme, setSettingsModalOpen } = useUIStore();
   const { chats, activeChatId, setActiveChatId, setMessages, setChats, updateChatTitle, removeChat, setLoading, setActiveContext, clearContext } = useChatStore();
 
 
@@ -393,6 +394,44 @@ export function Sidebar({ sessionId }: { sessionId?: string } = {}) {
           </AnimatePresence>
         </button>
 
+        {/* Settings Button — Positioned directly below Light/Dark theme switch */}
+        <button
+          onClick={() => setSettingsModalOpen(true)}
+          className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-[var(--bg-hover)] ${
+            collapsed ? 'justify-center px-0' : ''
+          }`}
+          style={{
+            color: 'var(--text-secondary)',
+            border: '1px solid var(--border)',
+            background: 'var(--bg-surface, var(--bg-base))',
+          }}
+          title="Open Settings"
+          aria-label="Settings"
+        >
+          <Settings className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+
+          <AnimatePresence>
+            {!collapsed && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="flex items-center justify-between flex-1 min-w-0"
+              >
+                <span className="font-medium text-[11px]" style={{ color: 'var(--text-primary)' }}>
+                  Settings
+                </span>
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase font-semibold"
+                  style={{ background: 'var(--bg-active)', color: 'var(--accent)' }}
+                >
+                  Ollama
+                </span>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </button>
+
         {/* User Profile */}
         <div className={`flex items-center gap-3 px-3 py-2 rounded-xl ${collapsed ? 'justify-center' : ''}`}>
 
@@ -432,6 +471,8 @@ export function Sidebar({ sessionId }: { sessionId?: string } = {}) {
           </AnimatePresence>
         </div>
       </div>
+
+      <SettingsModal />
     </motion.aside>
   );
 }

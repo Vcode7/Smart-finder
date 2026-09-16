@@ -219,9 +219,8 @@ class _SyncChatCompletionsProxy:
         self._manager = manager
 
     def create(self, **kwargs):
-        return self._manager.execute_with_fallback(
-            lambda client: client.chat.completions.create(**kwargs)
-        )
+        from app.ai.llm_router import get_llm_router
+        return get_llm_router().execute_chat_completion(**kwargs)
 
 class _SyncAudioTranscriptionsProxy:
     def __init__(self, manager: GroqKeyManager):
@@ -260,9 +259,8 @@ class _AsyncChatCompletionsProxy:
         self._manager = manager
 
     async def create(self, **kwargs):
-        return await self._manager.execute_async_with_fallback(
-            lambda client: client.chat.completions.create(**kwargs)
-        )
+        from app.ai.llm_router import get_llm_router
+        return await get_llm_router().execute_async_chat_completion(**kwargs)
 
 class _AsyncAudioTranscriptionsProxy:
     def __init__(self, manager: GroqKeyManager):
@@ -300,15 +298,11 @@ _sync_proxy = FallbackGroqClient(_key_manager)
 _async_proxy = FallbackAsyncGroqClient(_key_manager)
 
 def get_groq_client() -> Groq:
-    """Return transparent Groq client proxy backed by multi-key fallback."""
-    if not settings.get_groq_api_keys():
-        raise ValueError("No GROQ_API_KEY configured in .env file.")
+    """Return transparent Groq/LLM client proxy backed by multi-key fallback and Ollama routing."""
     return _sync_proxy  # type: ignore
 
 def get_async_groq_client() -> AsyncGroq:
-    """Return transparent AsyncGroq client proxy backed by multi-key fallback."""
-    if not settings.get_groq_api_keys():
-        raise ValueError("No GROQ_API_KEY configured in .env file.")
+    """Return transparent AsyncGroq/LLM client proxy backed by multi-key fallback and Ollama routing."""
     return _async_proxy  # type: ignore
 
 def execute_with_groq_fallback(call_fn: Callable[[Groq], Any]) -> Any:
@@ -389,31 +383,16 @@ def execute_groq_request(
     temperature: float = 0.1,
     operation: str = "general"
 ) -> Dict[str, Any]:
-    """Execute Groq request with multi-key rate-limit fallback and JSON parsing."""
-    model = settings.GROQ_MODEL
-
-    def _do_call(client: Groq):
-        safe_max_tokens = min(max_tokens, 850) if "qwen" in model.lower() else max_tokens
-        kwargs: Dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": safe_max_tokens,
-            "temperature": temperature,
-        }
-        if "qwen" in model.lower():
-            kwargs["extra_body"] = {"reasoning_format": "hidden"}
-        elif "r1" not in model.lower():
-            kwargs["response_format"] = {"type": "json_object"}
-
-        completion = client.chat.completions.create(**kwargs)
-        raw = completion.choices[0].message.content or "{}"
-        return robust_json_loads(raw, default={})
-
+    """Execute LLM request through unified LLM router with automatic Ollama/Groq fallback."""
+    from app.ai.llm_router import get_llm_router
     try:
-        return _key_manager.execute_with_fallback(_do_call)
+        return get_llm_router().execute_structured_request(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            operation=operation,
+        )
     except Exception as e:
-        print(f"[Groq Execution Failed] Operation: {operation.upper()}: {e}")
+        print(f"[LLM Execution Failed] Operation: {operation.upper()}: {e}")
         raise e

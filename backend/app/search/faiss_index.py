@@ -1,8 +1,11 @@
 import os
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 import numpy as np
 import faiss
 
@@ -76,17 +79,27 @@ class FAISSVectorManager:
     ) -> int:
         vec_np = self._prepare_vector(vector, TEXT_DIM)
         if vec_np is None:
+            logger.warning(
+                f"[FAISS] Cannot add text vector for source '{source_id}', chunk '{chunk_id}': "
+                f"vector is None or has invalid shape/values"
+            )
             return -1
         with self._lock:
-            idx = self.text_index.ntotal
-            self.text_index.add(vec_np)
-            self.text_meta.append({
+            # Append metadata FIRST so a crash between append and .add()
+            # leaves meta longer than index (detectable), not shorter (silent gap).
+            entry = {
                 "source_id": source_id,
                 "entity_type": (metadata or {}).get("type", "chunk"),
                 "entity_id": chunk_id,
                 "metadata": metadata or {},
-            })
-            return idx
+            }
+            self.text_meta.append(entry)
+            try:
+                self.text_index.add(vec_np)
+            except Exception:
+                self.text_meta.pop()  # rollback metadata on FAISS failure
+                raise
+            return self.text_index.ntotal - 1
 
     def add_image_vector(
         self,
@@ -97,17 +110,25 @@ class FAISSVectorManager:
     ) -> int:
         vec_np = self._prepare_vector(vector, IMAGE_DIM)
         if vec_np is None:
+            logger.warning(
+                f"[FAISS] Cannot add image vector for source '{source_id}', entity '{entity_id}': "
+                f"vector is None or has invalid shape/values"
+            )
             return -1
         with self._lock:
-            idx = self.image_index.ntotal
-            self.image_index.add(vec_np)
-            self.image_meta.append({
+            entry = {
                 "source_id": source_id,
                 "entity_type": (metadata or {}).get("type", "image"),
                 "entity_id": entity_id,
                 "metadata": metadata or {},
-            })
-            return idx
+            }
+            self.image_meta.append(entry)
+            try:
+                self.image_index.add(vec_np)
+            except Exception:
+                self.image_meta.pop()
+                raise
+            return self.image_index.ntotal - 1
 
     def add_face_vector(
         self,
@@ -118,17 +139,25 @@ class FAISSVectorManager:
     ) -> int:
         vec_np = self._prepare_vector(vector, FACE_DIM)
         if vec_np is None:
+            logger.warning(
+                f"[FAISS] Cannot add face vector for source '{source_id}', face '{face_id}': "
+                f"vector is None or has invalid shape/values"
+            )
             return -1
         with self._lock:
-            idx = self.face_index.ntotal
-            self.face_index.add(vec_np)
-            self.face_meta.append({
+            entry = {
                 "source_id": source_id,
                 "entity_type": "face",
                 "entity_id": face_id,
                 "metadata": metadata or {},
-            })
-            return idx
+            }
+            self.face_meta.append(entry)
+            try:
+                self.face_index.add(vec_np)
+            except Exception:
+                self.face_meta.pop()
+                raise
+            return self.face_index.ntotal - 1
 
     # ─── Searching Vectors ───────────────────────────────────────────────────────
 
@@ -136,7 +165,7 @@ class FAISSVectorManager:
         self,
         query_vector: Optional[List[float]],
         top_k: int = 25,
-        min_score: float = 0.35
+        min_score: float = 0.22  # Use TEXT_MIN_SCORE from constants — no arbitrary default
     ) -> List[Dict[str, Any]]:
         vec_np = self._prepare_vector(query_vector, TEXT_DIM)
         if vec_np is None:
@@ -238,8 +267,13 @@ class FAISSVectorManager:
                     new_text_meta = []
                     for i in keep_text_idx:
                         vec = self.text_index.reconstruct(i)
-                        new_text_index.add(np.array([vec], dtype=np.float32))
-                        new_text_meta.append(self.text_meta[i])
+                        # NaN-safe: re-validate reconstructed vector before re-adding
+                        prepared = self._prepare_vector(vec, TEXT_DIM)
+                        if prepared is not None:
+                            new_text_index.add(prepared)
+                            new_text_meta.append(self.text_meta[i])
+                        else:
+                            print(f"[FAISS] Dropped corrupted text vector at index {i} during compaction")
                     self.text_index = new_text_index
                     self.text_meta = new_text_meta
 
@@ -251,8 +285,12 @@ class FAISSVectorManager:
                     new_image_meta = []
                     for i in keep_img_idx:
                         vec = self.image_index.reconstruct(i)
-                        new_image_index.add(np.array([vec], dtype=np.float32))
-                        new_image_meta.append(self.image_meta[i])
+                        prepared = self._prepare_vector(vec, IMAGE_DIM)
+                        if prepared is not None:
+                            new_image_index.add(prepared)
+                            new_image_meta.append(self.image_meta[i])
+                        else:
+                            print(f"[FAISS] Dropped corrupted image vector at index {i} during compaction")
                     self.image_index = new_image_index
                     self.image_meta = new_image_meta
 
@@ -264,8 +302,12 @@ class FAISSVectorManager:
                     new_face_meta = []
                     for i in keep_face_idx:
                         vec = self.face_index.reconstruct(i)
-                        new_face_index.add(np.array([vec], dtype=np.float32))
-                        new_face_meta.append(self.face_meta[i])
+                        prepared = self._prepare_vector(vec, FACE_DIM)
+                        if prepared is not None:
+                            new_face_index.add(prepared)
+                            new_face_meta.append(self.face_meta[i])
+                        else:
+                            print(f"[FAISS] Dropped corrupted face vector at index {i} during compaction")
                     self.face_index = new_face_index
                     self.face_meta = new_face_meta
 
@@ -294,19 +336,31 @@ class FAISSVectorManager:
     # ─── Persistence to Disk ─────────────────────────────────────────────────────
 
     def save_to_disk(self) -> None:
+        """
+        Atomic disk write: each file is written to a .tmp sibling first,
+        then renamed (Path.replace is atomic on both POSIX and Windows).
+        A crash mid-write leaves the previous good file intact.
+        """
         with self._lock:
             try:
-                faiss.write_index(self.text_index, str(self.storage_dir / "text.index"))
-                faiss.write_index(self.image_index, str(self.storage_dir / "image.index"))
-                faiss.write_index(self.face_index, str(self.storage_dir / "face.index"))
+                for index, name in [
+                    (self.text_index,  "text"),
+                    (self.image_index, "image"),
+                    (self.face_index,  "face"),
+                ]:
+                    tmp = self.storage_dir / f"{name}.index.tmp"
+                    faiss.write_index(index, str(tmp))
+                    tmp.replace(self.storage_dir / f"{name}.index")
 
                 meta_data = {
-                    "text": self.text_meta,
+                    "text":  self.text_meta,
                     "image": self.image_meta,
-                    "face": self.face_meta,
+                    "face":  self.face_meta,
                 }
-                with open(self.storage_dir / "metadata.json", "w", encoding="utf-8") as f:
+                tmp_meta = self.storage_dir / "metadata.json.tmp"
+                with open(tmp_meta, "w", encoding="utf-8") as f:
                     json.dump(meta_data, f, ensure_ascii=False)
+                tmp_meta.replace(self.storage_dir / "metadata.json")
             except Exception as e:
                 print(f"[FAISS] Failed to save indexes to disk: {e}")
 
@@ -350,8 +404,21 @@ class FAISSVectorManager:
 # Global singleton
 _manager_instance: Optional[FAISSVectorManager] = None
 
-def get_faiss_manager() -> FAISSVectorManager:
+def get_faiss_manager(storage_dir: Optional[Path] = None) -> FAISSVectorManager:
+    """
+    Returns the global FAISSVectorManager singleton.
+    Pass storage_dir to force creation of a new instance at that path
+    (useful in tests for isolation — combine with reset_faiss_manager()).
+    """
     global _manager_instance
-    if _manager_instance is None:
-        _manager_instance = FAISSVectorManager()
+    if _manager_instance is None or storage_dir is not None:
+        _manager_instance = FAISSVectorManager(storage_dir=storage_dir)
     return _manager_instance
+
+def reset_faiss_manager() -> None:
+    """
+    Test-only: force the singleton to None so the next get_faiss_manager()
+    call creates a fresh instance. Never call this from production code paths.
+    """
+    global _manager_instance
+    _manager_instance = None

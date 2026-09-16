@@ -2,15 +2,32 @@ import asyncio
 import json
 import inspect
 import traceback
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 from app.database.session import db_run, db_get, db_all
 
 # In-memory background task queue
 _task_queue: asyncio.Queue = asyncio.Queue()
 _worker_running: bool = False
 
+# Sources pending FAISS removal (guard against stale results before rebuild runs)
+# Audit #10: FAISS index is not immediately consistent with SQLite deletes.
+_pending_deletion: Set[str] = set()
+
 async def enqueue_source_processing(source_id: str) -> None:
-    await _task_queue.put(source_id)
+    await _task_queue.put({"type": "process", "source_id": source_id})
+
+async def enqueue_faiss_removal(source_id: str) -> None:
+    """
+    Enqueues an async FAISS vector removal for a deleted source.
+    Also adds source_id to _pending_deletion so search results can filter
+    it out immediately, before the background rebuild completes.
+    """
+    _pending_deletion.add(source_id)
+    await _task_queue.put({"type": "remove_faiss", "source_id": source_id})
+
+def is_pending_deletion(source_id: str) -> bool:
+    """Returns True if this source's FAISS vectors are pending removal."""
+    return source_id in _pending_deletion
 
 def recover_stale_sources() -> None:
     """Reset any sources left stuck in 'processing' or 'indexing' state across restarts."""
@@ -106,11 +123,33 @@ async def background_worker() -> None:
     print("[IngestionPipeline] Background worker started")
     while True:
         try:
-            source_id = await _task_queue.get()
+            task = await _task_queue.get()
             try:
-                await _process_source(source_id)
+                # Support both legacy string tasks and new dict tasks
+                if isinstance(task, str):
+                    await _process_source(task)
+                elif isinstance(task, dict):
+                    task_type = task.get("type")
+                    source_id = task.get("source_id", "")
+                    if task_type == "process":
+                        await _process_source(source_id)
+                    elif task_type == "remove_faiss":
+                        try:
+                            print(f"[IngestionPipeline] Removing FAISS vectors for source {source_id}...")
+                            from app.search.faiss_index import get_faiss_manager
+                            faiss_mgr = get_faiss_manager()
+                            await asyncio.to_thread(faiss_mgr.remove_source_vectors, source_id)
+                            _pending_deletion.discard(source_id)
+                            print(f"[IngestionPipeline] FAISS vectors removed for source {source_id}.")
+                        except Exception as e:
+                            print(f"[IngestionPipeline] FAISS removal failed for {source_id}: {e}")
+                            _pending_deletion.discard(source_id)
+                    else:
+                        print(f"[IngestionPipeline] Unknown task type: {task_type}")
+                else:
+                    print(f"[IngestionPipeline] Unrecognized task format: {task!r}")
             except Exception as e:
-                print(f"[IngestionPipeline] Unhandled exception processing source {source_id}: {type(e).__name__}: {e}")
+                print(f"[IngestionPipeline] Unhandled exception processing task {task!r}: {type(e).__name__}: {e}")
                 traceback.print_exc()
             finally:
                 _task_queue.task_done()

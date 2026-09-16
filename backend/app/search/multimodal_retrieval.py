@@ -11,21 +11,11 @@ from app.search.model_pipeline import (
 from app.search.faiss_index import get_faiss_manager
 from app.search.keyword_search import search_document_chunks, search_transcripts
 from app.search.perceptual_hash import search_image_hashes
-
-DOCUMENT_EXTENSIONS = {'pdf', 'docx', 'doc', 'txt', 'md', 'csv', 'xlsx', 'xls', 'json', 'xml', 'html'}
-IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'}
-VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm'}
-AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac'}
-
-STOPWORDS = {
-    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'and', 'or', 'but', 'if', 'in', 'on',
-    'at', 'to', 'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during',
-    'before', 'after', 'above', 'below', 'from', 'up', 'down', 'of', 'off', 'over', 'under',
-    'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how',
-    'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
-    'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'can', 'will', 'just',
-    'don', 'should', 'now', 'this', 'that', 'these', 'those', 'video', 'image', 'document'
-}
+from app.search.constants import (
+    DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS,
+    STOPWORDS, COMPOSITE_MIN_SCORE, TEXT_MIN_SCORE, IMAGE_MIN_SCORE,
+    FACE_MIN_SCORE, FACE_MATCH_THRESHOLD,
+)
 
 def extract_query_tokens(text: str) -> List[str]:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
@@ -77,8 +67,19 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
     images: List[Dict[str, Any]] = []
     audio: List[Dict[str, Any]] = []
 
+    # Batch fetch all needed sources in ONE query (was N separate queries — audit #18)
+    source_ids = list(source_signals.keys())
+    if not source_ids:
+        return {"documents": [], "videos": [], "images": [], "audio": []}
+    placeholders = ",".join("?" * len(source_ids))
+    rows = db_all(
+        f"SELECT * FROM knowledge_sources WHERE id IN ({placeholders})",
+        tuple(source_ids)
+    )
+    sources_by_id = {r["id"]: r for r in rows}
+
     for source_id, sig in source_signals.items():
-        src = db_get("SELECT * FROM knowledge_sources WHERE id = ?", (source_id,))
+        src = sources_by_id.get(source_id)
         if not src:
             continue
 
@@ -109,7 +110,9 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
         max_fts = max(fts_scores, default=0.0)
 
         # Baseline vector / semantic score
-        vector_score = max(max_text_vec, max_img_vec, max_face_vec)
+        # Only fold face score into vector_score when the query actually carries a face signal (#9)
+        max_face_for_vec = max_face_vec if sig.get("is_face_query") else 0.0
+        vector_score = max(max_text_vec, max_img_vec, max_face_for_vec)
         lexical_score = max(max_fts, title_score)
 
         if sig.get("is_exact_image_match") or max_phash >= 0.95:
@@ -117,9 +120,8 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
         elif sig.get("is_face_match") and max_face_vec > 0.0:
             composite_score = max_face_vec
         elif vector_score > 0.0 and lexical_score > 0.0:
-            # Multi-signal synergy: combine vector and lexical signals
-            synergy = 0.05 * (vector_score * lexical_score)
-            composite_score = min(0.99, (0.70 * vector_score) + (0.30 * lexical_score) + synergy)
+            # Weights already sum to 1.0 — no synergy inflation (audit #9)
+            composite_score = min(0.99, (0.70 * vector_score) + (0.30 * lexical_score))
         elif vector_score > 0.0:
             composite_score = vector_score
         elif lexical_score > 0.0:
@@ -129,8 +131,8 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
         else:
             composite_score = 0.0
 
-        # Filter out very weak noise (< 0.20)
-        if composite_score < 0.20:
+        # Filter results below composite minimum (constant, not inline magic number — audit #8)
+        if composite_score < COMPOSITE_MIN_SCORE:
             continue
 
         # Clean snippet (never raw internal chunk representations)
@@ -144,8 +146,9 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
         if len(primary_snippet) > 350:
             primary_snippet = primary_snippet[:350].rstrip() + "..."
 
-        # Handle Video timestamps & frames
-        timestamps = sorted(list(set(sig.get("timestamps", []))))
+        # Round timestamps to fixed precision before dedup to prevent float equality issues (#29)
+        raw_ts = [round(t, 1) for t in sig.get("timestamps", [])]
+        timestamps = sorted(list(set(raw_ts)))
         first_ts = timestamps[0] if timestamps else 0.0
 
         matching_frames = []
@@ -172,11 +175,11 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
             "id": f"src-{src['id']}",
             "sourceId": src["id"],
             "category": category,
-            "title": src["original_name"],
-            "originalName": src["original_name"],
-            "fileType": src["file_type"],
-            "fileSize": src["file_size"],
-            "uploadDate": src["upload_date"],
+            "title": src.get("original_name", ""),
+            "originalName": src.get("original_name", ""),
+            "fileType": src.get("file_type", ""),
+            "fileSize": src.get("file_size", 0),
+            "uploadDate": src.get("upload_date", ""),
             "relevanceScore": round(composite_score, 4),
             "snippet": primary_snippet,
             "pageCount": src.get("page_count"),
@@ -241,9 +244,18 @@ async def search_by_text(query_text: str, limit: int = 30) -> Dict[str, Any]:
             }
         return source_signals[source_id]
 
-    # 1. Filename Exact / Token Match
-    all_sources = db_all("SELECT id, original_name FROM knowledge_sources")
-    for s in all_sources:
+    # 1. Filename Exact / Token Match — pre-filter with SQL LIKE before Python scoring
+    # Avoids full table scan of knowledge_sources for title matching (audit #19)
+    title_tokens = [w for w in re.sub(r"[^a-z0-9\s]", " ", clean_query.lower()).split() if len(w) >= 3]
+    if title_tokens:
+        like_clauses = " OR ".join(["original_name LIKE ?" for _ in title_tokens])
+        candidates = db_all(
+            f"SELECT id, original_name FROM knowledge_sources WHERE {like_clauses}",
+            tuple(f"%{t}%" for t in title_tokens)
+        )
+    else:
+        candidates = db_all("SELECT id, original_name FROM knowledge_sources")
+    for s in candidates:
         t_score = compute_title_score(clean_query, s["original_name"])
         if t_score > 0.0:
             get_signal(s["id"])["title_score"] = t_score
@@ -270,23 +282,24 @@ async def search_by_text(query_text: str, limit: int = 30) -> Dict[str, Any]:
     # 3. FAISS Vector Search: Text Space (Qwen3-Embedding-0.6B)
     faiss_mgr = get_faiss_manager()
     query_text_vec = get_text_embedding(clean_query)
-    text_matches = faiss_mgr.search_text(query_text_vec, top_k=limit, min_score=0.26)
-    for m in text_matches:
-        sid = m["source_id"]
-        sig = get_signal(sid)
-        sig["text_vec_scores"].append(m["score"])
-        meta = m.get("metadata", {})
-        if meta.get("preview"):
-            sig["snippets"].append(meta["preview"])
-        if meta.get("start") is not None:
-            sig["timestamps"].append(float(meta["start"]))
-        if meta.get("timestamp") is not None:
-            sig["timestamps"].append(float(meta["timestamp"]))
+    if query_text_vec is not None:  # None-safe: skip FAISS if model unavailable (audit #1)
+        text_matches = faiss_mgr.search_text(query_text_vec, top_k=limit, min_score=TEXT_MIN_SCORE)
+        for m in text_matches:
+            sid = m["source_id"]
+            sig = get_signal(sid)
+            sig["text_vec_scores"].append(m["score"])
+            meta = m.get("metadata", {})
+            if meta.get("preview"):
+                sig["snippets"].append(meta["preview"])
+            if meta.get("start") is not None:
+                sig["timestamps"].append(float(meta["start"]))
+            if meta.get("timestamp") is not None:
+                sig["timestamps"].append(float(meta["timestamp"]))
 
     # 4. FAISS Vector Search: Image Space (Jina CLIP v2 Text Encoder)
     clip_text_vec = get_multimodal_text_embedding(clean_query)
-    if clip_text_vec:
-        image_matches = faiss_mgr.search_image(clip_text_vec, top_k=limit, min_score=0.22)
+    if clip_text_vec:  # None-safe (audit #1)
+        image_matches = faiss_mgr.search_image(clip_text_vec, top_k=limit, min_score=IMAGE_MIN_SCORE)
         for m in image_matches:
             sid = m["source_id"]
             sig = get_signal(sid)
@@ -362,18 +375,22 @@ async def search_by_multimodal_signals(signals: Dict[str, Any]) -> Dict[str, Any
             if pm.get("image_path"):
                 sig["exact_image_path"] = pm["image_path"]
 
-    # 2. Face-Based Retrieval (InsightFace 512-dim index) - only when actual face was detected
+    # 2. Face-Based Retrieval — is_face_query flag set here for composite scoring (#9/#22)
     face_embeddings = signals.get("faceEmbeddings", [])
-    if signals.get("hasFace") and face_embeddings:
+    is_face_query = signals.get("hasFace", False) and bool(face_embeddings)
+    if is_face_query:
         for face_vec in face_embeddings:
-            face_matches = faiss_mgr.search_face(face_vec, top_k=25, min_score=0.48)
+            face_matches = faiss_mgr.search_face(face_vec, top_k=25, min_score=FACE_MIN_SCORE)
             for m in face_matches:
                 sid = m["source_id"]
                 sig = get_signal(sid)
                 sig["face_vec_scores"].append(m["score"])
-                sig["is_face_match"] = True
-                if sig["face_similarity"] is None or m["score"] > sig["face_similarity"]:
-                    sig["face_similarity"] = round(m["score"], 3)
+                sig["is_face_query"] = True  # signals face_score should be included in composite
+                # Only set is_face_match if this specific match exceeds threshold (audit #22)
+                if m["score"] >= FACE_MATCH_THRESHOLD:
+                    sig["is_face_match"] = True
+                    if sig["face_similarity"] is None or m["score"] > sig["face_similarity"]:
+                        sig["face_similarity"] = round(m["score"], 3)
 
                 meta = m.get("metadata", {})
                 ts = meta.get("timestamp")
@@ -391,7 +408,7 @@ async def search_by_multimodal_signals(signals: Dict[str, Any]) -> Dict[str, Any
     # 3. Image Vector Search (Jina CLIP v2 - 1024-dim visual space)
     clip_vec = signals.get("imageEmbedding")
     if clip_vec:
-        img_matches = faiss_mgr.search_image(clip_vec, top_k=30, min_score=0.45)
+        img_matches = faiss_mgr.search_image(clip_vec, top_k=30, min_score=IMAGE_MIN_SCORE)
         for m in img_matches:
             sid = m["source_id"]
             sig = get_signal(sid)
@@ -457,9 +474,9 @@ async def search_by_multimodal_signals(signals: Dict[str, Any]) -> Dict[str, Any
         # FAISS Text Vector search (Qwen3): Use precomputed embedding if available
         t_vec = signals.get("textEmbedding")
         if not t_vec:
-            t_vec = get_text_embedding(combined_text[:1200])
-        if t_vec:
-            txt_matches = faiss_mgr.search_text(t_vec, top_k=30, min_score=0.20)
+            t_vec = get_text_embedding(combined_text)
+        if t_vec is not None:  # None-safe (audit #1)
+            txt_matches = faiss_mgr.search_text(t_vec, top_k=30, min_score=TEXT_MIN_SCORE)
             for m in txt_matches:
                 sid = m["source_id"]
                 sig = get_signal(sid)
@@ -473,8 +490,8 @@ async def search_by_multimodal_signals(signals: Dict[str, Any]) -> Dict[str, Any
         # Jina CLIP text query to image index
         if not clip_vec:
             clip_t_vec = get_multimodal_text_embedding(combined_text)
-            if clip_t_vec:
-                img_matches = faiss_mgr.search_image(clip_t_vec, top_k=25, min_score=0.22)
+            if clip_t_vec is not None:  # None-safe (audit #1)
+                img_matches = faiss_mgr.search_image(clip_t_vec, top_k=25, min_score=IMAGE_MIN_SCORE)
                 for m in img_matches:
                     sid = m["source_id"]
                     sig = get_signal(sid)

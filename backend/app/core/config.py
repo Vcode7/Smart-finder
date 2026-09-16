@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     JWT_EXPIRES_DAYS: int = 7
     COOKIE_NAME: str = "sf_auth"
 
+    # Ollama Local LLM
+    OLLAMA_ENDPOINT: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = ""
+    OLLAMA_TIMEOUT: float = 45.0
+
     # Groq AI
     GROQ_API_KEY: str = ""
     GROQ_API_KEY_FALLBACK1: str = ""

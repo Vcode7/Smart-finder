@@ -204,5 +204,23 @@ MIGRATIONS: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_messages_chat ON chat_messages(chat_id)",
     "CREATE INDEX IF NOT EXISTS idx_context_chat ON chat_context(chat_id)",
+    # --- Repair tracking columns (added for audit remediation) ---
+    # needs_reembed = 1: embedding was skipped (model unavailable at ingest time)
+    # fts_synced    = 0: FTS5 insert failed — needs repair sweep
+    "ALTER TABLE document_chunks ADD COLUMN needs_reembed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE document_chunks ADD COLUMN fts_synced INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE video_transcripts ADD COLUMN needs_reembed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE video_transcripts ADD COLUMN fts_synced INTEGER NOT NULL DEFAULT 1",
+
+    # Perceptual hash prefix bucket for pre-filtering (audit issue #12)
+    "ALTER TABLE image_perceptual_hashes ADD COLUMN phash_prefix INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_iph_phash_prefix ON image_perceptual_hashes(phash_prefix)",
+
+    # App Settings (key-value store for user-configured options like Ollama model)
+    """CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now'))
+    )""",
 ]
 

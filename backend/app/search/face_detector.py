@@ -11,11 +11,11 @@ from PIL import Image
 from app.core.config import settings
 from app.database.session import db_all, db_get
 from app.search.embeddings import (
-    get_image_embedding,
     blob_to_float_array,
     cosine_similarity,
     float_array_to_blob,
 )
+
 
 def get_image_dimensions(file_path: str) -> Tuple[int, int]:
     try:

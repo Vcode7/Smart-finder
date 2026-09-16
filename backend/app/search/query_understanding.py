@@ -13,10 +13,7 @@ from app.search.model_pipeline import (
     get_image_embedding,
 )
 
-DOCUMENT_EXTENSIONS = {'pdf', 'docx', 'doc', 'txt', 'md', 'csv', 'xlsx', 'xls', 'json', 'xml', 'html'}
-IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'}
-VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm'}
-AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac'}
+from app.search.constants import DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
 
 def detect_file_category(file_name: Optional[str], mime_type: Optional[str] = None) -> str:
     if mime_type:
@@ -40,7 +37,9 @@ def detect_file_category(file_name: Optional[str], mime_type: Optional[str] = No
         if ext in DOCUMENT_EXTENSIONS:
             return "document"
 
-    return "text"
+    # Return 'unknown' for unrecognized types — callers must handle this explicitly.
+    # Previously returned 'text' which silently produced wrong behavior (#15).
+    return "unknown"
 
 async def extract_entities_with_llm(text: str) -> List[str]:
     if not settings.GROQ_API_KEY or not text.strip():
@@ -263,13 +262,22 @@ async def understand_multimodal_query(input_data: Dict[str, Any]) -> Dict[str, A
             signals["extractedEntities"].extend(entities)
             if not signals["derivedSearchKeywords"]:
                 signals["derivedSearchKeywords"] = " ".join(entities[:4]) or doc_text[:120]
-            try:
-                signals["textEmbedding"] = get_text_embedding(doc_text[:1200])
-                clip_doc_emb = get_multimodal_text_embedding(doc_text[:500])
-                if clip_doc_emb is not None:
-                    signals["clipTextEmbedding"] = clip_doc_emb
-            except Exception as e:
-                print(f"[QueryUnderstanding] Document embedding notice: {e}")
+            signals["textEmbedding"] = get_text_embedding(doc_text[:1200])
+            clip_doc_emb = get_multimodal_text_embedding(doc_text[:500])
+            if clip_doc_emb is not None:
+                signals["clipTextEmbedding"] = clip_doc_emb
+
+    # 6. Unknown file type — log visibly so it can be added to a supported category (#15)
+    elif category == "unknown" and file_name:
+        print(
+            f"[QueryUnderstanding] WARNING: Unrecognized file type for '{file_name}'. "
+            f"No visual/audio/document handler matched. "
+            f"Only text-query signals will be used. "
+            f"Add the extension to constants.py to enable proper handling."
+        )
+        # Still try to provide a keyword signal from the filename stem
+        if not signals["derivedSearchKeywords"] and file_name:
+            signals["derivedSearchKeywords"] = Path(file_name).stem
 
     return signals
 

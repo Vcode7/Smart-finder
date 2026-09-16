@@ -56,11 +56,14 @@ def expand_transcript_segment(transcript_id: str, score: float = 0.0) -> Optiona
     window_start = max(0.0, segment["start_time"] - 25.0)
     window_end = segment["end_time"] + 25.0
 
+    # Correct overlap: segment overlaps window ⟺ starts before window_end AND ends after window_start
+    # Old condition (end_time <= window_end) incorrectly excluded segments that start inside
+    # the window but run past it (e.g. a long 60s segment near the boundary). Audit #23.
     surrounding = db_all(
         """SELECT text FROM video_transcripts
-           WHERE video_id = ? AND start_time >= ? AND end_time <= ?
+           WHERE video_id = ? AND start_time <= ? AND end_time >= ?
            ORDER BY start_time ASC""",
-        (segment["video_id"], window_start, window_end)
+        (segment["video_id"], window_end, window_start)
     )
 
     combined_text = " ".join([r["text"] for r in surrounding]) if surrounding else segment["text"]

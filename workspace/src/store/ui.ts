@@ -12,6 +12,7 @@ interface UIState {
   sidebarOpen: boolean;
   commandPaletteOpen: boolean;
   workspaceModalOpen: boolean; // Full-screen workspace overlay
+  settingsModalOpen: boolean; // LLM & Ollama settings modal
   sortBy: 'relevance' | 'date';
   filterType: string | null;
   searchQuery: string;
@@ -29,6 +30,7 @@ interface UIState {
   setCommandPaletteOpen: (open: boolean) => void;
   setWorkspaceModalOpen: (open: boolean) => void;
   toggleWorkspaceModal: () => void;
+  setSettingsModalOpen: (open: boolean) => void;
   setSortBy: (sortBy: 'relevance' | 'date') => void;
   setFilterType: (type: string | null) => void;
   setSearchQuery: (query: string) => void;
@@ -55,6 +57,7 @@ export const useUIStore = create<UIState>()(
       sidebarOpen: true,
       commandPaletteOpen: false,
       workspaceModalOpen: false,
+      settingsModalOpen: false,
       sortBy: 'relevance',
       filterType: null,
       searchQuery: '',
@@ -70,6 +73,7 @@ export const useUIStore = create<UIState>()(
       setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
       setWorkspaceModalOpen: (open) => set({ workspaceModalOpen: open }),
       toggleWorkspaceModal: () => set((state) => ({ workspaceModalOpen: !state.workspaceModalOpen })),
+      setSettingsModalOpen: (open) => set({ settingsModalOpen: open }),
       setSortBy: (sortBy) => set({ sortBy }),
       setFilterType: (filterType) => set({ filterType }),
       setSearchQuery: (searchQuery) => set({ searchQuery }),
