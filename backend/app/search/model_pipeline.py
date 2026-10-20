@@ -1292,20 +1292,24 @@ _ocr_lang: Optional[str] = None
 
 def _alias_opencv_for_paddlex() -> None:
     """paddlex checks that a package named opencv-contrib-python is installed. This project
-    ships opencv-python-headless (the same cv2 module; a second cv2 would clash with it)."""
-    from paddlex.utils import deps
-    if getattr(deps.get_dep_version, "_opencv_aliased", False):
+    ships opencv-python-headless (the same cv2 module; a second cv2 would clash with it).
+    paddlex asks while its modules import (and caches the answer), so this patches
+    importlib.metadata itself and must run before paddlex/paddleocr is first imported."""
+    import importlib.metadata as md
+    if getattr(md.version, "_opencv_aliased", False):
         return
-    original = deps.get_dep_version
+    original = md.version
 
-    def get_dep_version(dep):
-        version = original(dep)
-        if version is None and dep == "opencv-contrib-python":
-            version = original("opencv-python-headless")
-        return version
+    def version(name):
+        try:
+            return original(name)
+        except md.PackageNotFoundError:
+            if name.replace("_", "-").lower() != "opencv-contrib-python":
+                raise
+            return original("opencv-python-headless")
 
-    get_dep_version._opencv_aliased = True
-    deps.get_dep_version = get_dep_version
+    version._opencv_aliased = True
+    md.version = version
 
 
 def _load_paddle_ocr():
@@ -1315,8 +1319,8 @@ def _load_paddle_ocr():
             ort.preload_dlls()
         except Exception:
             pass
-    from paddleocr import PaddleOCR
     _alias_opencv_for_paddlex()
+    from paddleocr import PaddleOCR
     gpu ="CUDAExecutionProvider" in ort.get_available_providers()
     # medium on a GPU (~0.5 s a page); on the CPU small reads as well, 4x faster
     tier = settings.OCR_PADDLE_MODEL.strip().lower() or ("medium" if gpu else "small")
