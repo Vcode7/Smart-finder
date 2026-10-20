@@ -222,6 +222,8 @@ step_build() {
 }
 
 step_configure() {
+    # a rollback runs this script against older code, which may predate configure_env.py
+    [ -f "$APP/backend/scripts/configure_env.py" ] || return 0
     "$VENV/bin/python" "$APP/backend/scripts/configure_env.py" || return 1
 }
 
