@@ -168,7 +168,7 @@ MIGRATIONS: List[str] = [
     """CREATE TABLE IF NOT EXISTS chat_context (
         id              TEXT PRIMARY KEY,
         chat_id         TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-        context_type    TEXT NOT NULL CHECK(context_type IN ('document','video','image','web')),
+        context_type    TEXT NOT NULL CHECK(context_type IN ('document','video','image','audio','web')),
         context_ref_id  TEXT NOT NULL,
         relevance_score REAL DEFAULT 0.0,
         snippet         TEXT,
@@ -215,6 +215,50 @@ MIGRATIONS: List[str] = [
     # Perceptual hash prefix bucket for pre-filtering (audit issue #12)
     "ALTER TABLE image_perceptual_hashes ADD COLUMN phash_prefix INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_iph_phash_prefix ON image_perceptual_hashes(phash_prefix)",
+
+    # Ingestion attempt counter: interrupted sources are re-queued, at most a few times
+    "ALTER TABLE knowledge_sources ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+
+    # Folder libraries: each keeps its own index (<folder>/.smartfind/index.db)
+    """CREATE TABLE IF NOT EXISTS libraries (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'folder' CHECK(kind IN ('folder','uploads','linked')),
+        root_path   TEXT,
+        index_path  TEXT NOT NULL,
+        watch       INTEGER NOT NULL DEFAULT 1,
+        paused      INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        last_scan_at TEXT
+    )""",
+    # Which library holds each source (rebuildable cache over the library databases)
+    """CREATE TABLE IF NOT EXISTS source_locator (
+        source_id   TEXT PRIMARY KEY,
+        library_id  TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_locator_library ON source_locator(library_id)",
+    # Old source ids that now point at another source (byte-identical duplicates merged
+    # during the legacy migration), so chats and links that used them keep working
+    """CREATE TABLE IF NOT EXISTS source_aliases (
+        alias_id    TEXT PRIMARY KEY,
+        source_id   TEXT NOT NULL
+    )""",
+    # Old knowledge_sources rows that now live in a library (hidden from the old index)
+    """CREATE TABLE IF NOT EXISTS legacy_migrated (
+        source_id    TEXT PRIMARY KEY,
+        migrated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    # People recognised across all libraries (face clusters the user can name)
+    """CREATE TABLE IF NOT EXISTS persons (
+        id          TEXT PRIMARY KEY,
+        name        TEXT,
+        centroid    BLOB,
+        face_count  INTEGER NOT NULL DEFAULT 0,
+        cover_face  TEXT,
+        hidden      INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
 
     # App Settings (key-value store for user-configured options like Ollama model)
     """CREATE TABLE IF NOT EXISTS app_settings (

@@ -1,0 +1,9 @@
+#!/bin/sh
+# /usr/bin/smartfinder-ctl: runs the control script from the live code (updated by
+# `smartfinder-ctl update-code`), or the copy shipped in the package before setup.
+for ctl in /opt/smartfinder/app/packaging/linux/smartfinder-ctl \
+           /usr/share/smartfinder/src/packaging/linux/smartfinder-ctl; do
+    [ -f "$ctl" ] && exec bash "$ctl" "$@"
+done
+echo "smartfinder-ctl: control script not found; reinstall the smartfinder package" >&2
+exit 1

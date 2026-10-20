@@ -2,9 +2,9 @@
 // src/components/ai/CrossSourceConnections.tsx
 // Cross-source connection insights and shared correlation patterns
 
-import { Link2, Sparkles, CheckCircle2, ShieldCheck, ArrowRight } from 'lucide-react';
+import { Link2, Sparkles } from 'lucide-react';
 
-interface ConnectionItem {
+export interface ConnectionItem {
   id: string;
   theme: string;
   description: string;
@@ -18,7 +18,7 @@ interface Props {
   onOpenSource?: (sourceId: string) => void;
 }
 
-export default function CrossSourceConnections({ connections, crossSynthesis, onOpenSource }: Props) {
+export default function CrossSourceConnections({ connections, crossSynthesis }: Props) {
   return (
     <div
       className="p-5 rounded-3xl space-y-4 shadow-xl"

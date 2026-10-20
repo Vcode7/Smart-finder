@@ -1,0 +1,2 @@
+# Linux scripts and service files must keep LF line endings, also when committed from Windows
+* text=auto eol=lf

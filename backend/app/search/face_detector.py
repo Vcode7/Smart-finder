@@ -1,114 +1,115 @@
 import os
 import re
+import io
 import json
 import uuid
 import base64
-import subprocess
+import asyncio
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Dict, Any, List, Optional, Union
 from PIL import Image
 
 from app.core.config import settings
-from app.database.session import db_all, db_get
-from app.search.embeddings import (
-    blob_to_float_array,
-    cosine_similarity,
-    float_array_to_blob,
-)
+from app.database.session import db_all
 
-
-def get_image_dimensions(file_path: str) -> Tuple[int, int]:
-    try:
-        with Image.open(file_path) as img:
-            return img.width, img.height
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", file_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        parts = result.stdout.strip().split("x")
-        w, h = int(parts[0]), int(parts[1])
-        if w > 0 and h > 0:
-            return w, h
-    except Exception:
-        pass
-    return 1280, 720
 
 def crop_face_from_image(image_path: str, bbox: Dict[str, float], output_path: str) -> bool:
+    """Save a padded crop of a face (bbox in normalized coordinates)."""
     try:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        img_w, img_h = get_image_dimensions(image_path)
-
-        x_min = bbox.get("xMin", 0.0)
-        y_min = bbox.get("yMin", 0.0)
-        x_max = bbox.get("xMax", 1.0)
-        y_max = bbox.get("yMax", 1.0)
-
-        # 15% padding
-        pad_x = (x_max - x_min) * 0.15
-        pad_y = (y_max - y_min) * 0.15
-
-        x1 = max(0.0, x_min - pad_x)
-        y1 = max(0.0, y_min - pad_y)
-        x2 = min(1.0, x_max + pad_x)
-        y2 = min(1.0, y_max + pad_y)
-
-        crop_x = int(round(x1 * img_w))
-        crop_y = int(round(y1 * img_h))
-        crop_w = max(32, int(round((x2 - x1) * img_w)))
-        crop_h = max(32, int(round((y2 - y1) * img_h)))
-
-        safe_crop_w = min(crop_w, img_w - crop_x)
-        safe_crop_h = min(crop_h, img_h - crop_y)
-
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", image_path,
-                "-filter:v", f"crop={safe_crop_w}:{safe_crop_h}:{crop_x}:{crop_y}",
-                "-q:v", "2", output_path
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True
-        )
-        return Path(output_path).exists()
+        with Image.open(image_path) as img:
+            w, h = img.width, img.height
+            x_min, y_min = bbox.get("xMin", 0.0), bbox.get("yMin", 0.0)
+            x_max, y_max = bbox.get("xMax", 1.0), bbox.get("yMax", 1.0)
+            pad_x = (x_max - x_min) * 0.15
+            pad_y = (y_max - y_min) * 0.15
+            box = (
+                int(round(max(0.0, x_min - pad_x) * w)),
+                int(round(max(0.0, y_min - pad_y) * h)),
+                int(round(min(1.0, x_max + pad_x) * w)),
+                int(round(min(1.0, y_max + pad_y) * h)),
+            )
+            if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+                return False
+            img.crop(box).convert("RGB").save(output_path, "JPEG", quality=90)
+        return True
     except Exception as e:
-        print(f"[FaceDetector] FFmpeg crop notice: {e}")
-        # Try PIL crop fallback
-        try:
-            with Image.open(image_path) as img:
-                box = (
-                    int(round(max(0.0, bbox.get("xMin", 0.0)) * img.width)),
-                    int(round(max(0.0, bbox.get("yMin", 0.0)) * img.height)),
-                    int(round(min(1.0, bbox.get("xMax", 1.0)) * img.width)),
-                    int(round(min(1.0, bbox.get("yMax", 1.0)) * img.height))
-                )
-                cropped = img.crop(box)
-                cropped.save(output_path, "JPEG")
-                return True
-        except Exception:
-            return False
+        print(f"[FaceDetector] Crop notice: {e}")
+        return False
+
+
+async def _vision_analysis(image_path: str) -> Dict[str, Any]:
+    """Optional Groq vision call for scene description, OCR and named entities."""
+    with Image.open(image_path) as src_im:
+        rgb_im = src_im.convert("RGB")
+        max_dim = 800
+        if max(rgb_im.width, rgb_im.height) > max_dim:
+            scale = max_dim / max(rgb_im.width, rgb_im.height)
+            rgb_im = rgb_im.resize((int(rgb_im.width * scale), int(rgb_im.height * scale)), Image.Resampling.BILINEAR)
+        buf = io.BytesIO()
+        rgb_im.save(buf, format="JPEG", quality=80)
+    data_url = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+    prompt = (
+        "Analyze this image for facial recognition, entity identification, and OCR text.\n"
+        "Do NOT include any <think> tags or conversational explanations.\n"
+        "Return ONLY a raw valid JSON object with this exact structure:\n"
+        "{\n"
+        '  "ocr_text": "All readable text in the image",\n'
+        '  "visual_description": "Detailed visual description of person/scene",\n'
+        '  "identified_names": ["Name 1", "Name 2"]\n'
+        "}"
+    )
+
+    from app.ai.groq_client import get_async_groq_client, robust_json_loads
+    client = get_async_groq_client()
+    call_kwargs = {
+        "model": settings.GROQ_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        "max_tokens": 1000,
+        "temperature": 0.1,
+    }
+    if "qwen" in settings.GROQ_MODEL.lower():
+        call_kwargs["extra_body"] = {"reasoning_format": "hidden"}
+
+    completion = await asyncio.wait_for(client.chat.completions.create(**call_kwargs), timeout=10.0)
+    raw = completion.choices[0].message.content or "{}"
+    if "<think>" in raw:
+        raw = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw).strip()
+    return robust_json_loads(raw, default={})
+
 
 async def detect_faces_in_image(
     image_input: Union[str, bytes],
     options: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    """
+    Faces (InsightFace, local) plus OCR / description for an image.
+
+    options:
+      sourceId   — "query" for search inputs (default)
+      useVision  — call the Groq vision model for OCR/description/names (default True)
+      saveCrops  — write face crops to disk (default: only for non-query images)
+    """
     opts = options or {}
     source_id = opts.get("sourceId", "query")
-    crop_dir = opts.get("cropDir") or str(settings.resolved_upload_dir / "faces" / source_id)
-    Path(crop_dir).mkdir(parents=True, exist_ok=True)
+    use_vision = bool(opts.get("useVision", True))
+    save_crops = bool(opts.get("saveCrops", source_id != "query"))
+    crop_dir = Path(opts.get("cropDir") or (settings.resolved_upload_dir / "faces" / source_id))
 
     temp_image_path: Optional[str] = None
     if isinstance(image_input, bytes):
         temp_dir = settings.resolved_upload_dir / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_image_path = str(temp_dir / f"detect_{uuid.uuid4()}.jpg")
+        temp_image_path = str(temp_dir / f"detect_{uuid.uuid4()}.img")
         with open(temp_image_path, "wb") as f:
             f.write(image_input)
         image_path = temp_image_path
@@ -118,106 +119,58 @@ async def detect_faces_in_image(
     detected_faces = []
     ocr_text = ""
     visual_description = ""
-    identified_names = []
+    identified_names: List[str] = []
 
-    # Try Groq vision model if API key is present
-    if settings.GROQ_API_KEY and Path(image_path).exists():
+    try:
+        if not Path(image_path).exists():
+            return {"hasFace": False, "faces": [], "primaryFace": None, "ocrText": "",
+                    "visualDescription": "", "identifiedNames": []}
+
+        # 1. Local InsightFace detection + 512-dim ArcFace embeddings
         try:
-            import io
-            import asyncio
-            with Image.open(image_path) as src_im:
-                rgb_im = src_im.convert("RGB")
-                max_dim = 800
-                if max(rgb_im.width, rgb_im.height) > max_dim:
-                    scale = max_dim / max(rgb_im.width, rgb_im.height)
-                    nw = int(rgb_im.width * scale)
-                    nh = int(rgb_im.height * scale)
-                    resized_im = rgb_im.resize((nw, nh), Image.Resampling.BILINEAR)
-                else:
-                    resized_im = rgb_im
-                
-                buf = io.BytesIO()
-                resized_im.save(buf, format="JPEG", quality=80)
-                b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
-            data_url = f"data:image/jpeg;base64,{b64_img}"
+            from app.search.model_pipeline import detect_and_embed_faces
+            insight_faces = await asyncio.to_thread(detect_and_embed_faces, image_path)
+            for i, iface in enumerate(insight_faces):
+                box = iface.get("box", [0, 0, 1, 1])
+                bbox = {"yMin": box[0], "xMin": box[1], "yMax": box[2], "xMax": box[3]}
+                face_id = str(uuid.uuid4())
+                crop_path = None
+                if save_crops:
+                    crop_file = str(crop_dir / f"face_{face_id}_{i}.jpg")
+                    if await asyncio.to_thread(crop_face_from_image, image_path, bbox, crop_file):
+                        crop_path = crop_file
+                detected_faces.append({
+                    "id": face_id,
+                    "bbox": bbox,
+                    "confidence": float(iface.get("confidence", 0.9)),
+                    "label": "person",
+                    "cropPath": crop_path,
+                    "embedding": iface.get("embedding", []),
+                })
+        except Exception as e_face:
+            print(f"[FaceDetector] InsightFace extraction notice: {e_face}")
 
-            prompt = (
-                "Analyze this image for facial recognition, entity identification, and OCR text.\n"
-                "Do NOT include any <think> tags or conversational explanations.\n"
-                "Return ONLY a raw valid JSON object with this exact structure:\n"
-                "{\n"
-                '  "faces": [{"box": [ymin, xmin, ymax, xmax], "confidence": 0.95, "label": "person"}],\n'
-                '  "ocr_text": "All readable text in the image",\n'
-                '  "visual_description": "Detailed visual description of person/scene",\n'
-                '  "identified_names": ["Name 1", "Name 2"]\n'
-                "}"
-            )
-
-            from app.ai.groq_client import get_async_groq_client, robust_json_loads
-            client = get_async_groq_client()
-            call_kwargs = {
-                "model": settings.GROQ_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    }
-                ],
-                "max_tokens": 1000,
-                "temperature": 0.1,
-            }
-            if "qwen" in settings.GROQ_MODEL.lower():
-                call_kwargs["extra_body"] = {"reasoning_format": "hidden"}
-
-            completion = await asyncio.wait_for(
-                client.chat.completions.create(**call_kwargs),
-                timeout=12.0
-            )
-            raw = completion.choices[0].message.content or "{}"
-            if "<think>" in raw:
-                raw = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw).strip()
-            parsed = robust_json_loads(raw, default={})
-
-            ocr_text = parsed.get("ocr_text", "")
-            visual_description = parsed.get("visual_description", "")
-            if isinstance(parsed.get("identified_names"), list):
-                identified_names.extend([n for n in parsed["identified_names"] if isinstance(n, str) and n.strip()])
-
-            # Real face detection & 512-dim ArcFace embeddings using InsightFace
+        # 2. OCR / description: Groq vision when requested and configured, else local Tesseract OCR
+        vision_done = False
+        if use_vision and settings.get_groq_api_keys():
             try:
-                from app.search.model_pipeline import detect_and_embed_faces
-                insight_faces = await asyncio.to_thread(detect_and_embed_faces, image_path)
-                for i, iface in enumerate(insight_faces):
-                    box = iface.get("box", [0, 0, 1, 1])
-                    bbox = {
-                        "yMin": box[0], "xMin": box[1], "yMax": box[2], "xMax": box[3]
-                    }
-                    face_id = str(uuid.uuid4())
-                    crop_file = str(Path(crop_dir) / f"face_{face_id}_{i}.jpg")
-                    cropped = crop_face_from_image(image_path, bbox, crop_file)
-                    detected_faces.append({
-                        "id": face_id,
-                        "bbox": bbox,
-                        "confidence": float(iface.get("confidence", 0.9)),
-                        "label": "person",
-                        "cropPath": crop_file if cropped else None,
-                        "embedding": iface.get("embedding", []),
-                    })
-            except Exception as e_face:
-                print(f"[FaceDetector] InsightFace extraction notice: {e_face}")
-        except Exception as e:
-            print(f"[FaceDetector] Groq vision analysis notice: {e}")
-
-    # Clean up temp file
-    if temp_image_path and Path(temp_image_path).exists():
-        try:
-            os.unlink(temp_image_path)
-        except Exception:
-            pass
-
+                parsed = await _vision_analysis(image_path)
+                ocr_text = parsed.get("ocr_text", "") or ""
+                visual_description = parsed.get("visual_description", "") or ""
+                if isinstance(parsed.get("identified_names"), list):
+                    identified_names.extend([n for n in parsed["identified_names"] if isinstance(n, str) and n.strip()])
+                vision_done = True
+            except Exception as e:
+                print(f"[FaceDetector] Groq vision analysis notice: {e}")
+        if not vision_done:
+            from app.search.model_pipeline import run_ocr
+            ocr_text = await asyncio.to_thread(run_ocr, image_path)
+    finally:
+        if temp_image_path and Path(temp_image_path).exists():
+            try:
+                os.unlink(temp_image_path)
+            except Exception:
+                pass
 
     return {
         "hasFace": len(detected_faces) > 0,
@@ -228,56 +181,57 @@ async def detect_faces_in_image(
         "identifiedNames": identified_names,
     }
 
+
 def search_face_embeddings(
     query_embedding: List[float],
     min_similarity: float = 0.50,
     limit: int = 15
 ) -> List[Dict[str, Any]]:
-    rows = db_all("SELECT * FROM face_embeddings")
+    """Nearest stored faces via the FAISS face index, joined to their source/frame rows."""
+    from app.search.faiss_index import get_faiss_manager
+
+    hits = get_faiss_manager().search_face(query_embedding, top_k=max(limit * 3, 30), min_score=min_similarity)
+    if not hits:
+        return []
+
+    face_ids = [h["entity_id"] for h in hits]
+    placeholders = ",".join("?" * len(face_ids))
+    rows = db_all(
+        f"""SELECT fe.id, fe.source_id, fe.video_id, fe.image_id, fe.frame_id, fe.timestamp,
+                   fe.confidence, fe.bbox_json, ks.original_name, vf.frame_path, vf.frame_number
+            FROM face_embeddings fe
+            LEFT JOIN knowledge_sources ks ON ks.id = fe.source_id
+            LEFT JOIN video_frames vf ON vf.id = fe.frame_id
+            WHERE fe.id IN ({placeholders})""",
+        tuple(face_ids)
+    )
+    by_id = {r["id"]: r for r in rows}
+
     matches = []
-
-    for row in rows:
-        emb_blob = row.get("embedding")
-        if not emb_blob:
+    for h in hits:
+        row = by_id.get(h["entity_id"])
+        if not row:
             continue
-        stored_vec = blob_to_float_array(emb_blob)
-        similarity = cosine_similarity(query_embedding, stored_vec)
-
-        if similarity >= min_similarity:
-            src = db_get("SELECT original_name FROM knowledge_sources WHERE id = ?", (row["source_id"],))
-            frame_path = None
-            frame_number = None
-
-            if row.get("frame_id"):
-                frame_row = db_get(
-                    "SELECT frame_path, frame_number FROM video_frames WHERE id = ?",
-                    (row["frame_id"],)
-                )
-                if frame_row:
-                    frame_path = frame_row.get("frame_path")
-                    frame_number = frame_row.get("frame_number")
-
-            bbox = None
-            if row.get("bbox_json"):
-                try:
-                    bbox = json.loads(row["bbox_json"])
-                except Exception:
-                    pass
-
-            matches.append({
-                "id": row["id"],
-                "sourceId": row["source_id"],
-                "videoId": row.get("video_id"),
-                "imageId": row.get("image_id"),
-                "frameId": row.get("frame_id"),
-                "timestamp": row.get("timestamp"),
-                "frameNumber": frame_number,
-                "confidence": row.get("confidence", 0.9),
-                "similarity": round(similarity, 4),
-                "sourceName": src.get("original_name") if src else None,
-                "framePath": frame_path,
-                "bbox": bbox,
-            })
+        bbox = None
+        if row.get("bbox_json"):
+            try:
+                bbox = json.loads(row["bbox_json"])
+            except Exception:
+                pass
+        matches.append({
+            "id": row["id"],
+            "sourceId": row["source_id"],
+            "videoId": row.get("video_id"),
+            "imageId": row.get("image_id"),
+            "frameId": row.get("frame_id"),
+            "timestamp": row.get("timestamp"),
+            "frameNumber": row.get("frame_number"),
+            "confidence": row.get("confidence", 0.9),
+            "similarity": round(float(h["score"]), 4),
+            "sourceName": row.get("original_name"),
+            "framePath": row.get("frame_path"),
+            "bbox": bbox,
+        })
 
     matches.sort(key=lambda x: x["similarity"], reverse=True)
     return matches[:limit]

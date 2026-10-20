@@ -1,18 +1,175 @@
 import uuid
 import json
 import datetime
+from pathlib import PurePosixPath
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, Depends
+
+from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.database.session import db_get, db_all, db_run, get_db_context
 from app.api.deps import require_auth
 from app.schemas.chat import ChatCreate, ChatUpdate, MessageCreate
+from app.search.constants import tokenize
 
 router = APIRouter(prefix="/chats", tags=["chats"])
 
+CONTEXT_TYPES = ("document", "video", "image", "audio", "web")
+HISTORY_MESSAGES = 8          # most recent turns sent to the LLM
+CONTEXT_ITEM_CHARS = 1800     # expanded text per context item
+CONTEXT_TOTAL_CHARS = 9000    # all context items together
+
 def iso_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _chat_row(chat: Dict[str, Any]) -> Dict[str, Any]:
+    """Chat row with camelCase aliases for the fields the frontend reads."""
+    out = dict(chat)
+    out["searchMode"] = chat.get("search_mode")
+    out["createdAt"] = chat.get("created_at")
+    out["updatedAt"] = chat.get("updated_at")
+    return out
+
+
+def _context_type(raw: Any) -> str:
+    ctype = str(raw or "document")
+    return ctype if ctype in CONTEXT_TYPES else "document"
+
+
+def _context_fields(it: Dict[str, Any], fallback_id: str) -> tuple:
+    """(type, ref_id, score, snippet, metadata_json) of a client-sent context item."""
+    ctype = _context_type(it.get("type"))
+    ref_id = str(it.get("refId") or it.get("sourceId") or it.get("id") or fallback_id)
+    meta = it.get("metadata")
+    meta = dict(meta) if isinstance(meta, dict) else {}
+    if "title" not in meta and it.get("title"):
+        meta["title"] = it.get("title")
+    try:
+        score = float(it.get("relevanceScore"))
+    except (TypeError, ValueError):
+        score = 0.8
+    snippet = it.get("snippet")
+    return ctype, ref_id, score, snippet if isinstance(snippet, str) else "", json.dumps(meta)
+
+
+def _pick_passages(rows: List[Dict[str, Any]], question: str) -> str:
+    """The passages sharing most words with the question, in document order on ties."""
+    q_tokens = set(tokenize(question))
+
+    def overlap(text: str) -> int:
+        return len(q_tokens & set(tokenize(text))) if q_tokens else 0
+
+    ranked = sorted(enumerate(rows), key=lambda ir: (-overlap(ir[1]["text"]), ir[0]))
+    picked, used = [], 0
+    for _, r in ranked[:6]:
+        text = (r["text"] or "").strip()
+        if used + len(text) > CONTEXT_ITEM_CHARS and picked:
+            break
+        page = f"(page {r['page']}) " if r.get("page") else ""
+        picked.append(page + text)
+        used += len(text)
+    return "\n".join(picked)[:CONTEXT_ITEM_CHARS]
+
+
+def _expand_library_context(source_id: str, start: Any, question: str) -> Optional[str]:
+    """Context from a folder library; None when the source isn't in one."""
+    from app.library.manager import get_library_manager
+    found = get_library_manager().find_source(source_id)
+    if not found:
+        return None
+    lib, src = found
+    if start is not None:
+        try:
+            t = float(start)
+            segs = lib.db.all(
+                "SELECT text FROM transcript_segments WHERE source_id = ? AND ts_end >= ? AND ts_start <= ? "
+                "ORDER BY ts_start", (src["id"], max(0.0, t - 30.0), t + 90.0))
+            if segs:
+                return " ".join(s["text"] for s in segs)[:CONTEXT_ITEM_CHARS]
+        except (TypeError, ValueError):
+            pass
+    rows = lib.db.all(
+        "SELECT text, page FROM chunks WHERE source_id = ? AND kind != 'title' ORDER BY ord LIMIT 400", (src["id"],))
+    return _pick_passages(rows, question) if rows else ""
+
+
+def _source_location(ref_id: str, meta: Dict[str, Any]) -> Optional[str]:
+    """'<library> › <folder>' of a local item (folder names often say the event or place)."""
+    from app.library.manager import get_library_manager
+    source_id = str(meta.get("sourceId") or ref_id or "").removeprefix("src-")
+    found = get_library_manager().find_source(source_id) if source_id else None
+    if found:
+        lib, src = found
+        library, rel = lib.name, src["rel_path"]
+    elif meta.get("relPath"):
+        library, rel = meta.get("libraryName") or "", str(meta["relPath"])
+    else:
+        return None
+    folder = str(PurePosixPath(rel.replace("\\", "/")).parent)
+    folder = "" if folder == "." else folder
+    if not folder:
+        return f"{library} (top level)" if library else None
+    return f"{library} › {folder}" if library else folder
+
+
+def _expand_local_context(ref_id: str, meta: Dict[str, Any], question: str) -> str:
+    """
+    Fuller text for a local knowledge-base item: the source's passages that best match
+    the question (documents/images) or the transcript window around the matched time
+    (audio/video). Returns "" for internet items or unknown sources.
+    """
+    source_id = str(meta.get("sourceId") or ref_id or "").removeprefix("src-")
+    if not source_id:
+        return ""
+    start = meta.get("startTime", meta.get("timestamp"))
+    library_text = _expand_library_context(source_id, start, question)
+    if library_text is not None:
+        return library_text
+    if not db_get("SELECT 1 FROM knowledge_sources WHERE id = ?", (source_id,)):
+        return ""
+
+    transcripts = []
+    if start is not None:
+        try:
+            start_f = float(start)
+            transcripts = db_all(
+                """SELECT text FROM video_transcripts
+                   WHERE source_id = ? AND end_time >= ? AND start_time <= ?
+                   ORDER BY start_time ASC""",
+                (source_id, max(0.0, start_f - 30.0), start_f + 90.0)
+            )
+        except (TypeError, ValueError):
+            transcripts = []
+    if transcripts:
+        return " ".join(t["text"] for t in transcripts)[:CONTEXT_ITEM_CHARS]
+
+    q_tokens = set(tokenize(question))
+    rows = db_all(
+        "SELECT chunk_text, page_num FROM document_chunks WHERE source_id = ? ORDER BY chunk_order ASC LIMIT 400",
+        (source_id,)
+    )
+    if not rows:
+        rows = [{"chunk_text": r["text"], "page_num": None} for r in db_all(
+            "SELECT text FROM video_transcripts WHERE source_id = ? ORDER BY start_time ASC LIMIT 400", (source_id,)
+        )]
+    if not rows:
+        return ""
+
+    def overlap(text: str) -> int:
+        return len(q_tokens & set(tokenize(text))) if q_tokens else 0
+
+    ranked = sorted(enumerate(rows), key=lambda ir: (-overlap(ir[1]["chunk_text"]), ir[0]))
+    picked, used = [], 0
+    for _, r in ranked[:6]:
+        text = r["chunk_text"].strip()
+        if used + len(text) > CONTEXT_ITEM_CHARS and picked:
+            break
+        page = f"(page {r['page_num']}) " if r.get("page_num") else ""
+        picked.append(page + text)
+        used += len(text)
+    return "\n".join(picked)[:CONTEXT_ITEM_CHARS]
 
 @router.get("")
 async def list_chats(user: Dict[str, Any] = Depends(require_auth)):
@@ -20,7 +177,7 @@ async def list_chats(user: Dict[str, Any] = Depends(require_auth)):
         "SELECT id, title, search_mode, created_at, updated_at FROM chats WHERE user_id = ? ORDER BY updated_at DESC",
         (user["id"],)
     )
-    return {"chats": chats}
+    return {"chats": [_chat_row(c) for c in chats]}
 
 @router.post("")
 async def create_chat(req: ChatCreate, user: Dict[str, Any] = Depends(require_auth)):
@@ -31,14 +188,14 @@ async def create_chat(req: ChatCreate, user: Dict[str, Any] = Depends(require_au
         (chat_id, user["id"], req.title or "New Chat", req.searchMode or "internet", now, now)
     )
     return {
-        "chat": {
+        "chat": _chat_row({
             "id": chat_id,
             "user_id": user["id"],
             "title": req.title or "New Chat",
             "search_mode": req.searchMode or "internet",
             "created_at": now,
             "updated_at": now,
-        }
+        })
     }
 
 @router.get("/{chat_id}")
@@ -72,8 +229,15 @@ async def get_chat(chat_id: str, user: Dict[str, Any] = Depends(require_auth)):
             "metadata": meta,
         })
 
+    for m in messages:
+        try:
+            m["citations"] = json.loads(m.get("citations_json") or "[]")
+        except Exception:
+            m["citations"] = []
+        m["createdAt"] = m.get("created_at")
+
     return {
-        "chat": chat,
+        "chat": _chat_row(chat),
         "messages": messages,
         "contextItems": context_items,
     }
@@ -84,23 +248,18 @@ async def update_chat_context(chat_id: str, req: Dict[str, Any], user: Dict[str,
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
-    items = req.get("contextItems", [])
+    items = req.get("contextItems") or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="contextItems must be a list")
     now = iso_now()
     with get_db_context() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM chat_context WHERE chat_id = ?", (chat_id,))
         for it in items:
+            if not isinstance(it, dict):
+                continue
             ctx_id = str(uuid.uuid4())
-            ctype = it.get("type", "document")
-            if ctype not in ("document", "video", "image", "web"):
-                ctype = "document"
-            ref_id = str(it.get("refId") or it.get("sourceId") or it.get("id") or ctx_id)
-            snippet = it.get("snippet", "")
-            meta = it.get("metadata") or {}
-            if "title" not in meta and it.get("title"):
-                meta["title"] = it.get("title")
-            meta_json = json.dumps(meta)
-            score = float(it.get("relevanceScore", 0.8))
+            ctype, ref_id, score, snippet, meta_json = _context_fields(it, ctx_id)
             cursor.execute(
                 "INSERT INTO chat_context (id, chat_id, context_type, context_ref_id, relevance_score, snippet, metadata_json, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (ctx_id, chat_id, ctype, ref_id, score, snippet, meta_json, now)
@@ -125,12 +284,15 @@ async def update_chat(chat_id: str, req: ChatUpdate, user: Dict[str, Any] = Depe
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
     now = iso_now()
     db_run(
         "UPDATE chats SET title = ?, updated_at = ? WHERE id = ?",
-        (req.title.strip(), now, chat_id)
+        (title, now, chat_id)
     )
-    return {"success": True, "title": req.title.strip()}
+    return {"success": True, "title": title}
 
 @router.delete("/{chat_id}")
 async def delete_chat(chat_id: str, user: Dict[str, Any] = Depends(require_auth)):
@@ -171,16 +333,7 @@ async def send_message(chat_id: str, req: MessageCreate, user: Dict[str, Any] = 
     if req.contextItems:
         for it in req.contextItems:
             ctx_id = str(uuid.uuid4())
-            ctype = it.get("type", "document")
-            if ctype not in ("document", "video", "image", "web"):
-                ctype = "document"
-            ref_id = str(it.get("refId") or it.get("sourceId") or it.get("id") or ctx_id)
-            snippet = it.get("snippet", "")
-            meta = it.get("metadata") or {}
-            if "title" not in meta and it.get("title"):
-                meta["title"] = it.get("title")
-            meta_json = json.dumps(meta)
-            score = float(it.get("relevanceScore", 0.8))
+            ctype, ref_id, score, snippet, meta_json = _context_fields(it, ctx_id)
 
             # avoid duplicate insertions if ref_id already exists in this chat's context
             existing = db_get(
@@ -196,46 +349,56 @@ async def send_message(chat_id: str, req: MessageCreate, user: Dict[str, Any] = 
                 except Exception:
                     pass
 
-    # Build conversation context & call Groq
-    recent_messages = db_all(
-        "SELECT role, content FROM chat_messages WHERE chat_id = ? ORDER BY created_at ASC LIMIT 10",
-        (chat_id,)
-    )
+    # Build conversation context: the most recent turns, newest last
+    recent_messages = list(reversed(db_all(
+        "SELECT role, content FROM chat_messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+        (chat_id, HISTORY_MESSAGES)
+    )))
     context_rows = db_all(
-        "SELECT context_type, snippet, metadata_json, relevance_score FROM chat_context WHERE chat_id = ? ORDER BY relevance_score DESC, added_at DESC",
+        "SELECT context_type, context_ref_id, snippet, metadata_json, relevance_score FROM chat_context WHERE chat_id = ? ORDER BY relevance_score DESC, added_at DESC",
         (chat_id,)
     )
 
-    context_snippets = []
-    citations = []
-    has_attached_file = False
-    for idx, cr in enumerate(context_rows):
-        try:
-            m = json.loads(cr.get("metadata_json") or "{}")
-        except Exception:
-            m = {}
-        title = m.get("title") or m.get("sourceName") or f"Source {idx + 1}"
-        url = m.get("url")
-        is_user_att = bool(m.get("isUserAttachment") or "[Attached" in title)
-        if is_user_att:
-            has_attached_file = True
+    def _build_context():
+        snippets = []
+        cites = []
+        attached = False
+        has_local = False
+        for idx, cr in enumerate(context_rows[:12]):
+            try:
+                m = json.loads(cr.get("metadata_json") or "{}")
+            except Exception:
+                m = {}
+            title = m.get("title") or m.get("sourceName") or f"Source {idx + 1}"
+            url = m.get("url")
+            is_user_att = bool(m.get("isUserAttachment") or "[Attached" in title)
+            attached = attached or is_user_att
 
-        raw_snip = (cr.get("snippet") or "").strip()
-        if not raw_snip and m.get("extractedSnippet"):
-            raw_snip = str(m.get("extractedSnippet")).strip()
+            raw_snip = (cr.get("snippet") or "").strip()
+            if not raw_snip and m.get("extractedSnippet"):
+                raw_snip = str(m.get("extractedSnippet")).strip()
+            expanded = "" if is_user_att else _expand_local_context(cr.get("context_ref_id") or "", m, msg_text)
+            body = expanded or raw_snip
+            limit = 1500 if is_user_att else CONTEXT_ITEM_CHARS
+            body = (body[:limit] + "...") if len(body) > limit else body
+            location = None if is_user_att or url else _source_location(cr.get("context_ref_id") or "", m)
+            has_local = has_local or location is not None
 
-        # Generous snippet allowance for attached document/image (up to 1500 chars), other sources up to 500 chars
-        limit = 1500 if is_user_att else 500
-        trunc_snip = (raw_snip[:limit] + "...") if len(raw_snip) > limit else raw_snip
+            prefix = "USER ATTACHED FILE" if is_user_att else cr["context_type"].upper()
+            where = f" — folder: {location}" if location else ""
+            entry = f"[{prefix}] {title}{where}:\n{body}"
+            if is_user_att:
+                snippets.insert(0, entry)
+            else:
+                snippets.append(entry)
+            cite = {"title": title, "url": url, "type": cr["context_type"],
+                    "sourceId": m.get("sourceId") or cr.get("context_ref_id")}
+            if location:
+                cite["folder"] = location
+            cites.append(cite)
+        return snippets, cites, attached, has_local
 
-        prefix = "USER ATTACHED FILE" if is_user_att else cr['context_type'].upper()
-        snippet_entry = f"[{prefix}] {title}:\n{trunc_snip}"
-        # Put user attached files at the very top of context
-        if is_user_att:
-            context_snippets.insert(0, snippet_entry)
-        else:
-            context_snippets.append(snippet_entry)
-        citations.append({"title": title, "url": url, "type": cr["context_type"]})
+    context_snippets, citations, has_attached_file, has_local_files = await run_in_threadpool(_build_context)
 
     system_prompt = (
         "You are an elite research AI assistant. "
@@ -248,60 +411,41 @@ async def send_message(chat_id: str, req: MessageCreate, user: Dict[str, Any] = 
             "You MUST carefully analyze, interpret, and ground your response in the attached document/image's contents and visual details, "
             "synthesizing it with any relevant external knowledge sources."
         )
+    if has_local_files:
+        system_prompt += (
+            "\n\nThe user's own files show the folder they are stored in (\"folder: <library> › <path>\"). "
+            "Folder names often name the event, trip, date or people a file belongs to: treat them as facts "
+            "about the file, and mention the folder when it helps the user find it."
+        )
 
     if context_snippets:
-        # Take up to 10 sources, cap total joined context to 3500 chars
-        joined_context = "\n\n".join(context_snippets[:10])[:3500]
+        joined_context = "\n\n".join(context_snippets)[:CONTEXT_TOTAL_CHARS]
         system_prompt += f"\n\n### RESEARCH CONTEXT:\n{joined_context}"
 
     messages_payload = [{"role": "system", "content": system_prompt}]
-    # Keep last 4 recent messages, truncating long individual messages
-    for m in recent_messages[-4:]:
+    for m in recent_messages:
         content = (m.get("content") or "").strip()
-        if len(content) > 500:
-            content = content[:500] + "..."
+        if len(content) > 1500:
+            content = content[:1500] + "..."
         messages_payload.append({"role": m["role"], "content": content})
 
     assistant_content = ""
-    candidate_models = [settings.GROQ_MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
-    seen = set()
-    models_to_try = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
-
     try:
-        from app.ai.groq_client import get_groq_client
-        client = get_groq_client()
-
-        for model_name in models_to_try:
-            try:
-                is_qwen = "qwen" in model_name.lower()
-                tokens_limit = 800 if is_qwen else 2048
-                call_kwargs = {
-                    "model": model_name,
-                    "messages": messages_payload,
-                    "max_tokens": tokens_limit,
-                    "temperature": 0.3,
-                }
-                if is_qwen:
-                    call_kwargs["extra_body"] = {"reasoning_format": "hidden"}
-
-                completion = client.chat.completions.create(**call_kwargs)
-                choice = completion.choices[0]
-                raw_text = (choice.message.content or "").strip()
-
-                if "<think>" in raw_text:
-                    import re
-                    raw_text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw_text).strip()
-
-                if raw_text:
-                    assistant_content = raw_text
-                    print(f"[ChatAPI] Generated response using {model_name}")
-                    break
-                else:
-                    print(f"[ChatAPI] Model {model_name} returned empty content, trying fallback model...")
-            except Exception as e:
-                print(f"[ChatAPI] Model {model_name} failed: {e}, trying fallback model...")
-    except Exception as outer_e:
-        print(f"[ChatAPI] Groq client initialization error: {outer_e}")
+        from app.ai.groq_client import get_async_groq_client
+        # The LLM router picks the model: the selected Ollama model, else the Groq model.
+        completion = await get_async_groq_client().chat.completions.create(
+            messages=messages_payload,
+            max_tokens=2048,
+            temperature=0.3,
+            timeout=60.0,
+        )
+        raw_text = (completion.choices[0].message.content or "").strip()
+        if "<think>" in raw_text:
+            import re
+            raw_text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw_text).strip()
+        assistant_content = raw_text
+    except Exception as e:
+        print(f"[ChatAPI] LLM generation failed: {e}")
 
     if not assistant_content:
         assistant_content = "I was unable to generate a response at this time. Please check your query or API quota."
@@ -315,13 +459,15 @@ async def send_message(chat_id: str, req: MessageCreate, user: Dict[str, Any] = 
     )
 
     # Auto-generate title if chat was "New Chat"
-    if chat.get("title") in ("New Chat", "", None):
-        auto_title = " ".join(msg_text.split()[:6])
-        db_run("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?", (auto_title, assistant_now, chat_id))
+    title = chat.get("title")
+    if title in ("New Chat", "", None):
+        title = " ".join(msg_text.split()[:6])
+        db_run("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?", (title, assistant_now, chat_id))
     else:
         db_run("UPDATE chats SET updated_at = ? WHERE id = ?", (assistant_now, chat_id))
 
     return {
+        "chat": {"id": chat_id, "title": title, "updatedAt": assistant_now},
         "userMessage": {
             "id": user_msg_id,
             "role": "user",

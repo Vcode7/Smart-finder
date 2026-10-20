@@ -1,6 +1,8 @@
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
+
+from app.api.deps import require_auth
 
 from app.schemas.ai import (
     SummarizeRequest, InsightsRequest, CompareRequest, BriefRequest,
@@ -12,7 +14,7 @@ from app.ai.groq_service import (
     generate_timeline, generate_research_report
 )
 
-router = APIRouter(tags=["ai"])
+router = APIRouter(tags=["ai"], dependencies=[Depends(require_auth)])
 
 @router.post("/summarize")
 async def summarize(req: SummarizeRequest):

@@ -6,14 +6,35 @@ Enables real-time model discovery, active model selection, health probing,
 and connectivity testing for Ollama with Groq fallback.
 """
 import time
-from typing import Optional
-from fastapi import APIRouter, HTTPException
+import asyncio
+from typing import Any, Dict, Optional
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.api.deps import require_auth, require_admin
 from app.ai.llm_router import get_llm_router
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+
+
+def _status_payload(force_refresh: bool) -> Dict[str, Any]:
+    """Ollama status + routing decision (blocking HTTP probe — run in a thread)."""
+    router_instance = get_llm_router()
+    status = router_instance.get_ollama_status(force_refresh=force_refresh)
+    selected_model = router_instance.get_selected_model()
+    ready, active_provider, active_model = router_instance.is_ollama_ready()
+    return {
+        "endpoint": router_instance.get_endpoint(),
+        "connected": status.get("connected", False),
+        "models": status.get("models", []),
+        "selected_model": selected_model,
+        "active_provider": active_provider,
+        "active_model": active_model,
+        "fallback_provider": "groq",
+        "fallback_model": settings.GROQ_MODEL,
+        "error": status.get("error"),
+    }
 
 
 class OllamaSettingsUpdate(BaseModel):
@@ -22,96 +43,53 @@ class OllamaSettingsUpdate(BaseModel):
 
 
 @router.get("/ollama")
-async def get_ollama_settings():
+async def get_ollama_settings(user: Dict[str, Any] = Depends(require_auth)):
     """
     Fetch current Ollama configuration, connectivity status,
     all installed models, and active model selection.
     """
-    router_instance = get_llm_router()
-    status = router_instance.get_ollama_status(force_refresh=False)
-    selected_model = router_instance.get_selected_model()
-    ready, active_provider, active_model = router_instance.is_ollama_ready()
-
-    return {
-        "endpoint": router_instance.get_endpoint(),
-        "connected": status.get("connected", False),
-        "models": status.get("models", []),
-        "selected_model": selected_model,
-        "active_provider": active_provider,
-        "active_model": active_model,
-        "fallback_provider": "groq",
-        "fallback_model": settings.GROQ_MODEL,
-        "error": status.get("error"),
-    }
+    return await asyncio.to_thread(_status_payload, False)
 
 
 @router.post("/ollama")
-async def update_ollama_settings(req: OllamaSettingsUpdate):
+async def update_ollama_settings(req: OllamaSettingsUpdate, user: Dict[str, Any] = Depends(require_admin)):
     """
     Update Ollama endpoint or selected model. Persisted into SQLite.
     """
     router_instance = get_llm_router()
 
     if req.endpoint is not None and req.endpoint.strip():
-        router_instance.set_endpoint(req.endpoint.strip())
+        endpoint = req.endpoint.strip()
+        if not endpoint.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="Endpoint must start with http:// or https://")
+        router_instance.set_endpoint(endpoint)
 
     if req.selected_model is not None and req.selected_model.strip():
         router_instance.set_selected_model(req.selected_model.strip())
 
-    # Return refreshed status
-    status = router_instance.get_ollama_status(force_refresh=True)
-    selected_model = router_instance.get_selected_model()
-    ready, active_provider, active_model = router_instance.is_ollama_ready()
-
-    return {
-        "success": True,
-        "endpoint": router_instance.get_endpoint(),
-        "connected": status.get("connected", False),
-        "models": status.get("models", []),
-        "selected_model": selected_model,
-        "active_provider": active_provider,
-        "active_model": active_model,
-        "fallback_provider": "groq",
-        "fallback_model": settings.GROQ_MODEL,
-        "error": status.get("error"),
-    }
+    return {"success": True, **(await asyncio.to_thread(_status_payload, True))}
 
 
 @router.post("/ollama/refresh")
-async def refresh_ollama_models():
+async def refresh_ollama_models(user: Dict[str, Any] = Depends(require_admin)):
     """
     Force-refresh the list of installed models from the Ollama endpoint.
     """
-    router_instance = get_llm_router()
-    status = router_instance.get_ollama_status(force_refresh=True)
-    selected_model = router_instance.get_selected_model()
-    ready, active_provider, active_model = router_instance.is_ollama_ready()
-
-    return {
-        "endpoint": router_instance.get_endpoint(),
-        "connected": status.get("connected", False),
-        "models": status.get("models", []),
-        "selected_model": selected_model,
-        "active_provider": active_provider,
-        "active_model": active_model,
-        "fallback_provider": "groq",
-        "fallback_model": settings.GROQ_MODEL,
-        "error": status.get("error"),
-    }
+    return await asyncio.to_thread(_status_payload, True)
 
 
 @router.post("/ollama/test")
-async def test_ollama_connection():
+async def test_ollama_connection(user: Dict[str, Any] = Depends(require_admin)):
     """
     Run a lightweight test generation using the active configuration.
     Demonstrates Ollama connectivity or transparent Groq fallback.
     """
     router_instance = get_llm_router()
-    ready, active_provider, active_model = router_instance.is_ollama_ready()
+    ready, active_provider, active_model = await asyncio.to_thread(router_instance.is_ollama_ready)
 
     start_t = time.time()
     try:
-        completion = router_instance.execute_chat_completion(
+        completion = await router_instance.execute_async_chat_completion(
             messages=[
                 {"role": "system", "content": "You are a test agent. Answer concisely in one sentence."},
                 {"role": "user", "content": "Confirm that you are operational with 'System online and ready.'"},

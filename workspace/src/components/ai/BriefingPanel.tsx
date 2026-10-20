@@ -146,7 +146,7 @@ export function BriefingPanel({ session, sessionId }: BriefingPanelProps) {
             <div className="flex items-center gap-2">
               <Cpu className="w-4 h-4 text-indigo-400" />
               <span className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>
-                Groq Qwen 3.6 27B Synthesis Scope
+                LLM Synthesis Scope
               </span>
             </div>
             <span className="text-[11px] font-mono font-semibold px-2 py-0.5 rounded-full" style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>
@@ -187,7 +187,7 @@ export function BriefingPanel({ session, sessionId }: BriefingPanelProps) {
           {loading ? (
             <>
               <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              <span>Synthesizing with Qwen 3.6 27B...</span>
+              <span>Synthesizing...</span>
             </>
           ) : (
             <>
@@ -219,7 +219,7 @@ export function BriefingPanel({ session, sessionId }: BriefingPanelProps) {
               Overall AI Research Briefing
             </h3>
             <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
-              Unified synthesis via Groq Qwen 3.6 27B • Generated {new Date(briefing.generatedAt).toLocaleTimeString()}
+              Unified LLM synthesis • Generated {new Date(briefing.generatedAt).toLocaleTimeString()}
             </p>
           </div>
         </div>

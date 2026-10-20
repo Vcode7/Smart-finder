@@ -2,7 +2,7 @@
 // src/components/ai/SourceComparisonMatrix.tsx
 // Interactive multi-perspective Source Comparison Matrix
 
-import { Scale, CheckCircle2, AlertTriangle, HelpCircle, FileText, ExternalLink } from 'lucide-react';
+import { Scale, CheckCircle2, AlertTriangle, FileText, ExternalLink } from 'lucide-react';
 import type { ComparisonResult } from '@/types/research';
 
 interface Props {

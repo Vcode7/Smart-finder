@@ -2,19 +2,18 @@
 // src/components/chat/ChatInterface.tsx — Full Interactive Research Chat with Smart Search Context Workflow, File Uploads, & Sources Review
 
 import { useState, useRef, useEffect, FormEvent, ChangeEvent, DragEvent } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import {
-  Send, Sparkles, Bot, User, Loader2, Globe, Database, Layers,
-  PanelRightOpen, PanelRightClose, MessageSquare, BookOpen, Calendar, Share2,
-  Paperclip, Image as ImageIcon, FileText, X, CheckCircle2, ArrowRight, Eye, Search
+  Send, Sparkles, Bot, Loader2, Globe, Database, BookOpen, Calendar, Share2,
+  Paperclip, FileText, X, CheckCircle2, ArrowRight,
 } from 'lucide-react';
-import { useChatStore, ContextItem } from '@/store/chat';
-import { useAuthStore } from '@/store/auth';
+import { useChatStore, ContextItem, Citation, ChatMessage } from '@/store/chat';
 import SearchModeSelector from './SearchModeSelector';
 import ContextPanel from './ContextPanel';
 import InteractiveMessageItem from './InteractiveMessageItem';
 import DocumentMetadataModal from '@/components/modals/DocumentMetadataModal';
 import { toast } from 'sonner';
+import { apiErrorMessage, readJson } from '@/lib/utils/api';
 
 interface AttachedFile {
   id: string;
@@ -33,6 +32,49 @@ interface ExtractedSearchInfo {
 }
 
 type WorkflowState = 'idle' | 'extracting_query' | 'searching_sources' | 'reviewing_sources' | 'generating_answer';
+
+/** One result of /api/search/smart (local or internet). */
+interface SearchResultItem {
+  id?: string;
+  sourceId?: string;
+  title?: string;
+  snippet?: string;
+  relevanceScore?: number;
+  fileType?: string;
+  page?: number;
+  section?: string;
+  filePath?: string;
+  startTime?: number;
+  url?: string;
+  thumbnail?: string;
+  author?: string;
+  domain?: string;
+  publishedDate?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface SentMessages {
+  userMessage: { id: string; content: string };
+  assistantMessage: { id: string; content: string; citations?: Citation[] };
+}
+
+const errorText = (err: unknown, fallback: string) => (err instanceof Error && err.message ? err.message : fallback);
+
+let tempSeq = 0;
+/** Id of an optimistic message until the server returns the stored one. */
+const newTempId = () => `temp-${Date.now()}-${++tempSeq}`;
+
+/** The confirmed user message and its answer, as the backend stored them. */
+function toMessages(data: SentMessages): ChatMessage[] {
+  const now = new Date().toISOString();
+  return [
+    { id: data.userMessage.id, role: 'user', content: data.userMessage.content, createdAt: now },
+    {
+      id: data.assistantMessage.id, role: 'assistant', content: data.assistantMessage.content,
+      citations: data.assistantMessage.citations || [], createdAt: now,
+    },
+  ];
+}
 
 function TypingIndicator({ statusText }: { statusText?: string }) {
   return (
@@ -67,8 +109,6 @@ function TypingIndicator({ statusText }: { statusText?: string }) {
 
 export default function ChatInterface() {
   const [input, setInput] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
-  const [isContextOpen, setIsContextOpen] = useState(false);
   const [inspectSourceId, setInspectSourceId] = useState<string | null>(null);
   const [inspectTimestamp, setInspectTimestamp] = useState<number | undefined>(undefined);
 
@@ -81,6 +121,7 @@ export default function ChatInterface() {
   const [pendingPrompt, setPendingPrompt] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const attachedFilesRef = useRef<AttachedFile[]>([]);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -91,51 +132,88 @@ export default function ChatInterface() {
     setMessages,
     searchMode,
     isSending,
+    sendingChatId,
     setSending,
     addMessage,
     activeContext,
     setActiveContext,
     isSmartSearchEnabled,
     setIsSmartSearchEnabled,
-    chats,
-    setChats,
+    isLoading: isLoadingChat,
+    setLoading: setLoadingChat,
+    createChat,
+    refreshChats,
   } = useChatStore();
-  const { user } = useAuthStore();
+  // Waiting for an answer in the chat on screen (another chat may still be answering)
+  const isTyping = isSending && sendingChatId === activeChatId;
+
+  const [isContextOpen, setIsContextOpen] = useState(activeContext.length > 0);
+  // Open the sources drawer whenever sources are added (here, from search or a source modal)
+  const [contextCount, setContextCount] = useState(activeContext.length);
+  if (activeContext.length !== contextCount) {
+    setContextCount(activeContext.length);
+    if (activeContext.length > contextCount) setIsContextOpen(true);
+  }
+
+  // Opening another chat (sidebar, palette, new chat) drops this one's unfinished Smart
+  // Search workflow; chats this component creates itself keep it running.
+  const [shownChatId, setShownChatId] = useState(activeChatId);
+  const [ownChatId, setOwnChatId] = useState<string | null>(null);
+  if (activeChatId !== shownChatId) {
+    setShownChatId(activeChatId);
+    if (activeChatId !== ownChatId) {
+      setWorkflowState('idle');
+      setWorkflowProgressText('');
+      setExtractedInfo(null);
+      setPendingPrompt('');
+    }
+  }
+
+  useEffect(() => {
+    attachedFilesRef.current = attachedFiles;
+  }, [attachedFiles]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping, workflowState]);
 
-  // Open context drawer automatically if context items get added
-  useEffect(() => {
-    if (activeContext.length > 0 && !isContextOpen) {
-      setIsContextOpen(true);
-    }
-  }, [activeContext.length]);
+  // Release attachment preview object URLs on unmount
+  useEffect(() => () => {
+    attachedFilesRef.current.forEach((f) => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+  }, []);
 
-  // Load chat messages and restore saved context items when activeChatId changes
+  const clearAttachments = () => {
+    attachedFilesRef.current.forEach((f) => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+    setAttachedFiles([]);
+  };
+
+  // Remove an optimistic message (failed send); reads fresh store state, not a stale closure
+  const dropMessage = (id: string) => {
+    setMessages(useChatStore.getState().messages.filter((m) => m.id !== id));
+  };
+
+  // Load the messages and saved sources of the chat being opened
   useEffect(() => {
     if (!activeChatId) return;
-
-    const fetchChatData = async () => {
-      try {
-        const res = await fetch(`/api/chats/${activeChatId}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.messages) {
-            setMessages(data.messages);
-          }
-          if (data.contextItems && Array.isArray(data.contextItems) && data.contextItems.length > 0) {
-            setActiveContext(data.contextItems);
-          }
+    let current = true;
+    setLoadingChat(true);
+    fetch(`/api/chats/${activeChatId}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        // Another chat was opened meanwhile, or the request failed
+        if (!current || !data) return;
+        // While this chat's message is being answered, its optimistic list is newer
+        if (Array.isArray(data.messages) && useChatStore.getState().sendingChatId !== activeChatId) {
+          setMessages(data.messages);
         }
-      } catch {
-        // ignore
-      }
-    };
-
-    fetchChatData();
-  }, [activeChatId, setMessages, setActiveContext]);
+        if (Array.isArray(data.contextItems) && data.contextItems.length > 0) {
+          setActiveContext(data.contextItems);
+        }
+      })
+      .catch(() => { /* keep what is shown; the chat reloads when reopened */ })
+      .finally(() => { if (current) setLoadingChat(false); });
+    return () => { current = false; };
+  }, [activeChatId, setMessages, setActiveContext, setLoadingChat]);
 
   // File Upload Handlers
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
@@ -200,42 +278,41 @@ export default function ChatInterface() {
 
     try {
       // Step A: Send input to LLM to generate clean search query, keywords, and search terms
-      const queryFormData = new FormData();
-      if (currentPrompt) queryFormData.append('query', currentPrompt);
-      if (attachedFiles.length > 0) {
-        queryFormData.append('file', attachedFiles[0].file);
-        if (attachedFiles[0].file.type.startsWith('image/')) {
-          queryFormData.append('image', attachedFiles[0].file);
-        }
-      }
+      const extractFor = async (att?: AttachedFile) => {
+        const fd = new FormData();
+        if (currentPrompt) fd.append('query', currentPrompt);
+        if (att) fd.append('file', att.file);
+        const res = await fetch('/api/search/extract-query', { method: 'POST', body: fd });
+        if (!res.ok) throw new Error('Failed to generate search query from LLM');
+        return (await res.json()) as ExtractedSearchInfo & { fileSnippet?: string };
+      };
 
-      const extractRes = await fetch('/api/search/extract-query', {
-        method: 'POST',
-        body: queryFormData,
-      });
-
-      if (!extractRes.ok) {
-        throw new Error('Failed to generate search query from LLM');
-      }
-
-      const extractedData: ExtractedSearchInfo & { fileSnippet?: string } = await extractRes.json();
+      // The first attachment drives the search; every attachment gets its own extracted snippet
+      const [extractedData, ...extraExtracts] = await Promise.all(
+        attachedFiles.length > 0 ? attachedFiles.map((att) => extractFor(att)) : [extractFor()]
+      );
       setExtractedInfo(extractedData);
+      const snippetsByAttachment = [extractedData, ...extraExtracts].map((d) => d?.fileSnippet);
 
       // Step B: Run document search logic matching Smart Finder with relativeThreshold = 0.20 (20%)
       setWorkflowState('searching_sources');
       setWorkflowProgressText(
-        `Searching local repository & live internet sources (relative similarity threshold 20%)...`
+        `Searching ${searchMode === 'local' ? 'your libraries' : 'your libraries & the internet'} (relative similarity threshold 20%)...`
       );
 
       const smartFormData = new FormData();
-      smartFormData.append('query', extractedData.searchQuery || currentPrompt);
+      const hasImageOnly = attachedFiles.length > 0 && attachedFiles[0].file.type.startsWith('image/') && !currentPrompt;
+      const baseQuery = hasImageOnly ? (extractedData.keywords?.length ? extractedData.keywords.join(' ') : '') : (extractedData.searchQuery || currentPrompt);
+      // Additional attachments contribute their keywords to the query
+      const extraKeywords = extraExtracts.flatMap((d) => d?.keywords || []).slice(0, 6);
+      const targetQuery = [baseQuery, ...extraKeywords].filter(Boolean).join(' ').trim();
+      if (targetQuery) {
+        smartFormData.append('query', targetQuery);
+      }
       smartFormData.append('relativeThreshold', '0.20'); // 20% relative threshold
-      smartFormData.append('enableInternet', 'true'); // Show both local repository and internet sources
+      smartFormData.append('enableInternet', searchMode === 'local' ? 'false' : 'true');
       if (attachedFiles.length > 0) {
         smartFormData.append('file', attachedFiles[0].file);
-        if (attachedFiles[0].file.type.startsWith('image/')) {
-          smartFormData.append('image', attachedFiles[0].file);
-        }
       }
 
       const searchRes = await fetch('/api/search/smart', {
@@ -248,14 +325,15 @@ export default function ChatInterface() {
       }
 
       const searchData = await searchRes.json();
-      const localDocs = searchData.local?.documents || [];
-      const localVideos = searchData.local?.videos || [];
-      const localImages = searchData.local?.images || [];
-      const internetWeb = searchData.internet?.web || [];
-      const internetNews = searchData.internet?.news || [];
-      const internetPapers = searchData.internet?.papers || [];
-      const internetVideos = searchData.internet?.videos || [];
-      const internetImages = searchData.internet?.images || [];
+      const localDocs: SearchResultItem[] = searchData.local?.documents || [];
+      const localVideos: SearchResultItem[] = searchData.local?.videos || [];
+      const localAudio: SearchResultItem[] = searchData.local?.audio || [];
+      const localImages: SearchResultItem[] = searchData.local?.images || [];
+      const internetWeb: SearchResultItem[] = searchData.internet?.web || [];
+      const internetNews: SearchResultItem[] = searchData.internet?.news || [];
+      const internetPapers: SearchResultItem[] = searchData.internet?.papers || [];
+      const internetVideos: SearchResultItem[] = searchData.internet?.videos || [];
+      const internetImages: SearchResultItem[] = searchData.internet?.images || [];
 
       // Map discovered items into ContextItem[]
       const discoveredItems: ContextItem[] = [];
@@ -264,34 +342,36 @@ export default function ChatInterface() {
       if (attachedFiles.length > 0) {
         attachedFiles.forEach((att, idx) => {
           const isImg = att.file.type.startsWith('image/');
+          const attSnippet = snippetsByAttachment[idx];
           discoveredItems.push({
             id: `attached-${att.id || idx}`,
             type: isImg ? 'image' : 'document',
             title: `[Attached ${isImg ? 'Image' : 'Document'}] ${att.name}`,
-            snippet: extractedData.fileSnippet || `User attached ${isImg ? 'image' : 'document'}: ${att.name} (${(att.size / 1024).toFixed(1)} KB)`,
+            snippet: attSnippet || `User attached ${isImg ? 'image' : 'document'}: ${att.name} (${(att.size / 1024).toFixed(1)} KB)`,
             relevanceScore: 1.0,
+            // No blob: preview URL here — context is persisted and the URL dies with the page
             metadata: {
               isUserAttachment: true,
               fileName: att.name,
               fileSize: att.size,
               fileType: att.type,
-              previewUrl: att.previewUrl,
-              extractedSnippet: extractedData.fileSnippet,
+              extractedSnippet: attSnippet,
             },
           });
         });
       }
 
       // 2. Local Knowledge Repository Sources
-      localDocs.forEach((d: any) => {
+      localDocs.forEach((d) => {
+        const cleanSid = String(d.sourceId || d.id || '').replace(/^src-/, '');
         discoveredItems.push({
-          id: d.id,
+          id: d.id || `doc-${cleanSid}`,
           type: 'document',
           title: d.title || 'Document',
           snippet: d.snippet || '',
           relevanceScore: d.relevanceScore,
           metadata: {
-            sourceId: d.sourceId,
+            sourceId: cleanSid,
             fileType: d.fileType,
             page: d.page,
             section: d.section,
@@ -301,15 +381,16 @@ export default function ChatInterface() {
         });
       });
 
-      localVideos.forEach((v: any) => {
+      localVideos.forEach((v) => {
+        const cleanSid = String(v.sourceId || v.id || '').replace(/^src-/, '');
         discoveredItems.push({
-          id: v.id,
+          id: v.id || `video-${cleanSid}-${v.startTime ?? 0}`,
           type: 'video',
           title: v.title || 'Video',
           snippet: v.snippet || '',
           relevanceScore: v.relevanceScore,
           metadata: {
-            sourceId: v.sourceId,
+            sourceId: cleanSid,
             timestamp: v.startTime,
             url: v.url,
             ...v.metadata,
@@ -317,22 +398,39 @@ export default function ChatInterface() {
         });
       });
 
-      localImages.forEach((img: any) => {
+      localAudio.forEach((a) => {
+        const cleanSid = String(a.sourceId || a.id || '').replace(/^src-/, '');
         discoveredItems.push({
-          id: img.id,
+          id: a.id || `audio-${cleanSid}-${a.startTime ?? 0}`,
+          type: 'audio',
+          title: a.title || 'Audio Recording',
+          snippet: a.snippet || '',
+          relevanceScore: a.relevanceScore,
+          metadata: {
+            sourceId: cleanSid,
+            timestamp: a.startTime,
+            ...a.metadata,
+          },
+        });
+      });
+
+      localImages.forEach((img) => {
+        const cleanSid = String(img.sourceId || img.id || '').replace(/^src-/, '');
+        discoveredItems.push({
+          id: img.id || `image-${cleanSid}`,
           type: 'image',
           title: img.title || 'Image',
           snippet: img.snippet || '',
           relevanceScore: img.relevanceScore,
           metadata: {
-            sourceId: img.sourceId,
+            sourceId: cleanSid,
             ...img.metadata,
           },
         });
       });
 
       // 3. Live Internet Sources (Videos, Web, News, Papers, Images)
-      internetVideos.forEach((v: any) => {
+      internetVideos.forEach((v) => {
         discoveredItems.push({
           id: v.id || `yt-${Math.random().toString(36).slice(2, 9)}`,
           type: 'video',
@@ -350,7 +448,7 @@ export default function ChatInterface() {
         });
       });
 
-      internetWeb.forEach((w: any) => {
+      internetWeb.forEach((w) => {
         discoveredItems.push({
           id: w.id || `web-${Math.random().toString(36).slice(2, 9)}`,
           type: 'web',
@@ -367,7 +465,7 @@ export default function ChatInterface() {
         });
       });
 
-      internetNews.forEach((n: any) => {
+      internetNews.forEach((n) => {
         discoveredItems.push({
           id: n.id || `news-${Math.random().toString(36).slice(2, 9)}`,
           type: 'web',
@@ -384,7 +482,7 @@ export default function ChatInterface() {
         });
       });
 
-      internetPapers.forEach((p: any) => {
+      internetPapers.forEach((p) => {
         discoveredItems.push({
           id: p.id || `paper-${Math.random().toString(36).slice(2, 9)}`,
           type: 'document',
@@ -401,7 +499,7 @@ export default function ChatInterface() {
         });
       });
 
-      internetImages.forEach((img: any) => {
+      internetImages.forEach((img) => {
         discoveredItems.push({
           id: img.id || `img-${Math.random().toString(36).slice(2, 9)}`,
           type: 'image',
@@ -417,12 +515,17 @@ export default function ChatInterface() {
         });
       });
 
+      // User attachments first; then local results by real relevance; internet results keep
+      // provider order after them (their scores are fixed placeholders, not comparable).
+      const rank = (item: ContextItem) => (item.metadata?.isUserAttachment ? 0 : item.metadata?.isInternet ? 2 : 1);
+      discoveredItems.sort((a, b) => rank(a) - rank(b) || (b.relevanceScore || 0) - (a.relevanceScore || 0));
+
       // Populate right sidebar with discovered sources (replacing previous source set when re-run)
       setActiveContext(discoveredItems);
       setIsContextOpen(true);
       setWorkflowState('reviewing_sources');
       setWorkflowProgressText(
-        `Discovered ${discoveredItems.length} matching sources (both local & internet). Review and remove unwanted items, then click Generate Answer.`
+        `Discovered ${discoveredItems.length} matching sources. Review and remove unwanted items, then click Generate Answer.`
       );
 
       if (discoveredItems.length > 0) {
@@ -430,10 +533,40 @@ export default function ChatInterface() {
       } else {
         toast.info('No documents matched the 20% threshold. You can still generate an answer or refine your prompt.');
       }
-    } catch (err: any) {
-      toast.error(err.message || 'Smart search failed. Please try again.');
+    } catch (err) {
+      toast.error(errorText(err, 'Smart search failed. Please try again.'));
       setWorkflowState('idle');
     }
+  };
+
+  // The server chat is created with its first message. It starts with the sources chosen
+  // before it existed and keeps this component's workflow running.
+  const ensureChat = async (title: string): Promise<string | null> => {
+    if (activeChatId) return activeChatId;
+    try {
+      const chat = await createChat(title);
+      const context = useChatStore.getState().activeContext;
+      setOwnChatId(chat.id);
+      setActiveChatId(chat.id);
+      setActiveContext(context);
+      return chat.id;
+    } catch {
+      toast.error('Failed to start a chat');
+      return null;
+    }
+  };
+
+  // A send in another chat may have started since; only clear this chat's marker
+  const endSending = (chatId: string) => {
+    if (useChatStore.getState().sendingChatId === chatId) setSending(false);
+  };
+
+  // Replace the optimistic message with the stored pair, unless another chat was opened
+  // meanwhile (that chat shows its own messages; this answer is on the server).
+  const showSent = (chatId: string, tempId: string, data: SentMessages) => {
+    const s = useChatStore.getState();
+    if (s.activeChatId !== chatId) return;
+    setMessages([...s.messages.filter((m) => m.id !== tempId), ...toMessages(data)]);
   };
 
   // 2. GENERATE ANSWER USING CONFIRMED CONTEXT
@@ -450,47 +583,26 @@ export default function ChatInterface() {
       return;
     }
 
-    let chatId = activeChatId;
-
-    // Create a new chat session if none exists
-    if (!chatId) {
-      try {
-        const res = await fetch('/api/chats', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: (promptToUse || extractedInfo?.searchQuery || 'Smart Search Chat').slice(0, 60),
-            searchMode,
-          }),
-        });
-        if (!res.ok) throw new Error('Failed to create chat session');
-        const data = await res.json();
-        chatId = data.chat.id;
-        setActiveChatId(chatId!);
-        setChats([data.chat, ...chats]);
-      } catch {
-        toast.error('Failed to initialize chat');
-        return;
-      }
-    }
+    const confirmedContext = activeContext;
+    const chatId = await ensureChat(promptToUse || extractedInfo?.searchQuery || 'Smart Search Chat');
+    if (!chatId) return;
 
     setWorkflowState('generating_answer');
-    setSending(true);
-    setIsTyping(true);
+    setSending(true, chatId);
 
     // Persist confirmed context on the backend
     try {
       await fetch(`/api/chats/${chatId}/context`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contextItems: activeContext }),
+        body: JSON.stringify({ contextItems: confirmedContext }),
       });
     } catch {
-      // silent fallback
+      // The message request below stores its context items too
     }
 
     // Optimistic user message in UI
-    const tempId = `temp-${Date.now()}`;
+    const tempId = newTempId();
     addMessage({
       id: tempId,
       role: 'user',
@@ -504,112 +616,77 @@ export default function ChatInterface() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: promptToUse,
-          contextItems: activeContext,
+          contextItems: confirmedContext,
         }),
       });
 
       if (!res.ok) {
-        let errDetail = 'Failed to generate response';
-        try {
-          const errData = await res.json();
-          if (errData?.detail) errDetail = errData.detail;
-        } catch {}
-        throw new Error(errDetail);
+        throw new Error(apiErrorMessage(await readJson(res), 'Failed to generate response'));
       }
 
-      const data = await res.json();
-      const filtered = messages.filter((m) => m.id !== tempId);
-      setMessages([
-        ...filtered,
-        { id: data.userMessage.id, role: 'user', content: data.userMessage.content, createdAt: new Date().toISOString() },
-        { id: data.assistantMessage.id, role: 'assistant', content: data.assistantMessage.content, createdAt: new Date().toISOString() },
-      ]);
+      showSent(chatId, tempId, await res.json());
+      refreshChats();
 
-      // Keep confirmed sources as active chat context for subsequent messages!
-      // Turn off Smart Search toggle so subsequent messages continue seamlessly without re-running search
+      // Confirmed sources stay active for follow-up questions, which are answered from
+      // them directly (Smart Search turns off so they don't re-run the search)
       setIsSmartSearchEnabled(false);
       setInput('');
       setPendingPrompt('');
-      setAttachedFiles([]);
+      clearAttachments();
       setWorkflowState('idle');
       toast.success('Answer generated! Confirmed sources remain active for this chat session.');
-    } catch (err: any) {
-      toast.error(err.message || 'Generation failed.');
+    } catch (err) {
+      dropMessage(tempId);
+      toast.error(errorText(err, 'Generation failed.'));
       setWorkflowState('reviewing_sources'); // allow re-clicking generate
     } finally {
-      setSending(false);
-      setIsTyping(false);
+      endSending(chatId);
     }
   };
 
   // 3. REGULAR MESSAGE SUBMIT (WHEN SMART SEARCH IS DISABLED)
-  const handleSubmitWithText = async (textToSend: string) => {
+  const handleSubmitWithText = async (textToSend: string, opts: { forceSmart?: boolean } = {}) => {
     if (!textToSend.trim() && attachedFiles.length === 0) return;
-    if (isSending) return;
+    if (isTyping) return;
 
     // If Smart Search is enabled or files are attached, route through the Smart Search workflow!
-    if (isSmartSearchEnabled || attachedFiles.length > 0) {
+    if (opts.forceSmart || isSmartSearchEnabled || attachedFiles.length > 0) {
       handleSmartSearchFlow(textToSend);
       return;
     }
 
-    let chatId = activeChatId;
-
-    // Create a new chat if none is active
-    if (!chatId) {
-      try {
-        const res = await fetch('/api/chats', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: textToSend.trim().slice(0, 60), searchMode }),
-        });
-        if (!res.ok) {
-          toast.error('Failed to create chat');
-          return;
-        }
-        const data = await res.json();
-        chatId = data.chat.id;
-        setActiveChatId(chatId!);
-        setChats([data.chat, ...chats]);
-      } catch {
-        toast.error('Failed to start chat');
-        return;
-      }
-    }
-
     const userMsg = textToSend.trim();
+    const context = activeContext;
+    const chatId = await ensureChat(userMsg);
+    if (!chatId) return;
+
     setInput('');
-    setSending(true);
-    setIsTyping(true);
+    setSending(true, chatId);
 
     // Optimistic user message
-    const tempId = `temp-${Date.now()}`;
+    const tempId = newTempId();
     addMessage({ id: tempId, role: 'user', content: userMsg, createdAt: new Date().toISOString() });
 
     try {
       const res = await fetch(`/api/chats/${chatId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg, contextItems: activeContext }),
+        body: JSON.stringify({ message: userMsg, contextItems: context }),
       });
 
       if (!res.ok) {
-        toast.error('Failed to send message');
+        dropMessage(tempId);
+        toast.error(apiErrorMessage(await readJson(res), 'Failed to send message'));
         return;
       }
 
-      const data = await res.json();
-      const filtered = messages.filter((m) => m.id !== tempId);
-      setMessages([
-        ...filtered,
-        { id: data.userMessage.id, role: 'user', content: data.userMessage.content, createdAt: new Date().toISOString() },
-        { id: data.assistantMessage.id, role: 'assistant', content: data.assistantMessage.content, createdAt: new Date().toISOString() },
-      ]);
+      showSent(chatId, tempId, await res.json());
+      refreshChats();
     } catch {
+      dropMessage(tempId);
       toast.error('Message failed. Please check connection.');
     } finally {
-      setSending(false);
-      setIsTyping(false);
+      endSending(chatId);
     }
   };
 
@@ -630,13 +707,21 @@ export default function ChatInterface() {
   };
 
   const hasMessages = messages.length > 0;
+  const openingChat = isLoadingChat && !hasMessages && Boolean(activeChatId);
 
   return (
-    <div className="flex h-full min-h-0 overflow-hidden">
+    <div className="flex h-full min-h-0 overflow-hidden relative">
       {/* Main chat column */}
       <div className="flex-1 flex flex-col min-w-0 h-full">
+        {openingChat && workflowState === 'idle' && (
+          <div className="flex-1 flex items-center justify-center gap-2 text-sm" style={{ color: 'var(--text-muted)' }}>
+            <Loader2 className="w-4 h-4 animate-spin" style={{ color: 'var(--accent)' }} />
+            Loading conversation…
+          </div>
+        )}
+
         {/* Empty state */}
-        {!hasMessages && workflowState === 'idle' && (
+        {!hasMessages && !openingChat && workflowState === 'idle' && (
           <div className="flex-1 flex flex-col items-center justify-center px-6 sm:px-8 text-center overflow-y-auto py-8">
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
@@ -696,7 +781,7 @@ export default function ChatInterface() {
                       onClick={() => {
                         setInput(s.text);
                         if (s.smart) setIsSmartSearchEnabled(true);
-                        handleSubmitWithText(s.text);
+                        handleSubmitWithText(s.text, { forceSmart: s.smart });
                       }}
                       className="flex items-start gap-3 p-3.5 rounded-2xl text-left text-xs transition-all shadow-sm group hover:border-cyan-500/40"
                       style={{
@@ -783,6 +868,68 @@ export default function ChatInterface() {
                           )}
                         </div>
                       )}
+
+                      {/* Ranked Discovered Sources Preview directly inside chat */}
+                      {workflowState === 'reviewing_sources' && activeContext.length > 0 && (
+                        <div className="mt-3 pt-3 border-t border-cyan-500/20 space-y-2">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-bold text-cyan-400 uppercase tracking-wider text-[10px]">
+                              Top Ranked Matches ({activeContext.length})
+                            </span>
+                            <button
+                              onClick={() => setIsContextOpen(true)}
+                              className="text-[11px] text-cyan-400 hover:underline flex items-center gap-1 font-medium"
+                            >
+                              <span>Inspect in sidebar</span>
+                              <ArrowRight className="w-3 h-3" />
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                            {activeContext.slice(0, 4).map((item, idx) => {
+                              const rawScore = item.relevanceScore;
+                              const safeScore = rawScore === undefined || rawScore === null || isNaN(rawScore) ? 0 : rawScore > 1 ? Math.min(100, Math.round(rawScore)) : Math.round(rawScore * 100);
+                              const isAtt = Boolean(item.metadata?.isUserAttachment);
+                              const cleanSid = item.metadata?.sourceId ? String(item.metadata.sourceId).replace(/^src-/, '') : null;
+                              return (
+                                <div
+                                  key={item.id || idx}
+                                  onClick={() => {
+                                    if (cleanSid) {
+                                      setInspectSourceId(cleanSid);
+                                    } else if (item.metadata?.url) {
+                                      window.open(String(item.metadata.url), '_blank');
+                                    }
+                                  }}
+                                  className="p-2.5 rounded-xl bg-[var(--bg-base)]/80 border border-cyan-500/20 hover:border-cyan-500/40 transition-all cursor-pointer flex items-start gap-2 text-left"
+                                >
+                                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 mt-0.5 ${
+                                    idx === 0
+                                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                                      : 'bg-zinc-800 text-zinc-400 border border-zinc-700/50'
+                                  }`}>
+                                    {isAtt ? 'User File' : idx === 0 ? '🏆 #1' : `#${idx + 1}`}
+                                  </span>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center justify-between gap-1">
+                                      <h5 className="text-[11px] font-bold truncate text-[var(--text-primary)]">
+                                        {item.title}
+                                      </h5>
+                                      <span className="text-[10px] font-mono text-cyan-400 font-bold flex-shrink-0">
+                                        {safeScore}%
+                                      </span>
+                                    </div>
+                                    {item.snippet && (
+                                      <p className="text-[10px] text-muted-foreground line-clamp-1 mt-0.5">
+                                        {item.snippet}
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -798,7 +945,7 @@ export default function ChatInterface() {
                         whileHover={{ scale: 1.03 }}
                         whileTap={{ scale: 0.97 }}
                         onClick={handleGenerateAnswer}
-                        disabled={isSending || activeContext.length === 0}
+                        disabled={isTyping || activeContext.length === 0}
                         className="px-4 py-2 rounded-2xl text-xs font-bold flex items-center gap-2 text-white shadow-lg transition-all disabled:opacity-50"
                         style={{
                           background: 'linear-gradient(135deg, #06b6d4 0%, #6366f1 100%)',
@@ -919,6 +1066,7 @@ export default function ChatInterface() {
                     className="flex items-center gap-2 pl-2.5 pr-2 py-1 rounded-xl text-xs bg-[var(--bg-base)] border border-cyan-500/30 text-[var(--text-primary)] shadow-sm"
                   >
                     {f.previewUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element -- blob: preview URL
                       <img src={f.previewUrl} alt={f.name} className="w-5 h-5 rounded object-cover" />
                     ) : (
                       <FileText className="w-4 h-4 text-cyan-400" />
@@ -964,7 +1112,7 @@ export default function ChatInterface() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                disabled={isSending || workflowState === 'extracting_query' || workflowState === 'searching_sources'}
+                disabled={isTyping || workflowState === 'extracting_query' || workflowState === 'searching_sources'}
                 placeholder={
                   isSmartSearchEnabled
                     ? 'Enter research question or topic (Smart Search will discover sources first)...'
@@ -987,7 +1135,7 @@ export default function ChatInterface() {
               {/* Submit Button */}
               <motion.button
                 onClick={() => handleSubmit()}
-                disabled={(!input.trim() && attachedFiles.length === 0) || isSending}
+                disabled={(!input.trim() && attachedFiles.length === 0) || isTyping}
                 whileHover={{ scale: 1.05 }}
                 whileTap={{ scale: 0.95 }}
                 className="h-10 px-3.5 rounded-2xl flex items-center justify-center gap-1.5 flex-shrink-0 shadow-md transition-all disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1005,7 +1153,7 @@ export default function ChatInterface() {
                 }}
                 title={isSmartSearchEnabled ? 'Run Smart Search' : 'Send message'}
               >
-                {isSending || workflowState === 'extracting_query' || workflowState === 'searching_sources' ? (
+                {isTyping || workflowState === 'extracting_query' || workflowState === 'searching_sources' ? (
                   <Loader2 className="w-4 h-4 text-white animate-spin" />
                 ) : isSmartSearchEnabled ? (
                   <>

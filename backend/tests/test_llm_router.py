@@ -13,27 +13,21 @@ Tests:
 """
 import pytest
 from unittest.mock import patch, MagicMock
-from fastapi.testclient import TestClient
 
-from app.main import app
 from app.core.config import settings
 from app.ai.llm_router import LLMRouter, get_llm_router, ChatCompletionWrapper
 from app.database.session import get_app_setting, set_app_setting
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
-
-
-@pytest.fixture
-def router():
+def router(tmp_db):
+    # tmp_db: model selection is persisted to app_settings — never in the live database
     r = LLMRouter()
     r.clear_cache()
     return r
 
 
-def test_app_settings_persistence():
+def test_app_settings_persistence(tmp_db):
     """Verify get_app_setting and set_app_setting persist across queries."""
     set_app_setting("test_key_endpoint", "http://127.0.0.1:11434")
     assert get_app_setting("test_key_endpoint") == "http://127.0.0.1:11434"
@@ -173,9 +167,9 @@ def test_chat_completion_falls_back_to_groq_on_ollama_runtime_error(router):
                 assert resp.choices[0].message.content == "Groq Cloud Fallback Reply"
 
 
-def test_settings_api_get_ollama(client):
+def test_settings_api_get_ollama(admin_client):
     """Test GET /api/settings/ollama returns status structure."""
-    res = client.get("/api/settings/ollama")
+    res = admin_client.get("/api/settings/ollama")
     assert res.status_code == 200
     data = res.json()
     assert "endpoint" in data
@@ -186,19 +180,27 @@ def test_settings_api_get_ollama(client):
     assert "fallback_model" in data
 
 
-def test_settings_api_update_model(client):
+def test_settings_api_update_model(admin_client):
     """Test POST /api/settings/ollama updates selected model."""
-    res = client.post("/api/settings/ollama", json={"selected_model": "test-model:latest"})
+    res = admin_client.post("/api/settings/ollama", json={"selected_model": "test-model:latest"})
     assert res.status_code == 200
     data = res.json()
     assert data["success"] is True
     assert data["selected_model"] == "test-model:latest"
 
 
-def test_settings_api_refresh_models(client):
+def test_settings_api_refresh_models(admin_client):
     """Test POST /api/settings/ollama/refresh returns status."""
-    res = client.post("/api/settings/ollama/refresh")
+    res = admin_client.post("/api/settings/ollama/refresh")
     assert res.status_code == 200
     data = res.json()
     assert "connected" in data
     assert "models" in data
+
+
+def test_groq_fallback_keeps_caller_timeout(router):
+    """After the Ollama fallback the caller's timeout must still reach Groq."""
+    with patch.object(router, "is_ollama_ready", return_value=(False, "groq", settings.GROQ_MODEL)):
+        with patch.object(router, "_call_groq_sync") as mock_groq:
+            router.execute_chat_completion(messages=[{"role": "user", "content": "hi"}], timeout=7.5)
+            assert mock_groq.call_args[0][0]["timeout"] == 7.5

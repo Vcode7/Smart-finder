@@ -15,7 +15,7 @@ export interface ChatMessage {
 }
 
 export interface Citation {
-  type: 'document' | 'video' | 'image' | 'web';
+  type: 'document' | 'video' | 'audio' | 'image' | 'web';
   title: string;
   url?: string;
   sourceId?: string;
@@ -27,7 +27,7 @@ export interface Citation {
 
 export interface ContextItem {
   id: string;
-  type: 'document' | 'video' | 'image' | 'web';
+  type: 'document' | 'video' | 'audio' | 'image' | 'web';
   title: string;
   snippet?: string;
   relevanceScore?: number;
@@ -54,6 +54,8 @@ interface ChatState {
   isSmartSearchEnabled: boolean;
   isLoading: boolean;
   isSending: boolean;
+  /** Chat whose message is waiting for its answer (null when none). */
+  sendingChatId: string | null;
 
   setActiveChatId: (id: string | null) => void;
   setChats: (chats: ChatSummary[]) => void;
@@ -68,9 +70,17 @@ interface ChatState {
   setEnableInternetSources: (enabled: boolean) => void;
   setIsSmartSearchEnabled: (enabled: boolean) => void;
   setLoading: (v: boolean) => void;
-  setSending: (v: boolean) => void;
+  setSending: (v: boolean, chatId?: string | null) => void;
   updateChatTitle: (id: string, title: string) => void;
   removeChat: (id: string) => void;
+  /** Reload the chat list (titles and order change on the server after each answer). */
+  refreshChats: () => Promise<void>;
+  /** Create a chat on the server and list it first. Throws when the request fails. */
+  createChat: (title: string, searchMode?: SearchMode) => Promise<ChatSummary>;
+  /** Show an empty chat; the server chat is created with its first message. */
+  startNewChat: () => void;
+  /** Forget everything about the signed-in user's chats (logout). */
+  reset: () => void;
 }
 
 export const useChatStore = create<ChatState>()(
@@ -81,15 +91,20 @@ export const useChatStore = create<ChatState>()(
       messages: [],
       activeContext: [],
       chatContexts: {},
-      searchMode: 'both',
-      enableInternetSources: true,
+      // Local-only by default: the internet is searched only after the user turns it on,
+      // and that choice lasts for the current visit (it is not persisted)
+      searchMode: 'local',
+      enableInternetSources: false,
       isSmartSearchEnabled: true,
       isLoading: false,
       isSending: false,
+      sendingChatId: null,
 
       setActiveChatId: (activeChatId) => {
         const stored = activeChatId ? get().chatContexts[activeChatId] || [] : [];
-        set({ activeChatId, activeContext: stored });
+        // Switching chats must not keep showing the previous chat's messages
+        const messages = activeChatId === get().activeChatId ? get().messages : [];
+        set({ activeChatId, activeContext: stored, messages });
       },
       setChats: (chats) => set({ chats }),
       setMessages: (messages) => set({ messages }),
@@ -134,7 +149,7 @@ export const useChatStore = create<ChatState>()(
       setEnableInternetSources: (enableInternetSources) => set({ enableInternetSources }),
       setIsSmartSearchEnabled: (isSmartSearchEnabled) => set({ isSmartSearchEnabled }),
       setLoading: (isLoading) => set({ isLoading }),
-      setSending: (isSending) => set({ isSending }),
+      setSending: (isSending, chatId = null) => set({ isSending, sendingChatId: isSending ? chatId : null }),
       updateChatTitle: (id, title) =>
         set((s) => ({
           chats: s.chats.map((c) => (c.id === id ? { ...c, title } : c)),
@@ -151,14 +166,50 @@ export const useChatStore = create<ChatState>()(
             activeContext: s.activeChatId === id ? [] : s.activeContext,
           };
         }),
+      refreshChats: async () => {
+        try {
+          const res = await fetch('/api/chats');
+          if (res.ok) {
+            const data = await res.json();
+            set({ chats: data.chats || [] });
+          }
+        } catch {
+          // Backend unreachable: keep the current list
+        }
+      },
+      createChat: async (title, searchMode) => {
+        const res = await fetch('/api/chats', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: title.trim().slice(0, 60) || 'New Chat', searchMode: searchMode ?? get().searchMode }),
+        });
+        if (!res.ok) throw new Error('Failed to create chat');
+        const chat = (await res.json()).chat as ChatSummary;
+        set((s) => ({ chats: [chat, ...s.chats.filter((c) => c.id !== chat.id)] }));
+        return chat;
+      },
+      startNewChat: () => set({ activeChatId: null, messages: [], activeContext: [] }),
+      reset: () =>
+        set({
+          activeChatId: null, chats: [], messages: [], activeContext: [], chatContexts: {},
+          isLoading: false, isSending: false, sendingChatId: null,
+        }),
     }),
     {
       name: 'sf-chat',
+      // Not persisted: the chat list (loaded from the server on every visit; a stored copy
+      // would show the previous account's chats to the next one to sign in) and the
+      // internet/search-mode choice (every visit starts with local search only).
+      version: 2,
+      migrate: (persisted) => {
+        const state = { ...((persisted as Record<string, unknown>) || {}) };
+        delete state.chats;
+        delete state.searchMode;
+        delete state.enableInternetSources;
+        return state as Pick<ChatState, 'isSmartSearchEnabled' | 'chatContexts'>;
+      },
       partialize: (state) => ({
-        searchMode: state.searchMode,
-        enableInternetSources: state.enableInternetSources,
         isSmartSearchEnabled: state.isSmartSearchEnabled,
-        chats: state.chats,
         chatContexts: state.chatContexts,
       }),
     }

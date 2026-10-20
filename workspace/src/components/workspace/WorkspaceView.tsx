@@ -41,7 +41,7 @@ export function WorkspaceView({ session, sessionId }: WorkspaceViewProps) {
       {/* 2x2 Default Panes Preview Showcase */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 max-w-2xl mx-auto mb-8 text-left">
         {[
-          { label: 'Pane 1: AI Insights', icon: Zap, color: '#a855f7', desc: 'Qwen 3.6 Synthesis' },
+          { label: 'Pane 1: AI Insights', icon: Zap, color: '#a855f7', desc: 'LLM Synthesis' },
           { label: 'Pane 2: Video Lecture', icon: Video, color: '#f43f5e', desc: 'Video & Transcripts' },
           { label: 'Pane 3: Academic Paper', icon: BookOpen, color: '#06b6d4', desc: 'Abstracts & Findings' },
           { label: 'Pane 4: Research Timeline', icon: GitBranch, color: '#10b981', desc: 'Chronological Nodes' },

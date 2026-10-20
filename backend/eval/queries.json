@@ -1,0 +1,18 @@
+{
+  "_about": "Labelled search queries over the migrated knowledge base. 'expect' lists file-name fragments; a query passes when one of them is in the top results. Add your own as your libraries grow.",
+  "queries": [
+    {"query": "SSC exam cancelled", "expect": ["SSC CGL exam to be cancelled"], "kind": "text"},
+    {"query": "Iran missile attack on gulf", "expect": ["Police Arrest SSC CGL Exam Centre Director"], "kind": "text in a news page"},
+    {"query": "Nehru letter about reservation in jobs", "expect": ["आरक्षण को पसंद नहीं करता"], "kind": "English query, Hindi speech"},
+    {"query": "आरक्षण नौकरी नेहरू", "expect": ["आरक्षण को पसंद नहीं करता"], "kind": "Hindi query, Hindi speech"},
+    {"query": "airline new fleet advertisement", "expect": ["Police Arrest SSC CGL Exam Centre Director"], "kind": "picture inside a PDF"},
+    {"query": "NEET paper leak", "expect": ["NEET"], "kind": "text"},
+    {"query": "who is the chairman of the staff selection commission", "expect": ["GOPALAKRISHNAN", "Gopalakrishnan", "Kishore"], "kind": "question"},
+    {"query": "web series about the exam paper leak", "expect": ["Zee5 unveils Scam The Leak"], "kind": "paraphrase"},
+    {"query": "Modi speech at SRCC", "expect": ["SRCC speech"], "kind": "text"},
+    {"query": "why were answer keys delayed", "expect": ["answer key delays"], "kind": "question"},
+    {"query": "prime minister speaking in parliament", "expect": ["आरक्षण को पसंद नहीं करता", "igexport"], "kind": "video by description"},
+    {"query": "biometric failures at exam centres", "expect": ["biometric failures"], "kind": "internet import"},
+    {"query": "kind:video SSC chairman", "expect": ["SSC Chairman S. Gopalakrishnan"], "kind": "filtered"}
+  ]
+}

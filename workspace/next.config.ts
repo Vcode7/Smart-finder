@@ -1,6 +1,19 @@
 import type { NextConfig } from 'next';
+import os from 'os';
+
+// Next dev mode rejects cross-origin requests for its dev resources unless the host is
+// allowed. Allow this machine's LAN addresses so other devices can use `next dev` too.
+const lanHosts = Object.values(os.networkInterfaces())
+  .flat()
+  .filter((ni): ni is os.NetworkInterfaceInfo => Boolean(ni) && ni!.family === 'IPv4' && !ni!.internal)
+  .map((ni) => ni.address);
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: [
+    ...lanHosts,
+    '0fa5-2409-40f2-2173-7fc2-b005-6255-ac33-2762.ngrok-free.app',
+    '*.ngrok-free.app',
+  ],
   images: {
     remotePatterns: [
       { protocol: 'https', hostname: 'i.ytimg.com' },
@@ -11,6 +24,7 @@ const nextConfig: NextConfig = {
     ],
   },
   async rewrites() {
+    // The Python backend listens on loopback only; Next is the network-facing entry point.
     const backendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:8000';
     return [
       {
@@ -20,11 +34,11 @@ const nextConfig: NextConfig = {
     ];
   },
   experimental: {
-    serverActions: {
-      bodySizeLimit: '500mb',
-    },
-    proxyClientMaxBodySize: '500mb',
-    proxyTimeout: 120_000,
+    // Next copies every proxied request body into memory and truncates it at this size.
+    // Uploads travel in 8 MB chunks (src/lib/upload/chunked-uploader.ts), so this only
+    // needs to fit one chunk or a search query's attached file.
+    proxyClientMaxBodySize: '64mb',
+    proxyTimeout: 1000 * 60 * 120, // 2 hours - long-running searches and uploads
   },
 };
 

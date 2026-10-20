@@ -262,7 +262,7 @@ export function SourcePane({ pane, session, sessionId, isFullScreen = true }: So
                   color: source.aiInsights ? '#a855f7' : 'var(--text-muted)',
                   borderColor: 'var(--border)',
                 }}
-                title={source.aiInsights ? 'View AI Insights' : 'Analyze Source with Groq Qwen 3.6'}
+                title={source.aiInsights ? 'View AI Insights' : 'Analyze Source with the configured LLM'}
               >
                 {isSummarizing ? (
                   <div className="w-3.5 h-3.5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin" />
@@ -350,7 +350,7 @@ export function SourcePane({ pane, session, sessionId, isFullScreen = true }: So
                 <Zap className="w-8 h-8 text-indigo-400 mb-2" />
                 <p className="text-xs font-bold mb-1" style={{ color: 'var(--text-primary)' }}>No Insights Generated Yet</p>
                 <p className="text-[11px] mb-3 max-w-xs" style={{ color: 'var(--text-muted)' }}>
-                  Click below to synthesize this source or generate an overall brief using Qwen 3.6 27B.
+                  Click below to synthesize this source or generate an overall brief using the configured LLM.
                 </p>
                 <button
                   onClick={handleSummarize}

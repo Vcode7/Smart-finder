@@ -1,6 +1,7 @@
 import re
 import json
 import time
+import logging
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 import httpx
@@ -13,6 +14,8 @@ except ImportError:
     APIStatusError = None
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 def is_groq_rate_limit_error(e: Exception) -> Tuple[bool, str]:
     """

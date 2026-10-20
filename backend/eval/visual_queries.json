@@ -1,0 +1,30 @@
+{
+  "_about": "Labelled text-to-image queries for the image embedder alone (run_visual_eval.py ranks the 'clip' vector space, without captions, OCR or keywords). 'expect' lists file-name fragments; several fragments mean any of those pictures counts. Written by looking at the pictures, not from their captions.",
+  "queries": [
+    {"query": "ribbon cutting inauguration with marigold garlands", "expect": ["PAN00133"], "kind": "event"},
+    {"query": "army officer in uniform speaking into a microphone", "expect": ["DSC09800", "2E1A8201"], "kind": "person"},
+    {"query": "lighting the ceremonial lamp", "expect": ["PAN00107", "2E1A8062"], "kind": "event"},
+    {"query": "empty banquet hall with round tables and white tablecloths", "expect": ["DSC00006"], "kind": "place"},
+    {"query": "meeting around a round wooden conference table", "expect": ["PAN00191"], "kind": "scene"},
+    {"query": "elderly man in a blue Nehru jacket sitting in an armchair", "expect": ["PAN00064"], "kind": "person"},
+    {"query": "woman standing next to a big flower board that says UPSC centenary", "expect": ["DSC09558"], "kind": "text in picture"},
+    {"query": "man in sunglasses unveiling a plaque", "expect": ["DSC_0524"], "kind": "event"},
+    {"query": "honouring a woman with a shawl on stage", "expect": ["2E1A8275"], "kind": "event"},
+    {"query": "looking at framed photographs on an exhibition wall", "expect": ["WIDE0735"], "kind": "scene"},
+    {"query": "packed auditorium with red seats seen from the side", "expect": ["2E1A8137", "DSC00119", "2E1A8619"], "kind": "place"},
+    {"query": "green leaf pattern background", "expect": ["5bc64fdff3849ef7483d56cebc575b9a"], "kind": "graphic"},
+    {"query": "grid of black and white portrait photos", "expect": ["45d8db768d1162a0f2e2f6e7cdf35b2d"], "kind": "graphic"},
+    {"query": "circular timeline infographic in Hindi", "expect": ["045e63e306997921c7ffbaf2e3cab3c5"], "kind": "graphic"},
+    {"query": "poster with a quote above a portrait on a blue background", "expect": ["3eddd2f32a06bb2b6e3a65a6a19a187a"], "kind": "graphic"},
+    {"query": "commemorative postage stamp unveiled on stage", "expect": ["13966905"], "kind": "event"},
+    {"query": "signboard pointing the way to auditorium 2", "expect": ["DSC09592"], "kind": "text in picture"},
+    {"query": "people shaking hands in the audience", "expect": ["2E1A8643"], "kind": "event"},
+    {"query": "marble lobby with standees and display cases", "expect": ["DSC09570"], "kind": "place"},
+    {"query": "panel discussion with four speakers seated on stage", "expect": ["2E1A8402", "2E1A8443", "2E1A8461"], "kind": "scene"},
+    {"query": "officials walking past a no smoking sign", "expect": ["DSC_0543"], "kind": "text in picture"},
+    {"query": "document about randomizing the interview boards", "expect": ["d9fab260a4eff427e14edffd0bdd6111"], "kind": "document picture"},
+    {"query": "woman speaking at a desk with the nameplate Suman Sharma", "expect": ["2E1A8164"], "kind": "text in picture"},
+    {"query": "दीप प्रज्वलन", "expect": ["PAN00107", "2E1A8062"], "kind": "Hindi query"},
+    {"query": "सेना अधिकारी माइक पर बोलते हुए", "expect": ["DSC09800", "2E1A8201"], "kind": "Hindi query"}
+  ]
+}

@@ -6,9 +6,9 @@ import { Globe, Database, Layers } from 'lucide-react';
 import { useChatStore, type SearchMode } from '@/store/chat';
 
 const MODES: { value: SearchMode; label: string; desc: string; icon: typeof Globe; color: string }[] = [
+  { value: 'local', label: 'Local Knowledge', desc: 'Search your libraries only (default)', icon: Database, color: '#6366f1' },
+  { value: 'both', label: 'Both', desc: 'Your libraries + the internet', icon: Layers, color: '#a855f7' },
   { value: 'internet', label: 'Internet', desc: 'Search the web in real-time', icon: Globe, color: '#10b981' },
-  { value: 'local', label: 'Local Knowledge', desc: 'Search uploaded documents & videos', icon: Database, color: '#6366f1' },
-  { value: 'both', label: 'Both', desc: 'Hybrid local + internet search', icon: Layers, color: '#a855f7' },
 ];
 
 export default function SearchModeSelector() {

@@ -4,21 +4,17 @@
 
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import {
-  User, Bot, Copy, Check, Sparkles, Calendar, Share2, Scale,
-  Flag, Link2, BookOpen, Loader2, ChevronDown, ChevronUp,
-  ExternalLink, FileText, Video as VideoIcon, Music, Globe, Image as ImageIcon,
-  MessageSquare, Layers, X
-} from 'lucide-react';
+import { User, Bot, Copy, Check, Sparkles, Calendar, Share2, Scale, Flag, Link2, BookOpen, Loader2, ExternalLink, FileText, Video as VideoIcon, Music, Globe, Image as ImageIcon, MessageSquare, Layers, X } from 'lucide-react';
 import { toast } from 'sonner';
 import MarkdownMessage from './MarkdownMessage';
 import InteractiveTimelineView from '@/components/timeline/InteractiveTimelineView';
 import InteractiveKnowledgeGraphView from '@/components/graph/InteractiveKnowledgeGraphView';
 import SourceComparisonMatrix from '@/components/ai/SourceComparisonMatrix';
-import KeyEventsViewer from '@/components/ai/KeyEventsViewer';
-import CrossSourceConnections from '@/components/ai/CrossSourceConnections';
+import KeyEventsViewer, { type KeyEventItem } from '@/components/ai/KeyEventsViewer';
+import CrossSourceConnections, { type ConnectionItem } from '@/components/ai/CrossSourceConnections';
 import ResearchReportModal from '@/components/report/ResearchReportModal';
-import { useChatStore, ContextItem } from '@/store/chat';
+import { useChatStore, ContextItem, Citation } from '@/store/chat';
+import { apiErrorMessage } from '@/lib/utils/api';
 import type { TimelineEvent, KnowledgeGraph, ComparisonResult, ResearchReport } from '@/types/research';
 
 export interface InteractiveMessageProps {
@@ -27,6 +23,7 @@ export interface InteractiveMessageProps {
     role: string;
     content: string;
     createdAt?: string;
+    citations?: Citation[];
   };
   onSendFollowup?: (question: string) => void;
   onOpenSourceModal?: (sourceId: string, timestamp?: number) => void;
@@ -37,6 +34,29 @@ type ActiveActionType = 'none' | 'followup' | 'sources' | 'timeline' | 'graph' |
 export default function InteractiveMessageItem({ msg, onSendFollowup, onOpenSourceModal }: InteractiveMessageProps) {
   const isUser = msg.role === 'user';
   const { activeContext } = useChatStore();
+
+  // Citations recorded with this answer (local items open the source modal, web items their URL)
+  const messageCitations = (msg.citations || []).map((c, i) => {
+    const rawId = c.sourceId ? String(c.sourceId).replace(/^src-/, '') : '';
+    const isLocal = !c.url && c.type !== 'web' && /^[0-9a-f-]{36}$/i.test(rawId);
+    return {
+      id: `${rawId || c.url || c.title}-${i}`,
+      type: c.type,
+      title: c.title,
+      url: c.url,
+      sourceId: isLocal ? rawId : undefined,
+      timestamp: c.timestamp !== undefined && c.timestamp !== null ? Number(c.timestamp) : undefined,
+      pageNum: c.page !== undefined && c.page !== null ? Number(c.page) : undefined,
+    };
+  });
+
+  // Internet context items carry placeholder ids; only real local sources open the modal
+  const openContextItem = (item: ContextItem) => {
+    const localId = item.metadata?.isInternet ? undefined : (item.metadata?.sourceId as string | undefined);
+    const url = item.metadata?.url as string | undefined;
+    if (localId) onOpenSourceModal?.(localId, item.metadata?.timestamp as number | undefined);
+    else if (url) window.open(url, '_blank', 'noopener,noreferrer');
+  };
   const [copied, setCopied] = useState(false);
   const [activeAction, setActiveAction] = useState<ActiveActionType>('none');
   const [actionLoading, setActionLoading] = useState(false);
@@ -45,8 +65,8 @@ export default function InteractiveMessageItem({ msg, onSendFollowup, onOpenSour
   const [timelineEvents, setTimelineEvents] = useState<TimelineEvent[] | null>(null);
   const [knowledgeGraph, setKnowledgeGraph] = useState<KnowledgeGraph | null>(null);
   const [comparisonResult, setComparisonResult] = useState<ComparisonResult | null>(null);
-  const [keyEvents, setKeyEvents] = useState<any[] | null>(null);
-  const [connectionsData, setConnectionsData] = useState<{ connections: any[]; crossSynthesis?: string } | null>(null);
+  const [keyEvents, setKeyEvents] = useState<KeyEventItem[] | null>(null);
+  const [connectionsData, setConnectionsData] = useState<{ connections: ConnectionItem[]; crossSynthesis?: string } | null>(null);
   const [reportData, setReportData] = useState<ResearchReport | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
 
@@ -110,29 +130,31 @@ export default function InteractiveMessageItem({ msg, onSendFollowup, onOpenSour
       });
 
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.message || err.error || 'Action failed');
+        const err = await res.json().catch(() => null);
+        throw new Error(apiErrorMessage(err, 'Action failed'));
       }
 
       const data = await res.json();
+      // The backend returns the result at the top level ({action, events} / {action, nodes, edges, ...})
+      const payload = data.data ?? data;
 
       if (action === 'timeline') {
-        setTimelineEvents(data.data?.events || []);
+        setTimelineEvents(payload.events || []);
         toast.success('Timeline generated!');
       } else if (action === 'graph') {
-        setKnowledgeGraph(data.data || { nodes: [], edges: [] });
+        setKnowledgeGraph({ nodes: payload.nodes || [], edges: payload.edges || [] });
         toast.success('Knowledge Graph mapped!');
       } else if (action === 'compare') {
-        setComparisonResult(data.data);
+        setComparisonResult(payload);
         toast.success('Source Comparison matrix ready!');
       } else if (action === 'events') {
-        setKeyEvents(data.data?.events || []);
+        setKeyEvents(payload.events || []);
         toast.success('Key Events extracted!');
       } else if (action === 'connections') {
-        setConnectionsData(data.data);
+        setConnectionsData(payload);
         toast.success('Cross-source Connections identified!');
       } else if (action === 'report') {
-        setReportData(data.data);
+        setReportData(payload);
         setIsReportModalOpen(true);
         toast.success('Research Report compiled!');
       }
@@ -201,24 +223,27 @@ export default function InteractiveMessageItem({ msg, onSendFollowup, onOpenSour
             <div className="space-y-3">
               <MarkdownMessage content={msg.content} />
 
-              {/* Context Source Badges (Shown when assistant used sources) */}
-              {activeContext.length > 0 && (
+              {/* Citation badges: the sources this answer was generated from */}
+              {messageCitations.length > 0 && (
                 <div className="pt-3 border-t border-[var(--border)] flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 mr-1 flex items-center gap-1">
                     <Layers className="w-3 h-3 text-cyan-400" />
                     <span>Citations:</span>
                   </span>
-                  {activeContext.slice(0, 4).map((item) => {
+                  {messageCitations.slice(0, 4).map((item) => {
                     const Icon = getSourceIcon(item.type);
-                    const sourceId = (item.metadata?.sourceId as string) || (item.type !== 'web' ? item.id : undefined);
-                    const timestamp = item.metadata?.timestamp as number | undefined;
-                    const pageNum = item.metadata?.pageNum as number | undefined;
+                    const sourceId = item.sourceId;
+                    const timestamp = item.timestamp;
+                    const pageNum = item.pageNum;
 
                     return (
                       <button
                         key={item.id}
                         type="button"
-                        onClick={() => sourceId && onOpenSourceModal?.(sourceId, timestamp)}
+                        onClick={() => {
+                          if (sourceId) onOpenSourceModal?.(sourceId, timestamp);
+                          else if (item.url) window.open(item.url, '_blank', 'noopener,noreferrer');
+                        }}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[11px] font-semibold transition-all hover:scale-105"
                         style={{
                           background: 'var(--bg-base)',
@@ -229,23 +254,23 @@ export default function InteractiveMessageItem({ msg, onSendFollowup, onOpenSour
                       >
                         <Icon className="w-3 h-3 text-cyan-400" />
                         <span className="truncate max-w-[140px]">{item.title}</span>
-                        {pageNum && <span className="text-[10px] text-indigo-400">p.{pageNum}</span>}
-                        {timestamp !== undefined && (
+                        {pageNum !== undefined && !Number.isNaN(pageNum) && <span className="text-[10px] text-indigo-400">p.{pageNum}</span>}
+                        {timestamp !== undefined && !Number.isNaN(timestamp) && (
                           <span className="text-[10px] text-rose-400">
-                            {Math.floor(timestamp / 60)}:{(timestamp % 60).toString().padStart(2, '0')}
+                            {Math.floor(timestamp / 60)}:{Math.floor(timestamp % 60).toString().padStart(2, '0')}
                           </span>
                         )}
                         <ExternalLink className="w-2.5 h-2.5 opacity-60" />
                       </button>
                     );
                   })}
-                  {activeContext.length > 4 && (
+                  {messageCitations.length > 4 && (
                     <button
                       type="button"
                       onClick={() => handleTriggerAction('sources')}
                       className="text-[10px] font-bold text-cyan-400 hover:underline px-1.5"
                     >
-                      +{activeContext.length - 4} more
+                      +{messageCitations.length - 4} more
                     </button>
                   )}
                 </div>
@@ -436,13 +461,11 @@ export default function InteractiveMessageItem({ msg, onSendFollowup, onOpenSour
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                             {activeContext.map((item) => {
                               const Icon = getSourceIcon(item.type);
-                              const sourceId = (item.metadata?.sourceId as string) || (item.type !== 'web' ? item.id : undefined);
-                              const timestamp = item.metadata?.timestamp as number | undefined;
 
                               return (
                                 <div
                                   key={item.id}
-                                  onClick={() => sourceId && onOpenSourceModal?.(sourceId, timestamp)}
+                                  onClick={() => openContextItem(item)}
                                   className="p-3 rounded-xl bg-[var(--bg-base)] border border-[var(--border)] space-y-1.5 cursor-pointer hover:border-indigo-500/40 transition-all"
                                 >
                                   <div className="flex items-center justify-between gap-2">

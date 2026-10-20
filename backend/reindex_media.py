@@ -18,7 +18,7 @@ from app.database.session import db_all, db_run
 from app.core.config import settings
 from app.search.model_pipeline import (
     get_image_embedding,
-    _get_jina_clip_model,
+    _get_image_model,
 )
 from app.search.perceptual_hash import (
     compute_image_hashes,
@@ -29,15 +29,15 @@ from app.search.faiss_index import get_faiss_manager
 def reindex_all_media():
     sys.stdout.reconfigure(encoding="utf-8")
     print("=" * 70)
-    print("STARTING COMPLETE MEDIA RE-INDEXING (REAL JINA CLIP v2 + pHASH/dHASH)")
+    print("STARTING COMPLETE MEDIA RE-INDEXING (Qwen3-VL-Embedding-2B + pHASH/dHASH)")
     print("=" * 70)
 
-    # 1. Ensure Jina CLIP model is loaded
-    print("[1/5] Initializing real Jina CLIP v2 model...")
-    clip_model = _get_jina_clip_model()
+    # 1. Ensure the image model is loaded
+    print("[1/5] Initializing Qwen3-VL-Embedding-2B...")
+    clip_model = _get_image_model()
     if clip_model is None:
-        raise RuntimeError("CRITICAL: Failed to load real Jina CLIP v2 model. Halting re-indexing.")
-    print("[1/5] Real Jina CLIP v2 model verified ready on CUDA/CPU.")
+        raise RuntimeError("CRITICAL: Failed to load Qwen3-VL-Embedding-2B. Halting re-indexing.")
+    print("[1/5] Qwen3-VL-Embedding-2B verified ready on CUDA/CPU.")
 
     # 2. Reset FAISS image index and SQLite perceptual hash table
     print("[2/5] Resetting FAISS image index and image_perceptual_hashes table...")
@@ -259,7 +259,7 @@ def reindex_all_media():
         dim = len(sample_vec)
         print(f"  Sample Vector #0 - Dim: {dim}, L2-Norm: {norm:.4f}, Non-zero count: {np.count_nonzero(sample_vec)}")
         if abs(norm - 1.0) < 1e-3 and dim == 1024:
-            print("  >>> SUCCESS: Image index contains REAL 1024-dim normalized Jina CLIP embeddings! <<<")
+            print("  >>> SUCCESS: Image index contains REAL 1024-dim normalized Qwen3-VL embeddings! <<<")
         else:
             print("  >>> WARNING: Embedding check did not match expected normalized 1024-dim vector! <<<")
 

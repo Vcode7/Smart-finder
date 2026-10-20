@@ -26,7 +26,7 @@ export default function ResearchLayout({ children }: { children: React.ReactNode
 
   return (
     <div className="h-screen w-screen flex overflow-hidden relative" style={{ background: 'var(--bg-base)' }}>
-      <Sidebar sessionId={sessionId} />
+      <Sidebar />
       <div
         className="flex flex-col flex-1 min-w-0 h-full overflow-hidden transition-all duration-300 relative"
         style={{ marginLeft: sidebarOpen ? 'var(--sidebar-width)' : '0' }}

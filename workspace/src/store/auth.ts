@@ -3,6 +3,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { useChatStore } from '@/store/chat';
 
 export interface AuthUser {
   id: string;
@@ -35,9 +36,15 @@ export const useAuthStore = create<AuthState>()(
       setInitialized: (isInitialized) => set({ isInitialized }),
 
       logout: async () => {
-        await fetch('/api/auth/logout', { method: 'POST' });
+        try {
+          await fetch('/api/auth/logout', { method: 'POST' });
+        } catch {
+          // Backend unreachable: still clear the local session
+        }
         set({ user: null });
-        window.location.href = '/auth/login';
+        useChatStore.getState().reset();
+        // Full page load (not router.push): drops every in-memory store of the signed-out account
+        window.location.replace('/auth/login');
       },
 
       fetchMe: async () => {

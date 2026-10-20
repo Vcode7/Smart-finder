@@ -389,6 +389,16 @@ export interface LocalCategorizedItem {
   description?: string;
   ocrText?: string;
   relatedCrossSources?: CrossSourceItem[];
+  // Folder libraries: where the file lives and what matched
+  libraryId?: string;
+  libraryName?: string;
+  relPath?: string;
+  folder?: string;                 // the file's folder in its library ('' at the top level)
+  folderMatch?: string | null;     // the folder named in the query that holds it
+  matchedBy?: string[];
+  evidence?: string;
+  rerankScore?: number | null;
+  similarPhotos?: string[];
 }
 
 export interface InternetCategorizedItem {

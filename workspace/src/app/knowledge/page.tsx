@@ -1,13 +1,14 @@
 'use client';
 // src/app/knowledge/page.tsx — Knowledge Base browser for all authenticated users
 
-import { useState, useEffect, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect } from 'react';
+import { motion } from 'framer-motion';
 import {
-  Database, Search, FileText, Video, Image, Clock,
-  ChevronRight, Loader2, Sparkles
+  Database, Search, FileText, Video, Image, Music,
+  Loader2, Sparkles
 } from 'lucide-react';
 import Sidebar from '@/components/layout/Sidebar';
+import DocumentMetadataModal from '@/components/modals/DocumentMetadataModal';
 import { useChatStore } from '@/store/chat';
 import { toast } from 'sonner';
 
@@ -23,12 +24,45 @@ interface KnowledgeSource {
 
 const TYPE_ICONS: Record<string, typeof FileText> = {
   pdf: FileText, docx: FileText, doc: FileText, txt: FileText, md: FileText,
-  csv: FileText, xlsx: FileText, xls: FileText, json: FileText,
-  jpg: Image, jpeg: Image, png: Image, webp: Image,
+  csv: FileText, xlsx: FileText, xls: FileText, json: FileText, pptx: FileText,
+  jpg: Image, jpeg: Image, png: Image, webp: Image, gif: Image, bmp: Image, heic: Image, tiff: Image,
   mp4: Video, avi: Video, mov: Video, mkv: Video, webm: Video,
+  mp3: Music, wav: Music, m4a: Music, ogg: Music, flac: Music, aac: Music, opus: Music,
 };
 
-function formatBytes(bytes: number): string {
+type ResultCategory = 'document' | 'video' | 'image' | 'audio';
+
+interface LocalResult {
+  id: string;
+  sourceId: string;
+  title: string;
+  snippet: string;
+  category: ResultCategory;
+  relevanceScore: number;
+  startTime?: number | null;
+  thumbnail?: string;
+}
+
+interface LocalResults {
+  documents: LocalResult[];
+  videos: LocalResult[];
+  images: LocalResult[];
+  audio: LocalResult[];
+}
+
+const CATEGORY_STYLE: Record<ResultCategory, { icon: typeof FileText; color: string; label: string }> = {
+  document: { icon: FileText, color: 'var(--accent)', label: 'Document' },
+  video: { icon: Video, color: '#f43f5e', label: 'Video' },
+  image: { icon: Image, color: '#10b981', label: 'Image' },
+  audio: { icon: Music, color: '#f59e0b', label: 'Audio' },
+};
+
+function formatTime(seconds: number): string {
+  return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+}
+
+function formatBytes(bytes?: number | null): string {
+  if (!bytes) return '—';
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -38,23 +72,20 @@ export default function KnowledgePage() {
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [results, setResults] = useState<{ documents: unknown[]; videos: unknown[] } | null>(null);
+  const [results, setResults] = useState<LocalResults | null>(null);
   const [searching, setSearching] = useState(false);
+  const [inspect, setInspect] = useState<{ id: string; t?: number } | null>(null);
   const { setSearchMode, addContextItem } = useChatStore();
 
-  const fetchSources = useCallback(async () => {
-    try {
-      const res = await fetch('/api/knowledge');
-      if (res.ok) {
-        const data = await res.json();
-        setSources(data.sources || []);
-      }
-    } finally {
-      setLoading(false);
-    }
+  useEffect(() => {
+    let current = true;
+    fetch('/api/knowledge')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (current && data) setSources(data.sources || []); })
+      .catch(() => { if (current) toast.error('Could not load knowledge sources'); })
+      .finally(() => { if (current) setLoading(false); });
+    return () => { current = false; };
   }, []);
-
-  useEffect(() => { fetchSources(); }, [fetchSources]);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -68,7 +99,14 @@ export default function KnowledgePage() {
       });
       if (res.ok) {
         const data = await res.json();
-        setResults(data);
+        setResults({
+          documents: data.documents || [],
+          videos: data.videos || [],
+          images: data.images || [],
+          audio: data.audio || [],
+        });
+      } else {
+        toast.error('Search failed');
       }
     } catch {
       toast.error('Search failed');
@@ -77,24 +115,30 @@ export default function KnowledgePage() {
     }
   };
 
-  const addToChat = (item: { id: string; type: string; title: string; snippet: string; fullContext: string }) => {
+  const addToChat = (item: LocalResult) => {
     addContextItem({
       id: item.id,
-      type: item.type === 'document' ? 'document' : 'video',
+      type: item.category,
       title: item.title,
       snippet: item.snippet,
-      metadata: { fullContext: item.fullContext },
+      relevanceScore: item.relevanceScore,
+      metadata: { sourceId: item.sourceId, startTime: item.startTime ?? undefined },
     });
     setSearchMode('local');
     toast.success('Added to chat context');
   };
+
+  const allResults: LocalResult[] = results
+    ? [...results.documents, ...results.videos, ...results.images, ...results.audio]
+        .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    : [];
 
   const filteredSources = sources.filter((s) =>
     s.original_name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   return (
-    <div className="flex h-screen overflow-hidden" style={{ background: 'var(--bg-base)' }}>
+    <div className="flex flex-col md:flex-row h-dvh overflow-hidden" style={{ background: 'var(--bg-base)' }}>
       <Sidebar />
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-4xl mx-auto px-6 py-8">
@@ -106,7 +150,7 @@ export default function KnowledgePage() {
               </div>
               <div>
                 <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>Knowledge Base</h1>
-                <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>Search across all uploaded documents and videos</p>
+                <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>Search across documents, images, videos and audio</p>
               </div>
             </div>
 
@@ -141,61 +185,47 @@ export default function KnowledgePage() {
               <h2 className="text-sm font-semibold mb-3" style={{ color: 'var(--text-secondary)' }}>
                 Search Results for &quot;{searchQuery}&quot;
               </h2>
-              {[...(results.documents as { id: string; title: string; sectionTitle: string; snippet: string; fileType: string; relevanceScore: number; fullContext: string }[]),
-                ...(results.videos as { id: string; title: string; snippet: string; type: string; relevanceScore: number; fullContext: string; startTime: number }[])
-              ].length === 0 ? (
+              {allResults.length === 0 ? (
                 <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No results found. Try different keywords.</p>
               ) : (
                 <div className="space-y-3">
-                  {(results.documents as { id: string; title: string; sectionTitle: string; snippet: string; fileType: string; relevanceScore: number; fullContext: string }[]).map((doc) => (
-                    <motion.div key={doc.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
-                      className="p-4 rounded-2xl" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}>
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 mb-1">
-                            <FileText className="w-4 h-4 flex-shrink-0" style={{ color: 'var(--accent)' }} />
-                            <span className="font-semibold text-sm truncate" style={{ color: 'var(--text-primary)' }}>{doc.title}</span>
-                            {doc.sectionTitle && (
-                              <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>
-                                {doc.sectionTitle}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{doc.snippet}</p>
+                  {allResults.map((item) => {
+                    const style = CATEGORY_STYLE[item.category] || CATEGORY_STYLE.document;
+                    const Icon = style.icon;
+                    return (
+                      <motion.div key={item.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
+                        className="p-4 rounded-2xl" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}>
+                        <div className="flex items-start justify-between gap-3">
+                          {item.thumbnail && item.category !== 'audio' && (
+                            /* eslint-disable-next-line @next/next/no-img-element */
+                            <img src={item.thumbnail} alt="" loading="lazy"
+                              className="w-16 h-16 rounded-xl object-cover flex-shrink-0"
+                              style={{ background: 'var(--bg-active)' }}
+                              onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
+                          )}
+                          <button type="button" className="flex-1 min-w-0 text-left group"
+                            onClick={() => setInspect({ id: item.sourceId, t: item.startTime ?? undefined })}>
+                            <div className="flex items-center gap-2 mb-1">
+                              <Icon className="w-4 h-4 flex-shrink-0" style={{ color: style.color }} />
+                              <span className="font-semibold text-sm truncate group-hover:underline" style={{ color: 'var(--text-primary)' }}>{item.title}</span>
+                              {typeof item.startTime === 'number' && (
+                                <span className="text-[11px] px-2 py-0.5 rounded-full font-mono"
+                                  style={{ background: 'var(--bg-active)', color: style.color }}>
+                                  {formatTime(item.startTime)}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{item.snippet}</p>
+                          </button>
+                          <button onClick={() => addToChat(item)}
+                            className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all hover:bg-[var(--accent-muted)]"
+                            style={{ border: '1px solid var(--border)', color: 'var(--accent)' }}>
+                            + Context
+                          </button>
                         </div>
-                        <button onClick={() => addToChat({ ...doc, type: 'document' })}
-                          className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all hover:bg-[var(--accent-muted)]"
-                          style={{ border: '1px solid var(--border)', color: 'var(--accent)' }}>
-                          + Context
-                        </button>
-                      </div>
-                    </motion.div>
-                  ))}
-                  {(results.videos as { id: string; title: string; snippet: string; relevanceScore: number; fullContext: string; startTime: number }[]).map((vid) => (
-                    <motion.div key={vid.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
-                      className="p-4 rounded-2xl" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}>
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 mb-1">
-                            <Video className="w-4 h-4 flex-shrink-0" style={{ color: '#f43f5e' }} />
-                            <span className="font-semibold text-sm truncate" style={{ color: 'var(--text-primary)' }}>{vid.title}</span>
-                            {vid.startTime !== undefined && (
-                              <span className="text-[11px] px-2 py-0.5 rounded-full font-mono"
-                                style={{ background: 'rgba(244,63,94,0.1)', color: '#f43f5e' }}>
-                                {Math.floor(vid.startTime / 60)}:{String(Math.floor(vid.startTime % 60)).padStart(2, '0')}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>{vid.snippet}</p>
-                        </div>
-                        <button onClick={() => addToChat({ ...vid, type: 'video' })}
-                          className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all hover:bg-[var(--accent-muted)]"
-                          style={{ border: '1px solid var(--border)', color: 'var(--accent)' }}>
-                          + Context
-                        </button>
-                      </div>
-                    </motion.div>
-                  ))}
+                      </motion.div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -222,10 +252,10 @@ export default function KnowledgePage() {
                   {filteredSources.map((source, i) => {
                     const TypeIcon = TYPE_ICONS[source.file_type] || FileText;
                     return (
-                      <motion.div key={source.id}
+                      <motion.button key={source.id} type="button" onClick={() => setInspect({ id: source.id })}
                         initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: i * 0.02 }}
-                        className="flex items-center gap-3 p-4 rounded-2xl transition-all hover:bg-[var(--bg-hover)]"
+                        transition={{ delay: Math.min(i, 20) * 0.02 }}
+                        className="w-full text-left flex items-center gap-3 p-4 rounded-2xl transition-all hover:bg-[var(--bg-hover)]"
                         style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}>
                         <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
                           style={{ background: 'var(--accent-muted)' }}>
@@ -253,7 +283,7 @@ export default function KnowledgePage() {
                         }}>
                           {source.processing_status === 'completed' ? 'Ready' : source.processing_status}
                         </span>
-                      </motion.div>
+                      </motion.button>
                     );
                   })}
                 </div>
@@ -262,6 +292,9 @@ export default function KnowledgePage() {
           )}
         </div>
       </div>
+
+      <DocumentMetadataModal sourceId={inspect?.id ?? null} initialTimestamp={inspect?.t}
+        isOpen={Boolean(inspect)} onClose={() => setInspect(null)} />
     </div>
   );
 }

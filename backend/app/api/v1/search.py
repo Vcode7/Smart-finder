@@ -1,14 +1,18 @@
 import re
+import io
 import json
+import uuid
 import base64
+import asyncio
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, Request, HTTPException, Depends, UploadFile, File, Form
+from typing import Dict, Any, List, Optional, Tuple
+from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.database.session import db_get, db_all
-from app.api.deps import get_current_user, require_auth
+from app.api.deps import require_auth
 from app.schemas.search import (
     SearchRequest, LocalSearchRequest, VideoSearchRequest,
     FetchMoreRequest, SynthesizeRequest
@@ -18,17 +22,163 @@ from app.search.providers.academic import search_papers
 from app.search.providers.news import search_news, search_articles_only, search_reports_only
 from app.search.providers.web import search_web
 from app.search.providers.images import search_internet_images
-from app.search.keyword_search import search_document_chunks, search_transcripts
-from app.search.context_expander import expand_document_chunk, expand_transcript_segment
+from app.search.keyword_search import search_transcripts, extract_query_tokens
+from app.search.context_expander import expand_transcript_segment
 from app.search.face_detector import detect_faces_in_image, search_face_embeddings
 from app.search.query_understanding import understand_multimodal_query, generate_enhanced_internet_query, detect_file_category
 from app.search.multimodal_retrieval import search_by_multimodal_signals, search_by_text
-from app.search.constants import COMPOSITE_MIN_SCORE
+from app.search.constants import COMPOSITE_MIN_SCORE, IMAGE_EXTENSIONS
+from app.search.engine import fts_terms, get_engine, plan_from_source
+from app.search.plan import QueryPlan, build_plan
 
 router = APIRouter(prefix="/search", tags=["search"])
 
+_BUCKETS = ("documents", "videos", "images", "audio")
+
+
+# ── local search: folder libraries (engine) + the legacy index until it is migrated ──
+def _legacy_exists() -> bool:
+    """Sources still only in the old index (rows copied into a library are in legacy_migrated)."""
+    try:
+        return db_get("SELECT 1 AS x FROM knowledge_sources "
+                      "WHERE id NOT IN (SELECT source_id FROM legacy_migrated) LIMIT 1") is not None
+    except Exception:
+        return False
+
+
+async def _legacy_results(query_text: str, file_buffer: Optional[bytes], file_name: Optional[str],
+                          mime_type: Optional[str], limit: int) -> Dict[str, List[Dict[str, Any]]]:
+    if not await run_in_threadpool(_legacy_exists):
+        return {k: [] for k in _BUCKETS}
+    try:
+        if not file_buffer:
+            return await run_in_threadpool(search_by_text, query_text, limit)
+        signals = await understand_multimodal_query({
+            "textQuery": query_text, "fileBuffer": file_buffer, "fileName": file_name, "mimeType": mime_type,
+            "fileCategory": detect_file_category(file_name, mime_type), "previewUrl": None,
+        }, use_llm=False)
+        return await run_in_threadpool(search_by_multimodal_signals, signals)
+    except Exception as e:
+        print(f"[Search] Legacy index search notice: {e}")
+        return {k: [] for k in _BUCKETS}
+
+
+def _merge_buckets(primary: Dict[str, List[Dict[str, Any]]], legacy: Dict[str, List[Dict[str, Any]]],
+                   limit: int) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for k in _BUCKETS:
+        seen = {i.get("sourceId") for i in primary.get(k, [])}
+        items = list(primary.get(k, [])) + [i for i in legacy.get(k, []) if i.get("sourceId") not in seen]
+        out[k] = sorted(items, key=lambda x: x.get("relevanceScore", 0.0), reverse=True)[:limit]
+    return out
+
+
+async def _local_search(query_text: str, file_buffer: Optional[bytes] = None, file_name: Optional[str] = None,
+                        mime_type: Optional[str] = None, limit: int = 20) -> Tuple[Dict[str, List[Dict[str, Any]]], QueryPlan, Dict[str, Any]]:
+    files = [(file_buffer, file_name, mime_type)] if file_buffer else []
+    plan = await run_in_threadpool(build_plan, query_text, files)
+    engine_res = await run_in_threadpool(get_engine().search, plan, limit)
+    legacy = await _legacy_results(query_text, file_buffer, file_name, mime_type, limit)
+    return _merge_buckets(engine_res.as_dict(), legacy, limit), plan, engine_res.trace
+
+
+def _compat_signals(plan: QueryPlan) -> Dict[str, Any]:
+    """The shape the internet-query enhancer expects from the old query understanding."""
+    anchor = plan.text or plan.rerank_query
+    return {
+        "queryType": plan.kind,
+        "textQuery": plan.text,
+        "originalQueryText": plan.text or None,
+        "derivedSearchKeywords": " ".join(fts_terms(anchor)[:8]),
+        "ocrText": plan.trace.get("ocr"),
+        "speechTranscript": plan.trace.get("speech"),
+        "documentText": plan.trace.get("document"),
+        "extractedEntities": [],
+        "hasFace": plan.has_faces,
+        "faces": [f for img in plan.images for f in img.faces],
+    }
+
+
+def _decode_base64_image(data: str) -> bytes:
+    clean_b64 = re.sub(r"^data:image\/[\w.+-]+;base64,", "", data or "")
+    try:
+        return base64.b64decode(clean_b64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="imageBase64 is not valid base64 image data")
+
+
+def _preview_data_url(file_buffer: Optional[bytes], mime_type: Optional[str]) -> Optional[str]:
+    """Small JPEG preview of an uploaded query image (the full image is never echoed back)."""
+    if not file_buffer or not (mime_type or "").startswith("image/"):
+        return None
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(io.BytesIO(file_buffer)) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            im.thumbnail((512, 512))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=80)
+        return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
+    except Exception:
+        return None
+
+
+async def _read_query_request(request: Request) -> Dict[str, Any]:
+    """Parse a search request sent either as multipart (with one file) or as JSON."""
+    content_type = request.headers.get("content-type") or ""
+    out: Dict[str, Any] = {"query": "", "file_buffer": None, "file_name": None, "mime_type": None, "fields": {}}
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        out["fields"] = {k: v for k, v in form.items() if isinstance(v, str)}
+        out["query"] = str(form.get("query") or "")
+        target_file = form.get("file") or form.get("image")
+        if target_file and hasattr(target_file, "filename") and target_file.filename:
+            out["file_name"] = target_file.filename
+            out["mime_type"] = target_file.content_type
+            out["file_buffer"] = await target_file.read()
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            try:
+                raw_bytes = await request.body()
+                body = json.loads(raw_bytes.decode("utf-8", errors="ignore")) if raw_bytes else {}
+            except Exception:
+                body = {}
+        if not isinstance(body, dict):
+            body = {}
+        out["fields"] = body
+        out["query"] = str(body.get("query") or "")
+        out["file_name"] = body.get("fileName")
+        out["mime_type"] = body.get("mimeType")
+        if body.get("imageBase64"):
+            out["file_buffer"] = _decode_base64_image(body["imageBase64"])
+            out["mime_type"] = out["mime_type"] or "image/jpeg"
+    return out
+
+
+def _relative_threshold(raw: Any, default: float = 0.20) -> float:
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+        if val > 1.0:
+            val = val / 100.0
+        return max(0.0, min(1.0, val))
+    except (ValueError, TypeError):
+        return default
+
+
+def _cutoff(items: List[Dict[str, Any]], relative_threshold: float, fallback: float) -> float:
+    top = max((i.get("relevanceScore", 0.0) for i in items), default=0.0)
+    if top <= 0:
+        return fallback
+    return max(COMPOSITE_MIN_SCORE, round(top - relative_threshold, 4))
+
+
 @router.post("")
-async def unified_search(req: SearchRequest):
+async def unified_search(req: SearchRequest, user: Dict[str, Any] = Depends(require_auth)):
     topic = req.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="Topic is required")
@@ -39,14 +189,13 @@ async def unified_search(req: SearchRequest):
         "videos": [], "papers": [], "articles": [], "reports": [], "web": [], "providerStatuses": {}
     }
 
-    if source in ("internet", "both"):
-        import asyncio
-        v_task = search_videos(topic)
-        p_task = search_papers(topic)
-        n_task = search_news(topic)
-        w_task = search_web(topic)
+    local_task = _local_search(topic, limit=10) if source in ("local", "both") else None
 
-        v_res, p_res, n_res, w_res = await asyncio.gather(v_task, p_task, n_task, w_task, return_exceptions=True)
+    if source in ("internet", "both"):
+        v_res, p_res, n_res, w_res = await asyncio.gather(
+            search_videos(topic), search_papers(topic), search_news(topic), search_web(topic),
+            return_exceptions=True
+        )
 
         v_data = v_res if isinstance(v_res, dict) else {"status": "error", "sources": [], "count": 0}
         p_data = p_res if isinstance(p_res, dict) else {"status": "error", "sources": [], "count": 0}
@@ -68,20 +217,16 @@ async def unified_search(req: SearchRequest):
             }
         }
 
-    local_documents = []
-    local_videos = []
-
-    if source in ("local", "both"):
-        text_res = await search_by_text(topic, limit=10)
-        local_documents = text_res.get("documents", [])
-        local_videos = text_res.get("videos", [])
-
+    text_res = (await local_task)[0] if local_task is not None else {}
     return {
         "source": source,
         **internet_results,
-        "localDocuments": local_documents,
-        "localVideos": local_videos,
+        "localDocuments": text_res.get("documents", []),
+        "localVideos": text_res.get("videos", []),
+        "localImages": text_res.get("images", []),
+        "localAudio": text_res.get("audio", []),
     }
+
 
 @router.post("/local")
 async def local_search(req: LocalSearchRequest, user: Dict[str, Any] = Depends(require_auth)):
@@ -90,77 +235,58 @@ async def local_search(req: LocalSearchRequest, user: Dict[str, Any] = Depends(r
         raise HTTPException(status_code=400, detail="Query is required")
 
     limit = req.limit or 10
-    res = await search_by_text(query, limit=limit)
+    res, _plan, _trace = await _local_search(query, limit=limit)
+    documents = res.get("documents", [])[:limit]
+    videos = res.get("videos", [])[:limit]
+    images = res.get("images", [])[:limit]
+    audio = res.get("audio", [])[:limit]
     return {
         "query": query,
-        "documents": res.get("documents", []),
-        "videos": res.get("videos", []),
-        "images": res.get("images", []),
-        "audio": res.get("audio", []),
-        "total": res.get("total", 0),
+        "documents": documents,
+        "videos": videos,
+        "images": images,
+        "audio": audio,
+        "total": len(documents) + len(videos) + len(images) + len(audio),
     }
 
+
+def _document_snippet(file_buffer: bytes, file_name: Optional[str]) -> Optional[str]:
+    ext = (file_name.split(".")[-1].lower()) if (file_name and "." in file_name) else "txt"
+    if ext == "pdf":
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(file_buffer))
+        return "\n".join(p.extract_text() or "" for p in reader.pages[:3]).strip()[:1500]
+    if ext == "docx":
+        import docx
+        doc = docx.Document(io.BytesIO(file_buffer))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip()).strip()[:1500]
+    return file_buffer.decode("utf-8", errors="ignore").strip()[:1500]
+
+
 @router.post("/extract-query")
-async def extract_search_query(request: Request):
+async def extract_search_query(request: Request, user: Dict[str, Any] = Depends(require_auth)):
     """
     Extract a clean search query, keywords, and relevant search terms from user chat inquiry
-    plus optional uploaded image or document file using LLM.
+    plus optional uploaded image, audio or document file using LLM.
     """
-    content_type = request.headers.get("content-type") or ""
-    query_text = ""
-    file_buffer: Optional[bytes] = None
-    file_name: Optional[str] = None
-    mime_type: Optional[str] = None
+    parsed_req = await _read_query_request(request)
+    query_text = parsed_req["query"]
+    file_buffer: Optional[bytes] = parsed_req["file_buffer"]
+    file_name: Optional[str] = parsed_req["file_name"]
+    mime_type: Optional[str] = parsed_req["mime_type"]
     file_snippet: Optional[str] = None
 
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        query_text = str(form.get("query") or "")
-        target_file = form.get("file") or form.get("image")
-        if target_file and hasattr(target_file, "filename") and target_file.filename:
-            file_name = target_file.filename
-            mime_type = target_file.content_type
-            file_buffer = await target_file.read()
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        query_text = body.get("query", "")
-        file_name = body.get("fileName")
-        mime_type = body.get("mimeType")
-        img_b64 = body.get("imageBase64")
-        if img_b64:
-            clean_b64 = re.sub(r"^data:image\/\w+;base64,", "", img_b64)
-            try:
-                file_buffer = base64.b64decode(clean_b64)
-                mime_type = mime_type or "image/jpeg"
-            except Exception:
-                pass
-
-    # Extract text snippet from uploaded reference file if present
     if file_buffer:
         cat = detect_file_category(file_name, mime_type)
         if cat == "document":
-            ext = (file_name.split(".")[-1].lower()) if (file_name and "." in file_name) else "txt"
-            if ext == "pdf":
-                try:
-                    import pypdf, io
-                    reader = pypdf.PdfReader(io.BytesIO(file_buffer))
-                    pages_text = [p.extract_text() or "" for p in reader.pages[:3]]
-                    file_snippet = "\n".join(pages_text).strip()[:1500]
-                except Exception as e:
-                    print(f"[ExtractQuery] PDF extract notice: {e}")
-            else:
-                try:
-                    file_snippet = file_buffer.decode("utf-8", errors="ignore").strip()[:1500]
-                except Exception:
-                    pass
+            try:
+                file_snippet = await run_in_threadpool(_document_snippet, file_buffer, file_name)
+            except Exception as e:
+                print(f"[ExtractQuery] Document extract notice: {e}")
             if not file_snippet:
                 file_snippet = f"User attached document: {file_name or 'Uploaded Document'}"
         elif cat == "image":
             try:
-                from app.search.face_detector import detect_faces_in_image
                 face_res = await detect_faces_in_image(file_buffer, {"sourceId": "query"})
                 ocr_text = face_res.get("ocrText") or ""
                 visual_desc = face_res.get("visualDescription") or ""
@@ -177,6 +303,16 @@ async def extract_search_query(request: Request):
             except Exception as e:
                 print(f"[ExtractQuery] Image extract notice: {e}")
                 file_snippet = f"User attached image: {file_name or 'Uploaded Image'}"
+        elif cat in ("audio", "video"):
+            try:
+                signals = await understand_multimodal_query({
+                    "fileBuffer": file_buffer, "fileName": file_name,
+                    "mimeType": mime_type, "fileCategory": cat,
+                }, use_llm=False)
+                transcript = (signals.get("speechTranscript") or "").strip()
+                file_snippet = f"Speech transcript: {transcript[:1200]}" if transcript else f"User attached {cat}: {file_name or 'recording'}"
+            except Exception as e:
+                print(f"[ExtractQuery] Audio extract notice: {e}")
 
     # Fallback values if LLM unavailable
     fallback_query = query_text.strip() or (Path(file_name).stem if file_name else "Research Documents")
@@ -185,8 +321,7 @@ async def extract_search_query(request: Request):
     fallback_terms = [fallback_query]
     fallback_intent = "Document and knowledge source retrieval"
 
-    # Use Groq LLM to generate clean search query, keywords, and search terms
-    if settings.GROQ_API_KEY:
+    if settings.get_groq_api_keys():
         try:
             from app.ai.groq_client import get_async_groq_client, robust_json_loads
             client = get_async_groq_client()
@@ -206,20 +341,20 @@ async def extract_search_query(request: Request):
                 "Return ONLY valid JSON matching this schema."
             )
 
-            resp = await client.chat.completions.create(
-                model=settings.GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an elite search query formulation specialist. Your role is to convert complex user prompts and reference file contents into clean, precise search queries, keywords, and terms for document retrieval. Return ONLY a valid JSON object."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt_content
-                    }
-                ],
-                max_tokens=300,
-                temperature=0.2,
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an elite search query formulation specialist. Your role is to convert complex user prompts and reference file contents into clean, precise search queries, keywords, and terms for document retrieval. Return ONLY a valid JSON object."
+                        },
+                        {"role": "user", "content": prompt_content}
+                    ],
+                    max_tokens=300,
+                    temperature=0.2,
+                    timeout=3.5,
+                ),
+                timeout=4.0
             )
 
             content = resp.choices[0].message.content or "{}"
@@ -239,7 +374,7 @@ async def extract_search_query(request: Request):
                 "originalQuery": query_text,
             }
         except Exception as e:
-            print(f"[ExtractQuery] Groq extraction error: {e}")
+            print(f"[ExtractQuery] LLM extraction error: {e}")
 
     return {
         "searchQuery": fallback_query,
@@ -250,226 +385,171 @@ async def extract_search_query(request: Request):
         "originalQuery": query_text,
     }
 
+
+def _web_domain(url: str, default: str) -> str:
+    try:
+        domain = urllib.parse.urlparse(url or "").hostname or default
+    except Exception:
+        domain = default
+    return re.sub(r"^www\.", "", domain)
+
+
+async def _internet_sources(query: str) -> Dict[str, List[Dict[str, Any]]]:
+    try:
+        w_res, n_res, p_res, v_res, i_res = await asyncio.wait_for(
+            asyncio.gather(
+                search_web(query), search_news(query), search_papers(query),
+                search_videos(query), search_internet_images(query, 8),
+                return_exceptions=True
+            ),
+            timeout=12.0
+        )
+    except asyncio.TimeoutError:
+        print("[SmartSearch] Internet search providers timed out after 12s, proceeding with available data")
+        w_res = n_res = p_res = v_res = i_res = None
+
+    web, news, papers, videos, images = [], [], [], [], []
+    if isinstance(w_res, dict):
+        for it in w_res.get("sources", [])[:8]:
+            web.append({
+                "id": it.get("id") or f"web-{uuid.uuid4()}", "category": "web", "title": it.get("title", ""), "url": it.get("url", ""),
+                "snippet": it.get("description", ""), "domain": _web_domain(it.get("url", ""), "web"), "publishedDate": it.get("date"),
+                "thumbnail": it.get("thumbnail"), "relevanceScore": 0.92,
+            })
+    if isinstance(n_res, dict):
+        for it in n_res.get("articles", [])[:6]:
+            news.append({
+                "id": it.get("id") or f"news-{uuid.uuid4()}", "category": "news", "title": it.get("title", ""), "url": it.get("url", ""),
+                "snippet": it.get("description", ""), "domain": _web_domain(it.get("url", ""), "news"), "publishedDate": it.get("date"),
+                "author": it.get("author"), "relevanceScore": 0.89,
+            })
+    if isinstance(p_res, dict):
+        for it in p_res.get("sources", [])[:6]:
+            papers.append({
+                "id": it.get("id") or f"paper-{uuid.uuid4()}", "category": "paper", "title": it.get("title", ""),
+                "url": it.get("url") or f"https://semanticscholar.org/search?q={urllib.parse.quote(it.get('title', ''))}",
+                "snippet": it.get("description", ""), "domain": "semanticscholar.org",
+                "publishedDate": it.get("date"), "author": it.get("author"), "relevanceScore": 0.90,
+            })
+    if isinstance(v_res, dict):
+        for it in v_res.get("sources", [])[:6]:
+            vid_id = (it.get("id") or "").replace("yt-", "")
+            videos.append({
+                "id": it.get("id") or f"yt-{uuid.uuid4()}", "category": "video", "title": it.get("title", ""),
+                "url": it.get("url") or f"https://youtube.com/watch?v={vid_id}",
+                "snippet": it.get("description", ""), "domain": "youtube.com",
+                "publishedDate": it.get("date"), "author": it.get("author"),
+                "thumbnail": it.get("thumbnail"), "relevanceScore": 0.90,
+            })
+    if isinstance(i_res, list):
+        for it in i_res[:8]:
+            if not isinstance(it, dict):
+                continue
+            images.append({
+                "id": it.get("id") or f"img-{uuid.uuid4()}", "category": "image", "title": it.get("title", ""),
+                "url": it.get("sourceUrl") or it.get("url", ""), "snippet": f"Image from {it.get('domain', 'web')}",
+                "domain": it.get("domain", "web"), "thumbnail": it.get("thumbnail") or it.get("url", ""),
+                "relevanceScore": 0.88,
+            })
+    return {"web": web, "news": news, "papers": papers, "videos": videos, "images": images}
+
+
 @router.post("/smart")
-async def smart_search(request: Request):
-    content_type = request.headers.get("content-type") or ""
-    query_text = ""
-    file_buffer = None
-    file_name = None
-    mime_type = None
-    preview_url = None
-    enable_internet = False
-    relative_threshold = 0.20
-    raw_thresh = None
-
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        query_text = str(form.get("query") or "")
-        enable_internet = form.get("enableInternet") == "true" or form.get("enableInternetSources") == "true"
-        raw_thresh = form.get("relativeThreshold")
-        target_file = form.get("file") or form.get("image")
-        if target_file and hasattr(target_file, "filename") and target_file.filename:
-            file_name = target_file.filename
-            mime_type = target_file.content_type
-            file_buffer = await target_file.read()
-            if mime_type and mime_type.startswith("image/"):
-                preview_url = f"data:{mime_type};base64,{base64.b64encode(file_buffer).decode('utf-8')}"
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            try:
-                raw_bytes = await request.body()
-                body = json.loads(raw_bytes.decode("utf-8", errors="ignore")) if raw_bytes else {}
-            except Exception:
-                body = {}
-        query_text = body.get("query", "")
-        file_name = body.get("fileName")
-        mime_type = body.get("mimeType")
-        enable_internet = body.get("enableInternet") is True or body.get("enableInternetSources") is True
-        raw_thresh = body.get("relativeThreshold")
-        img_b64 = body.get("imageBase64")
-        if img_b64:
-            clean_b64 = re.sub(r"^data:image\/\w+;base64,", "", img_b64)
-            file_buffer = base64.b64decode(clean_b64)
-            preview_url = img_b64
-            mime_type = mime_type or "image/jpeg"
-
-    if raw_thresh is not None:
-        try:
-            val = float(raw_thresh)
-            if val > 1.0:
-                val = val / 100.0
-            relative_threshold = max(0.0, min(1.0, val))
-        except (ValueError, TypeError):
-            relative_threshold = 0.20
+async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_auth)):
+    req = await _read_query_request(request)
+    fields = req["fields"]
+    query_text = req["query"]
+    file_buffer = req["file_buffer"]
+    file_name = req["file_name"]
+    mime_type = req["mime_type"]
+    enable_internet = str(fields.get("enableInternet") or fields.get("enableInternetSources") or "").lower() == "true" \
+        or fields.get("enableInternet") is True or fields.get("enableInternetSources") is True
+    relative_threshold = _relative_threshold(fields.get("relativeThreshold"))
 
     if not query_text.strip() and not file_buffer:
         raise HTTPException(status_code=400, detail="Please provide a search query or upload reference material.")
 
-    file_category = detect_file_category(file_name, mime_type)
-    signals = await understand_multimodal_query({
-        "textQuery": query_text,
-        "fileBuffer": file_buffer,
-        "fileName": file_name,
-        "mimeType": mime_type,
-        "fileCategory": file_category,
-        "previewUrl": preview_url,
-    })
+    preview_url = _preview_data_url(file_buffer, mime_type)
 
-    # 1. Local Search First
-    local_res = await search_by_multimodal_signals(signals)
-    all_local_matches = [
-        *local_res.get("videos", []),
-        *local_res.get("documents", []),
-        *local_res.get("images", []),
-        *local_res.get("audio", []),
-    ]
-    all_local_matches.sort(key=lambda x: x.get("relevanceScore", 0), reverse=True)
+    # 1. Local search: every folder library (plus the legacy index until it is migrated)
+    local_res, plan, engine_trace = await _local_search(query_text, file_buffer, file_name, mime_type, limit=20)
+    signals = _compat_signals(plan)
+    all_local_matches = sorted(
+        [*local_res.get("videos", []), *local_res.get("documents", []),
+         *local_res.get("images", []), *local_res.get("audio", [])],
+        key=lambda x: x.get("relevanceScore", 0), reverse=True
+    )
 
-    # 2. Determine internet search query.
-    # IMPORTANT: anchor to the original user text query when present.
-    # Local matches are used only for supplemental entity enrichment (image/doc-upload case).
-    # Previously the LLM was free to replace the query with the top local match title,
-    # causing query bleed (e.g., "narendra modi" → "SSC Chairman S Kishore").
-    enhanced = await generate_enhanced_internet_query(signals, all_local_matches)
-    if query_text.strip():
-        # Text query present — user intent is explicit; keep it as the primary anchor
-        target_internet_query = query_text.strip()
-    else:
-        # Image/document upload with no text — use LLM-enriched query from local context
-        target_internet_query = enhanced.get("primaryQuery") or "AI Research Intelligence"
-
-    # 3. Multi-category internet search (if enabled)
-    internet_web = []
-    internet_news = []
-    internet_papers = []
-    internet_videos = []
-    internet_images = []
-
+    # 2. Internet search (optional). The typed text stays the anchor; LLM enrichment from
+    #    local context is only used for image/document uploads without text.
+    enhanced: Dict[str, Any] = {}
+    target_internet_query = query_text.strip()
+    internet = {"web": [], "news": [], "papers": [], "videos": [], "images": []}
     if enable_internet:
-        import asyncio
-        w_task = search_web(target_internet_query)
-        n_task = search_news(target_internet_query)
-        p_task = search_papers(target_internet_query)
-        v_task = search_videos(target_internet_query)
-        i_task = search_internet_images(target_internet_query, 8)
+        enhanced = await generate_enhanced_internet_query(signals, all_local_matches)
+        if not target_internet_query:
+            target_internet_query = enhanced.get("primaryQuery") or "AI Research Intelligence"
+        internet = await _internet_sources(target_internet_query)
 
-        try:
-            w_res, n_res, p_res, v_res, i_res = await asyncio.wait_for(
-                asyncio.gather(w_task, n_task, p_task, v_task, i_task, return_exceptions=True),
-                timeout=12.0
-            )
-        except asyncio.TimeoutError:
-            print("[SmartSearch] Internet search providers timed out after 12s, proceeding with available data")
-            w_res, n_res, p_res, v_res, i_res = None, None, None, None, None
-
-        if isinstance(w_res, dict) and w_res.get("sources"):
-            for it in w_res["sources"][:8]:
-                try:
-                    domain = urllib.parse.urlparse(it.get("url", "https://google.com")).hostname or "google.com"
-                    domain = re.sub(r"^www\.", "", domain)
-                    internet_web.append({
-                        "id": it.get("id"), "category": "web", "title": it.get("title", ""), "url": it.get("url", ""),
-                        "snippet": it.get("description", ""), "domain": domain, "publishedDate": it.get("date"),
-                        "thumbnail": it.get("thumbnail"), "relevanceScore": 0.92,
-                    })
-                except Exception: pass
-
-        if isinstance(n_res, dict) and n_res.get("articles"):
-            for it in n_res["articles"][:6]:
-                try:
-                    domain = urllib.parse.urlparse(it.get("url", "https://news.google.com")).hostname or "news"
-                    domain = re.sub(r"^www\.", "", domain)
-                    internet_news.append({
-                        "id": it.get("id"), "category": "news", "title": it.get("title", ""), "url": it.get("url", ""),
-                        "snippet": it.get("description", ""), "domain": domain, "publishedDate": it.get("date"),
-                        "author": it.get("author"), "relevanceScore": 0.89,
-                    })
-                except Exception: pass
-
-        if isinstance(p_res, dict) and p_res.get("sources"):
-            for it in p_res["sources"][:6]:
-                internet_papers.append({
-                    "id": it.get("id"), "category": "paper", "title": it.get("title", ""),
-                    "url": it.get("url") or f"https://semanticscholar.org/search?q={urllib.parse.quote(it.get('title', ''))}",
-                    "snippet": it.get("description", ""), "domain": "semanticscholar.org",
-                    "publishedDate": it.get("date"), "author": it.get("author"), "relevanceScore": 0.90,
-                })
-
-        if isinstance(v_res, dict) and v_res.get("sources"):
-            for it in v_res["sources"][:6]:
-                vid_id = it.get("id", "").replace("yt-", "")
-                internet_videos.append({
-                    "id": it.get("id"), "category": "video", "title": it.get("title", ""),
-                    "url": it.get("url") or f"https://youtube.com/watch?v={vid_id}",
-                    "snippet": it.get("description", ""), "domain": "youtube.com",
-                    "publishedDate": it.get("date"), "author": it.get("author"),
-                    "thumbnail": it.get("thumbnail"), "relevanceScore": 0.90,
-                })
-
-        if isinstance(i_res, list):
-            for it in i_res[:8]:
-                internet_images.append({
-                    "id": it["id"], "category": "image", "title": it.get("title", ""),
-                    "url": it.get("sourceUrl") or it.get("url", ""), "snippet": f"Image from {it.get('domain')}",
-                    "domain": it.get("domain", "web"), "thumbnail": it.get("thumbnail") or it.get("url", ""),
-                    "relevanceScore": 0.88,
-                })
-
-    # 4. Relative Similarity Threshold Filtering
-    # IMPORTANT: compute top_score from LOCAL results only.
-    # Internet results use hardcoded scores (0.88-0.92); mixing them would raise min_score
-    # to ~0.72 and wipe all local results that scored below that bar.
-    local_only_scores = [m.get("relevanceScore", 0.0) for m in all_local_matches]
-    top_local_score = max(local_only_scores, default=0.0)
-    # Floor at COMPOSITE_MIN_SCORE to avoid over-filtering when index has few results
+    # 3. Per-modality relative thresholds, so strong document scores can't wipe out
+    #    visual or audio matches (and vice versa).
+    top_local_score = max((m.get("relevanceScore", 0.0) for m in all_local_matches), default=0.0)
     min_score = max(COMPOSITE_MIN_SCORE, round(top_local_score - relative_threshold, 4))
+    is_visual_search = bool(plan.images) and not plan.text
+    has_user_text = bool(plan.text)
 
-    total_before = len(all_local_matches) + (len(internet_web) + len(internet_news) + len(internet_papers) + len(internet_videos) + len(internet_images) if enable_internet else 0)
+    doc_min = _cutoff(local_res.get("documents", []), relative_threshold, min_score)
+    video_min = _cutoff(local_res.get("videos", []), relative_threshold, min_score)
+    image_min = _cutoff(local_res.get("images", []), relative_threshold, min_score)
+    audio_min = _cutoff(local_res.get("audio", []), relative_threshold, min_score)
+    if is_visual_search and not has_user_text:
+        # Pure visual search: documents must be genuinely relevant to show up
+        doc_min = max(0.50, doc_min)
 
-    # Apply threshold filtering to local results only
-    filtered_documents = [d for d in local_res.get("documents", []) if d.get("relevanceScore", 0.0) >= min_score]
-    filtered_videos = [v for v in local_res.get("videos", []) if v.get("relevanceScore", 0.0) >= min_score]
-    filtered_images = [i for i in local_res.get("images", []) if i.get("relevanceScore", 0.0) >= min_score]
-    filtered_audio = [a for a in local_res.get("audio", []) if a.get("relevanceScore", 0.0) >= min_score]
-    all_local_matches = [m for m in all_local_matches if m.get("relevanceScore", 0.0) >= min_score]
-    local_total = len(filtered_documents) + len(filtered_videos) + len(filtered_images) + len(filtered_audio)
+    filtered_documents = [d for d in local_res.get("documents", []) if d.get("relevanceScore", 0.0) >= doc_min]
+    filtered_videos = [v for v in local_res.get("videos", []) if v.get("relevanceScore", 0.0) >= video_min]
+    filtered_images = [i for i in local_res.get("images", []) if i.get("relevanceScore", 0.0) >= image_min]
+    filtered_audio = [a for a in local_res.get("audio", []) if a.get("relevanceScore", 0.0) >= audio_min]
+    all_local_matches = sorted(
+        [*filtered_videos, *filtered_documents, *filtered_images, *filtered_audio],
+        key=lambda x: x.get("relevanceScore", 0.0), reverse=True
+    )
+    local_total = len(all_local_matches)
+    internet_total = sum(len(v) for v in internet.values())
+    total_before = len(local_res.get("documents", [])) + len(local_res.get("videos", [])) + \
+        len(local_res.get("images", [])) + len(local_res.get("audio", [])) + internet_total
 
-    # Internet results are pre-ranked by provider — no threshold filtering needed
-    if enable_internet:
-        internet_total = len(internet_web) + len(internet_news) + len(internet_papers) + len(internet_videos) + len(internet_images)
-    else:
-        internet_total = 0
+    print(f"[SmartSearch Threshold] top_local_score={top_local_score:.4f}, configured_threshold={relative_threshold:.4f}, "
+          f"min_score={min_score:.4f}, results_before={total_before}, results_after={local_total + internet_total}")
 
-    total_after = local_total + internet_total
-
-    print(f"[SmartSearch Threshold] top_local_score={top_local_score:.4f}, configured_threshold={relative_threshold:.4f}, min_score={min_score:.4f}, results_before={total_before}, results_after={total_after}")
-
+    top = all_local_matches[0] if all_local_matches else None
     discovery_trace = {
-        "inputType": signals.get("queryType"),
-        "inputName": signals.get("fileName"),
-        "inputPreview": signals.get("previewUrl"),
+        "inputType": plan.kind,
+        "inputName": file_name,
+        "inputPreview": preview_url,
         "extractedSignals": {
-            "hasFace": signals.get("hasFace"),
+            "hasFace": plan.has_faces,
             "faceCount": len(signals.get("faces", [])),
             "ocrSnippet": signals.get("ocrText")[:160] if signals.get("ocrText") else None,
             "speechSnippet": signals.get("speechTranscript")[:160] if signals.get("speechTranscript") else None,
-            "visualDescription": signals.get("visualDescription")[:160] if signals.get("visualDescription") else None,
-            "extractedEntities": signals.get("extractedEntities"),
+            "visualDescription": None,
+            "extractedEntities": [],
+            "filters": plan.filters.describe(),
         },
+        "engine": {k: engine_trace.get(k) for k in ("libraries", "candidates", "reranked", "faceFilter", "returned",
+                                                   "folders", "folderQuery")},
         "topLocalMatch": {
-            "id": all_local_matches[0]["id"],
-            "sourceId": all_local_matches[0]["sourceId"],
-            "title": all_local_matches[0]["title"],
-            "category": all_local_matches[0]["category"],
-            "relevanceScore": all_local_matches[0]["relevanceScore"],
-            "timestamp": all_local_matches[0].get("startTime"),
-            "isFaceMatch": all_local_matches[0].get("isFaceMatch"),
-            "faceSimilarity": all_local_matches[0].get("faceSimilarity"),
-            "snippet": all_local_matches[0].get("snippet"),
-        } if all_local_matches else None,
-        "enhancedQuery": target_internet_query,
+            "id": top.get("id"),
+            "sourceId": top.get("sourceId"),
+            "title": top.get("title") or top.get("originalName") or "Untitled Document",
+            "category": top.get("category", "document"),
+            "relevanceScore": top.get("relevanceScore", 0.0),
+            "timestamp": top.get("startTime"),
+            "isFaceMatch": top.get("isFaceMatch"),
+            "faceSimilarity": top.get("faceSimilarity"),
+            "snippet": top.get("snippet"),
+        } if top else None,
+        "enhancedQuery": target_internet_query or query_text,
         "queryVariants": enhanced.get("queryVariants"),
         "discoveredEntities": enhanced.get("discoveredEntities"),
         "contextSummary": enhanced.get("contextSummary"),
@@ -481,16 +561,13 @@ async def smart_search(request: Request):
         "queryImagePreview": preview_url,
         "discoveryTrace": discovery_trace,
         "thresholdInfo": {
-            "topScore": round(top_score, 4),
+            "topScore": round(top_local_score, 4),
             "relativeThreshold": round(relative_threshold, 4),
             "minScore": round(min_score, 4),
             "resultsBefore": total_before,
-            "resultsAfter": total_after,
+            "resultsAfter": local_total + internet_total,
         },
-        "internet": {
-            "web": internet_web, "news": internet_news, "papers": internet_papers,
-            "videos": internet_videos, "images": internet_images, "total": internet_total,
-        },
+        "internet": {**internet, "total": internet_total},
         "local": {
             "documents": filtered_documents,
             "videos": filtered_videos,
@@ -505,63 +582,27 @@ async def smart_search(request: Request):
         },
     }
 
-@router.post("/similar")
-async def find_similar_sources(request: Request):
-    content_type = request.headers.get("content-type") or ""
-    source_id = None
-    relative_threshold = 0.20
-    raw_thresh = None
 
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        source_id = str(form.get("sourceId") or form.get("source_id") or "").strip()
-        raw_thresh = form.get("relativeThreshold")
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            try:
-                raw_bytes = await request.body()
-                body = json.loads(raw_bytes.decode("utf-8", errors="ignore")) if raw_bytes else {}
-            except Exception:
-                body = {}
-        source_id = str(body.get("sourceId") or body.get("source_id") or "").strip()
-        raw_thresh = body.get("relativeThreshold")
+def _similar_signals(source: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build retrieval signals describing an indexed source (blocking)."""
+    from collections import Counter
+    from app.search.model_pipeline import get_image_embedding, get_text_query_embedding
 
-    if raw_thresh is not None:
-        try:
-            val = float(raw_thresh)
-            if val > 1.0:
-                val = val / 100.0
-            relative_threshold = max(0.0, min(1.0, val))
-        except (ValueError, TypeError):
-            relative_threshold = 0.20
-
-    if not source_id:
-        raise HTTPException(status_code=400, detail="sourceId is required to find similar sources")
-
-    source = db_get(
-        "SELECT id, original_name, file_type, file_path, file_size, upload_date, tags_json, metadata_json FROM knowledge_sources WHERE id = ?",
-        (source_id,)
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail=f"Source with id '{source_id}' not found")
-
+    source_id = source["id"]
     title = source["original_name"]
     file_type = (source.get("file_type") or "").lower()
 
-    # Retrieve document sections & chunks
     chunks = db_all(
-        """SELECT c.chunk_text, s.section_title, c.page_num 
-           FROM document_chunks c 
-           LEFT JOIN document_sections s ON c.section_id = s.id 
-           WHERE c.source_id = ? 
+        """SELECT c.chunk_text, s.section_title, c.page_num
+           FROM document_chunks c
+           LEFT JOIN document_sections s ON c.section_id = s.id
+           WHERE c.source_id = ?
            ORDER BY c.chunk_order ASC LIMIT 10""",
         (source_id,)
     )
     chunk_texts = [c["chunk_text"] for c in chunks if c.get("chunk_text")]
     section_titles = list({
-        c["section_title"] for c in chunks 
+        c["section_title"] for c in chunks
         if c.get("section_title") and not c["section_title"].startswith("Page ")
     })
     if not section_titles:
@@ -569,16 +610,13 @@ async def find_similar_sources(request: Request):
         section_titles = list({s["section_title"] for s in secs if s.get("section_title") and not s["section_title"].startswith("Page ")})
     doc_summary = " ".join(chunk_texts)[:1000] if chunk_texts else ""
 
-    # Retrieve video transcripts
     transcripts = db_all(
         "SELECT text, start_time FROM video_transcripts WHERE source_id = ? ORDER BY start_time ASC LIMIT 12",
         (source_id,)
     )
-    transcript_texts = [t["text"] for t in transcripts if t.get("text")]
-    video_summary = " ".join(transcript_texts)[:1000] if transcript_texts else ""
+    video_summary = " ".join(t["text"] for t in transcripts if t.get("text"))[:1000]
 
-    # Retrieve tags / keywords
-    keywords = []
+    keywords: List[str] = []
     if source.get("tags_json"):
         try:
             kws = json.loads(source["tags_json"])
@@ -586,10 +624,8 @@ async def find_similar_sources(request: Request):
                 keywords.extend(kws)
         except Exception:
             pass
-    if section_titles:
-        keywords.extend(section_titles)
+    keywords.extend(section_titles)
 
-    # Retrieve visual signals (pHash, dHash, image embeddings)
     img_row = db_get(
         "SELECT image_path, phash, dhash FROM image_perceptual_hashes WHERE source_id = ? LIMIT 1",
         (source_id,)
@@ -597,122 +633,153 @@ async def find_similar_sources(request: Request):
     phash = img_row.get("phash") if img_row else None
     dhash = img_row.get("dhash") if img_row else None
     img_path = img_row.get("image_path") if img_row else (
-        source["file_path"] if file_type in ("jpg", "png", "webp", "jpeg", "bmp") else None
+        source["file_path"] if file_type in IMAGE_EXTENSIONS else None
     )
-
-    img_emb = None
-    if img_path and Path(img_path).exists():
-        try:
-            from app.search.model_pipeline import get_image_embedding
-            img_emb = get_image_embedding(img_path)
-        except Exception as e:
-            print(f"[Find Similar Sources] Notice loading image embedding: {e}")
+    img_emb = get_image_embedding(img_path) if img_path and Path(img_path).exists() else None
 
     text_content = doc_summary or video_summary
-    from app.search.keyword_search import extract_query_tokens
     tokens = extract_query_tokens(f"{title} {text_content}")
-    from collections import Counter
     top_tokens = [w for w, _ in Counter(tokens).most_common(8)]
     combined_keywords = list(dict.fromkeys(keywords + top_tokens))
-
     query_preview = f"{title} {' '.join(combined_keywords[:6])}".strip()
-
-    text_emb = None
-    if text_content:
-        try:
-            from app.search.model_pipeline import get_text_embedding
-            text_emb = get_text_embedding(f"{title} {text_content}"[:1200])
-        except Exception as e:
-            print(f"[Find Similar Sources] Notice loading text embedding: {e}")
+    text_emb = get_text_query_embedding(f"{title} {text_content}"[:1200]) if text_content else None
 
     signals = {
         "queryType": "similar_source",
         "textQuery": query_preview,
         "originalQueryText": title,
         "textEmbedding": text_emb,
-        "documentText": doc_summary if doc_summary else None,
+        "documentText": doc_summary or None,
         "derivedSearchKeywords": " ".join(combined_keywords[:8]),
-        "ocrText": doc_summary[:500] if doc_summary else None,
         "speechTranscript": video_summary[:500] if video_summary else None,
         "fileName": title,
         "phash": phash,
         "dhash": dhash,
         "imageEmbedding": img_emb,
     }
-
-    # Execute search across existing vector & text indexes
-    raw_res = await search_by_multimodal_signals(signals)
-
-    # Exclude the query source itself so it does not dominate
-    filtered_documents = [
-        d for d in raw_res.get("documents", [])
-        if d.get("sourceId") != source_id and d.get("id") != f"src-{source_id}"
-    ]
-    filtered_videos = [
-        v for v in raw_res.get("videos", [])
-        if v.get("sourceId") != source_id and v.get("id") != f"src-{source_id}"
-    ]
-    filtered_images = [
-        i for i in raw_res.get("images", [])
-        if i.get("sourceId") != source_id and i.get("id") != f"src-{source_id}"
-    ]
-    filtered_audio = [
-        a for a in raw_res.get("audio", [])
-        if a.get("sourceId") != source_id and a.get("id") != f"src-{source_id}"
-    ]
-
-    all_matches = [*filtered_videos, *filtered_documents, *filtered_images, *filtered_audio]
-    all_matches.sort(key=lambda x: x.get("relevanceScore", 0.0), reverse=True)
-
-    # Apply relative threshold filtering
-    top_score = max([m.get("relevanceScore", 0.0) for m in all_matches], default=0.0)
-    min_score = max(0.0, round(top_score - relative_threshold, 4))
-    total_before = len(all_matches)
-
-    final_docs = [d for d in filtered_documents if d.get("relevanceScore", 0.0) >= min_score]
-    final_vids = [v for v in filtered_videos if v.get("relevanceScore", 0.0) >= min_score]
-    final_imgs = [i for i in filtered_images if i.get("relevanceScore", 0.0) >= min_score]
-    final_auds = [a for a in filtered_audio if a.get("relevanceScore", 0.0) >= min_score]
-    final_matches = [m for m in all_matches if m.get("relevanceScore", 0.0) >= min_score]
-    total_related = len(final_matches)
-
-    # Structured logs as requested
-    print(f"[Find Similar Sources] Selected source: '{title}' (id: {source_id})")
-    print(f"[Find Similar Sources] Keywords/Summary used: '{query_preview}'")
-    print(f"[Find Similar Sources] Number of related sources returned: {total_related}")
-    print(f"[Find Similar Sources Threshold] top_score={top_score:.4f}, configured_threshold={relative_threshold:.4f}, min_score={min_score:.4f}, results_before={total_before}, results_after={total_related}")
-
-    discovery_trace = {
-        "inputType": "similar_source",
-        "inputName": title,
-        "extractedSignals": {
-            "sourceTitle": title,
-            "sourceType": file_type,
-            "keywords": combined_keywords[:8],
-            "hasVisualSignal": bool(phash or img_emb is not None),
-            "summarySnippet": (text_content[:200] + "...") if text_content else None,
-        },
-        "topLocalMatch": final_matches[0] if final_matches else None,
-        "enhancedQuery": query_preview,
+    info = {
+        "title": title,
+        "file_type": file_type,
+        "keywords": combined_keywords[:8],
+        "query_preview": query_preview,
+        "text_content": text_content,
+        "has_visual": bool(phash or img_emb is not None),
     }
+    return signals, info
 
+
+async def _similar_in_libraries(lib, src: Dict[str, Any], relative_threshold: float) -> Dict[str, Any]:
+    plan = await run_in_threadpool(plan_from_source, lib, src["id"])
+    res = await run_in_threadpool(get_engine().search, plan, 20)
+    buckets = res.as_dict()
+    all_matches = res.all()
+    top_score = max((m["relevanceScore"] for m in all_matches), default=0.0)
+    min_score = max(0.0, round(top_score - relative_threshold, 4))
+    final = {k: [i for i in v if i["relevanceScore"] >= min_score] for k, v in buckets.items()}
+    final_matches = [m for m in all_matches if m["relevanceScore"] >= min_score]
+    total = len(final_matches)
+    title = src["name"]
     return {
         "query": f"Similar to: {title}",
-        "sourceId": source_id,
+        "sourceId": src["id"],
         "sourceTitle": title,
-        "discoveryTrace": discovery_trace,
+        "discoveryTrace": {
+            "inputType": "similar_source",
+            "inputName": title,
+            "extractedSignals": {
+                "sourceTitle": title,
+                "sourceType": src["ext"],
+                "keywords": fts_terms(plan.rerank_query)[:8],
+                "hasVisualSignal": bool(plan.images),
+                "summarySnippet": (plan.rerank_query[:200] + "...") if plan.rerank_query else None,
+            },
+            "topLocalMatch": final_matches[0] if final_matches else None,
+            "enhancedQuery": title,
+        },
         "thresholdInfo": {
             "topScore": round(top_score, 4),
             "relativeThreshold": round(relative_threshold, 4),
             "minScore": round(min_score, 4),
-            "resultsBefore": total_before,
+            "resultsBefore": len(all_matches),
+            "resultsAfter": total,
+        },
+        "local": {**final, "total": total},
+        "internet": {"web": [], "news": [], "papers": [], "videos": [], "images": [], "total": 0},
+        "stats": {"internetCount": 0, "localCount": total, "total": total},
+    }
+
+
+@router.post("/similar")
+async def find_similar_sources(request: Request, user: Dict[str, Any] = Depends(require_auth)):
+    req = await _read_query_request(request)
+    fields = req["fields"]
+    raw_id = str(fields.get("sourceId") or fields.get("source_id") or "").strip()
+    relative_threshold = _relative_threshold(fields.get("relativeThreshold"))
+    if not raw_id:
+        raise HTTPException(status_code=400, detail="sourceId is required to find similar sources")
+
+    source_id = raw_id.removeprefix("src-")
+    from app.library.manager import get_library_manager
+    found = await run_in_threadpool(get_library_manager().find_source, source_id)
+    if found:
+        return await _similar_in_libraries(found[0], found[1], relative_threshold)
+    source = db_get(
+        "SELECT id, original_name, file_type, file_path, file_size, upload_date, tags_json, metadata_json FROM knowledge_sources WHERE id = ?",
+        (source_id,)
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source with id '{raw_id}' not found")
+
+    signals, info = await run_in_threadpool(_similar_signals, source)
+    raw_res = await run_in_threadpool(search_by_multimodal_signals, signals)
+
+    def not_self(item: Dict[str, Any]) -> bool:
+        return item.get("sourceId") != source_id
+
+    filtered = {k: [i for i in raw_res.get(k, []) if not_self(i)] for k in ("documents", "videos", "images", "audio")}
+    all_matches = sorted(
+        [*filtered["videos"], *filtered["documents"], *filtered["images"], *filtered["audio"]],
+        key=lambda x: x.get("relevanceScore", 0.0), reverse=True
+    )
+
+    top_score = max((m.get("relevanceScore", 0.0) for m in all_matches), default=0.0)
+    min_score = max(0.0, round(top_score - relative_threshold, 4))
+    final = {k: [i for i in v if i.get("relevanceScore", 0.0) >= min_score] for k, v in filtered.items()}
+    final_matches = [m for m in all_matches if m.get("relevanceScore", 0.0) >= min_score]
+    total_related = len(final_matches)
+
+    print(f"[Find Similar Sources] '{info['title']}' (id: {source_id}) -> {total_related} related "
+          f"(top_score={top_score:.4f}, min_score={min_score:.4f})")
+
+    return {
+        "query": f"Similar to: {info['title']}",
+        "sourceId": source_id,
+        "sourceTitle": info["title"],
+        "discoveryTrace": {
+            "inputType": "similar_source",
+            "inputName": info["title"],
+            "extractedSignals": {
+                "sourceTitle": info["title"],
+                "sourceType": info["file_type"],
+                "keywords": info["keywords"],
+                "hasVisualSignal": info["has_visual"],
+                "summarySnippet": (info["text_content"][:200] + "...") if info["text_content"] else None,
+            },
+            "topLocalMatch": final_matches[0] if final_matches else None,
+            "enhancedQuery": info["query_preview"],
+        },
+        "thresholdInfo": {
+            "topScore": round(top_score, 4),
+            "relativeThreshold": round(relative_threshold, 4),
+            "minScore": round(min_score, 4),
+            "resultsBefore": len(all_matches),
             "resultsAfter": total_related,
         },
         "local": {
-            "documents": final_docs,
-            "videos": final_vids,
-            "audio": final_auds,
-            "images": final_imgs,
+            "documents": final["documents"],
+            "videos": final["videos"],
+            "audio": final["audio"],
+            "images": final["images"],
             "total": total_related,
         },
         "internet": {
@@ -725,160 +792,153 @@ async def find_similar_sources(request: Request):
         },
     }
 
+
 @router.post("/multimodal")
-async def multimodal_search(request: Request):
-    content_type = request.headers.get("content-type") or ""
-    query_text = ""
-    file_buffer = None
-    file_name = None
-    mime_type = None
-    preview_url = None
-
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        query_text = str(form.get("query") or "")
-        target_file = form.get("file") or form.get("image")
-        if target_file and hasattr(target_file, "filename") and target_file.filename:
-            file_name = target_file.filename
-            mime_type = target_file.content_type
-            file_buffer = await target_file.read()
-            if mime_type and mime_type.startswith("image/"):
-                preview_url = f"data:{mime_type};base64,{base64.b64encode(file_buffer).decode('utf-8')}"
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            try:
-                raw_bytes = await request.body()
-                body = json.loads(raw_bytes.decode("utf-8", errors="ignore")) if raw_bytes else {}
-            except Exception:
-                body = {}
-        query_text = body.get("query", "")
-        file_name = body.get("fileName")
-        mime_type = body.get("mimeType")
-        img_b64 = body.get("imageBase64")
-        if img_b64:
-            clean_b64 = re.sub(r"^data:image\/\w+;base64,", "", img_b64)
-            file_buffer = base64.b64decode(clean_b64)
-            preview_url = img_b64
-            mime_type = mime_type or "image/jpeg"
-
+async def multimodal_search(request: Request, user: Dict[str, Any] = Depends(require_auth)):
+    req = await _read_query_request(request)
+    query_text = req["query"]
+    file_buffer = req["file_buffer"]
     if not query_text.strip() and not file_buffer:
         raise HTTPException(status_code=400, detail="Please provide a text query or upload reference material.")
 
-    file_category = detect_file_category(file_name, mime_type)
-    signals = await understand_multimodal_query({
-        "textQuery": query_text,
-        "fileBuffer": file_buffer,
-        "fileName": file_name,
-        "mimeType": mime_type,
-        "fileCategory": file_category,
-        "previewUrl": preview_url,
-    })
+    res, _plan, _trace = await _local_search(query_text, file_buffer, req["file_name"], req["mime_type"], limit=20)
+    return res
 
-    results = await search_by_multimodal_signals(signals)
-    return results
 
 @router.post("/face")
 async def face_search(request: Request, user: Dict[str, Any] = Depends(require_auth)):
     content_type = request.headers.get("content-type") or ""
-    matches = []
+    query_embeddings: List[List[float]] = []
+    buf: Optional[bytes] = None
 
     if "multipart/form-data" in content_type:
         form = await request.form()
         target_file = form.get("file") or form.get("image")
         if target_file and hasattr(target_file, "filename") and target_file.filename:
             buf = await target_file.read()
-            face_res = await detect_faces_in_image(buf, {"sourceId": "query"})
-            for f in face_res.get("faces", []):
-                if f.get("embedding"):
-                    res = search_face_embeddings(f["embedding"], min_similarity=0.50, limit=10)
-                    matches.extend(res)
     else:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Expected an image upload or a JSON body")
         if body.get("embedding") and isinstance(body["embedding"], list):
-            matches = search_face_embeddings(body["embedding"], min_similarity=0.50, limit=10)
+            query_embeddings = [body["embedding"]]
         elif body.get("imageBase64"):
-            clean_b64 = re.sub(r"^data:image\/\w+;base64,", "", body["imageBase64"])
-            buf = base64.b64decode(clean_b64)
-            face_res = await detect_faces_in_image(buf, {"sourceId": "query"})
-            for f in face_res.get("faces", []):
-                if f.get("embedding"):
-                    res = search_face_embeddings(f["embedding"], min_similarity=0.50, limit=10)
-                    matches.extend(res)
+            buf = _decode_base64_image(body["imageBase64"])
 
-    # Deduplicate matches
+    matches: List[Dict[str, Any]] = []
+    if buf:
+        # Folder libraries: identity vectors from buffalo_l
+        def _face_only() -> List[Dict[str, Any]]:
+            from app.search.plan import _image_signal, finish_plan
+            sig = _image_signal(buf, "face query")
+            if sig is None or not sig.faces:
+                return []
+            sig.clip_vec, sig.phash, sig.ocr_text = None, None, ""
+            plan = QueryPlan(images=[sig])
+            finish_plan(plan)
+            out = []
+            for item in get_engine().search(plan, 20).all():
+                frame = item.get("primaryFrame") or (item.get("matchingFrames") or [None])[0]
+                out.append({
+                    "sourceId": item["sourceId"], "title": item["title"], "category": item["category"],
+                    "similarity": item.get("faceSimilarity") or 0.0, "isMatch": item.get("isFaceMatch"),
+                    "timestamp": item.get("startTime"), "frameId": frame.get("id") if frame else None,
+                    "framePath": frame.get("framePath") if frame else None,
+                    "libraryName": item.get("libraryName"), "relevanceScore": item["relevanceScore"],
+                })
+            return out
+        matches.extend(await run_in_threadpool(_face_only))
+        # Legacy index (buffalo_s vectors) until it is migrated
+        if await run_in_threadpool(_legacy_exists):
+            face_res = await detect_faces_in_image(buf, {"sourceId": "query", "useVision": False})
+            query_embeddings = [f["embedding"] for f in face_res.get("faces", []) if f.get("embedding")]
+
+    for emb in query_embeddings:
+        matches.extend(await run_in_threadpool(search_face_embeddings, emb, 0.50, 10))
+
     seen = set()
     unique_matches = []
-    for m in matches:
+    for m in sorted(matches, key=lambda x: x.get("similarity", 0), reverse=True):
         key = f"{m.get('sourceId')}-{m.get('videoId')}-{m.get('timestamp')}"
         if key not in seen:
             seen.add(key)
             unique_matches.append(m)
-    unique_matches.sort(key=lambda x: x.get("similarity", 0), reverse=True)
 
     return {"matches": unique_matches[:10], "total": len(unique_matches)}
+
 
 @router.post("/video")
 async def video_search(req: VideoSearchRequest, user: Dict[str, Any] = Depends(require_auth)):
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
-
     limit = req.limit or 10
-    raw_results = search_transcripts(query, limit * 2)
-    video_results = []
-    seen_videos = set()
 
-    for tr in raw_results:
-        expanded = expand_transcript_segment(tr["id"], tr["score"])
-        if not expanded:
-            continue
+    def _search() -> List[Dict[str, Any]]:
+        video_results = []
+        # Folder libraries: transcripts and frames through the search engine
+        plan = build_plan(query + " kind:video")
+        for item in get_engine().search(plan, limit).videos:
+            video_results.append({
+                "id": item["id"], "videoId": item["sourceId"], "sourceId": item["sourceId"],
+                "videoTitle": item["title"], "startTime": item.get("startTime") or 0,
+                "endTime": item.get("endTime") or 0, "duration": item.get("duration"),
+                "transcript": item["snippet"], "snippet": item["snippet"],
+                "relevanceScore": item["relevanceScore"], "uploadDate": item.get("uploadDate"),
+                "matchingFrames": item.get("matchingFrames") or [], "libraryName": item.get("libraryName"),
+            })
+        if not _legacy_exists() or len(video_results) >= limit:
+            return video_results[:limit]
+        raw_results = search_transcripts(query, limit * 2)
+        seen_videos = set()
+        for tr in raw_results:
+            expanded = expand_transcript_segment(tr["id"], tr["score"])
+            if not expanded:
+                continue
+            video_key = f"{expanded['videoId']}-{int((expanded.get('startTime') or 0) // 30)}"
+            if video_key in seen_videos:
+                continue
+            seen_videos.add(video_key)
 
-        video_key = f"{expanded['videoId']}-{int((expanded.get('startTime') or 0) // 30)}"
-        if video_key in seen_videos:
-            continue
-        seen_videos.add(video_key)
+            source = db_get(
+                "SELECT id, original_name, file_type, upload_date, duration_seconds FROM knowledge_sources WHERE id = ?",
+                (expanded["sourceId"],)
+            )
+            frames = db_all(
+                """SELECT id, frame_number, scene_id, timestamp, frame_path FROM video_frames
+                   WHERE video_id = ? AND timestamp BETWEEN ? AND ?
+                   ORDER BY timestamp ASC LIMIT 3""",
+                (expanded["videoId"], max(0.0, (expanded.get("startTime") or 0) - 15), (expanded.get("endTime") or 0) + 15)
+            )
+            video_results.append({
+                "id": tr["id"],
+                "videoId": expanded["videoId"],
+                "sourceId": expanded["sourceId"],
+                "videoTitle": source.get("original_name") if source else "Video",
+                "startTime": expanded.get("startTime") or 0,
+                "endTime": expanded.get("endTime") or 0,
+                "duration": source.get("duration_seconds") if source else None,
+                "transcript": expanded.get("transcriptText") or tr["text"],
+                "snippet": tr["text"],
+                "relevanceScore": tr["score"],
+                "uploadDate": source.get("upload_date") if source else None,
+                "matchingFrames": [
+                    {
+                        "id": f["id"],
+                        "frameNumber": f["frame_number"],
+                        "sceneId": f["scene_id"],
+                        "timestamp": f["timestamp"],
+                        "framePath": f["frame_path"],
+                    }
+                    for f in frames
+                ],
+            })
+            if len(video_results) >= limit:
+                break
+        return video_results
 
-        source = db_get(
-            "SELECT id, original_name, file_type, upload_date, duration_seconds FROM knowledge_sources WHERE id = ?",
-            (expanded["sourceId"],)
-        )
-
-        frames = db_all(
-            """SELECT id, frame_number, scene_id, timestamp, frame_path FROM video_frames
-               WHERE video_id = ? AND timestamp BETWEEN ? AND ?
-               ORDER BY timestamp ASC LIMIT 3""",
-            (expanded["videoId"], max(0.0, (expanded.get("startTime") or 0) - 15), (expanded.get("endTime") or 0) + 15)
-        )
-
-        video_results.append({
-            "id": tr["id"],
-            "videoId": expanded["videoId"],
-            "sourceId": expanded["sourceId"],
-            "videoTitle": source.get("original_name") if source else "Video",
-            "startTime": expanded.get("startTime") or 0,
-            "endTime": expanded.get("endTime") or 0,
-            "duration": source.get("duration_seconds") if source else None,
-            "transcript": expanded.get("transcriptText") or tr["text"],
-            "snippet": tr["text"],
-            "relevanceScore": tr["score"],
-            "uploadDate": source.get("upload_date") if source else None,
-            "matchingFrames": [
-                {
-                    "id": f["id"],
-                    "frameNumber": f["frame_number"],
-                    "sceneId": f["scene_id"],
-                    "timestamp": f["timestamp"],
-                    "framePath": f["frame_path"],
-                }
-                for f in frames
-            ],
-        })
-
-        if len(video_results) >= limit:
-            break
-
+    video_results = await run_in_threadpool(_search)
     return {"query": query, "results": video_results, "total": len(video_results)}
 
 def normalize_url(url: Optional[str]) -> str:
@@ -899,7 +959,7 @@ def normalize_title(title: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]", "", title.lower()).strip()
 
 @router.post("/fetch-more")
-async def fetch_more(req: FetchMoreRequest):
+async def fetch_more(req: FetchMoreRequest, user: Dict[str, Any] = Depends(require_auth)):
     topic = req.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="Topic is required")
@@ -1011,7 +1071,7 @@ async def fetch_more(req: FetchMoreRequest):
     }
 
 @router.post("/synthesize")
-async def synthesize(req: SynthesizeRequest):
+async def synthesize(req: SynthesizeRequest, user: Dict[str, Any] = Depends(require_auth)):
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
@@ -1087,18 +1147,21 @@ Tone: Objective, thorough, analytical, and professional."""
     from app.ai.groq_client import get_async_groq_client
     client = get_async_groq_client()
     try:
-        completion = await client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an advanced AI research analyst specialized in cross-source data synthesis and knowledge extraction."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=850
+        completion = await asyncio.wait_for(
+            client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are an advanced AI research analyst specialized in cross-source data synthesis and knowledge extraction."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=850,
+                timeout=12.0,
+            ),
+            timeout=14.0
         )
         summary = completion.choices[0].message.content or "Unable to generate synthesis."
     except Exception as e:
-        print(f"[Synthesize] Error with {settings.GROQ_MODEL} across Groq keys: {e}")
+        print(f"[Synthesize] LLM error: {e}")
         summary = f"Error generating synthesis: {e}"
 
     import datetime

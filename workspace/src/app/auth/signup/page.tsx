@@ -6,9 +6,10 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { Sparkles, Mail, Lock, User, ArrowRight, Eye, EyeOff, Shield, CheckCircle, Sun, Moon } from 'lucide-react';
-import { useAuthStore } from '@/store/auth';
+import { useAuthStore, type AuthUser } from '@/store/auth';
 import { useUIStore } from '@/store/ui';
 import { toast } from 'sonner';
+import { apiErrorMessage, readJson } from '@/lib/utils/api';
 
 const REQUIREMENTS = [
   { label: 'At least 8 characters', test: (p: string) => p.length >= 8 },
@@ -38,10 +39,10 @@ export default function SignupPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, username, password }),
       });
-      const data = await res.json();
+      const data = await readJson<{ user: AuthUser }>(res);
 
-      if (!res.ok) {
-        toast.error(data.error || 'Signup failed');
+      if (!res.ok || !data) {
+        toast.error(apiErrorMessage(data, 'Signup failed'));
         return;
       }
 

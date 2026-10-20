@@ -1,8 +1,8 @@
 // src/lib/groq/config.ts
 // Centralized Groq model limits, conservative free-tier token budgets, and operational defaults
 
-export const GROQ_MODEL = 'qwen/qwen3.6-27b';
-export const GROQ_FAST_MODEL = 'qwen/qwen3.6-27b';
+export const GROQ_MODEL = 'qwen/qwen3.8-27b';
+export const GROQ_FAST_MODEL = 'qwen/qwen3.8-27b';
 
 // Hard Model Limits for Qwen 3.6 27B on Groq
 export const GROQ_MAX_CONTEXT_TOKENS = 131072; // Hard context window

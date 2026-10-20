@@ -1,0 +1,19 @@
+#!/bin/sh
+# remove: deletes the code checkout, Python/Node environments and service settings.
+# purge:  also deletes config, the index database, uploads, downloaded models and caches.
+# The .smartfind index folders inside your own folders are never touched.
+set -e
+case "$1" in
+    remove|purge)
+        rm -rf /opt/smartfinder \
+               /etc/systemd/system/smartfinder-backend.service.d \
+               /etc/systemd/system/smartfinder-frontend.service.d
+        if [ "$1" = "purge" ]; then
+            rm -rf /etc/smartfinder /var/lib/smartfinder /var/cache/smartfinder /var/log/smartfinder
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+exit 0

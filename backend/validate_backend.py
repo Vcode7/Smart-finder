@@ -4,7 +4,7 @@ Comprehensive automated backend validation script for Smart Find AI.
 
 Checks:
 1. Environment configuration files & database paths
-2. AI/ML model availability and test loading (Qwen3, Jina CLIP, InsightFace, faster-whisper, Tesseract)
+2. AI/ML model availability and test loading (Qwen3, Qwen3-VL, InsightFace, faster-whisper, Tesseract)
 3. Database access and FAISS vector index integrity
 4. Temporary backend startup, live health checks, and complete API endpoint validation
 5. Clean shutdown of the temporary backend process
@@ -108,22 +108,22 @@ def check_models() -> bool:
         log_step("Qwen3-Embedding-0.6B Model", False, str(e))
         all_ok = False
 
-    # 2.2 Jina CLIP v2
+    # 2.2 Qwen3-VL-Embedding-2B
     try:
-        from app.search.model_pipeline import get_multimodal_text_embedding, _get_jina_clip_model
-        model = _get_jina_clip_model()
+        from app.search.model_pipeline import get_multimodal_text_embedding, _get_image_model
+        model = _get_image_model()
         if model is not None:
             vec = get_multimodal_text_embedding("multimodal test query")
             if vec and len(vec) == 1024:
-                log_step("Jina CLIP v2 Multimodal Model", True, f"Loaded & generated {len(vec)}-dim visual-text embedding")
+                log_step("Qwen3-VL-Embedding-2B Multimodal Model", True, f"Loaded & generated {len(vec)}-dim visual-text embedding")
             else:
-                log_step("Jina CLIP v2 Multimodal Model", False, f"Unexpected shape: {len(vec) if vec else None}")
+                log_step("Qwen3-VL-Embedding-2B Multimodal Model", False, f"Unexpected shape: {len(vec) if vec else None}")
                 all_ok = False
         else:
-            log_step("Jina CLIP v2 Multimodal Model", False, "Model returned None")
+            log_step("Qwen3-VL-Embedding-2B Multimodal Model", False, "Model returned None")
             all_ok = False
     except Exception as e:
-        log_step("Jina CLIP v2 Multimodal Model", False, str(e))
+        log_step("Qwen3-VL-Embedding-2B Multimodal Model", False, str(e))
         all_ok = False
 
     # 2.3 InsightFace buffalo_s
@@ -152,7 +152,18 @@ def check_models() -> bool:
         log_step("faster-whisper Medium Model", False, str(e))
         all_ok = False
 
-    # 2.5 Tesseract OCR
+    # 2.5 OCR: PaddleOCR PP-OCRv6, Tesseract for Hindi
+    try:
+        from app.search.model_pipeline import _paddle_ocr
+        if _paddle_ocr.get() is not None:
+            log_step("PaddleOCR PP-OCRv6", True, "Loaded text recognition models successfully")
+        else:
+            log_step("PaddleOCR PP-OCRv6", False, "Could not load PP-OCRv6 (Tesseract will be used instead)")
+            all_ok = False
+    except Exception as e:
+        log_step("PaddleOCR PP-OCRv6", False, str(e))
+        all_ok = False
+
     tesseract_found = False
     tesseract_candidates = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -161,15 +172,15 @@ def check_models() -> bool:
     for cand in tesseract_candidates:
         if os.path.isfile(cand):
             tesseract_found = True
-            log_step("Tesseract OCR binary", True, cand)
+            log_step("Tesseract OCR binary (Hindi OCR)", True, cand)
             break
     if not tesseract_found:
         import shutil
         path_tess = shutil.which("tesseract")
         if path_tess:
-            log_step("Tesseract OCR binary", True, f"Found in PATH: {path_tess}")
+            log_step("Tesseract OCR binary (Hindi OCR)", True, f"Found in PATH: {path_tess}")
         else:
-            log_step("Tesseract OCR binary", False, "Tesseract binary not found in standard paths")
+            log_step("Tesseract OCR binary (Hindi OCR)", False, "Not found: text in Hindi images will not be read")
 
     # 2.6 Frontend Xenova Model Cache
     xenova_cache = REPO_ROOT / "workspace" / "data" / ".cache" / "Xenova"
@@ -227,11 +238,15 @@ def validate_api_endpoints_live() -> bool:
         print(f"[Backend] Launching temporary backend instance on port {target_port}...")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Server output goes to a log file: an unread PIPE fills up and freezes the server.
+        import tempfile
+        server_log_path = Path(tempfile.gettempdir()) / f"smartfind_validate_{target_port}.log"
+        server_log = open(server_log_path, "w", encoding="utf-8", errors="replace")
         server_proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(target_port)],
             cwd=str(BACKEND_DIR),
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=server_log,
             stderr=subprocess.STDOUT,
             text=True,
         )
@@ -242,8 +257,9 @@ def validate_api_endpoints_live() -> bool:
         t0 = time.time()
         while time.time() - t0 < 35.0:
             if server_proc.poll() is not None:
-                out, _ = server_proc.communicate()
-                print(f"[Backend] Failed to start. Output:\n{out}")
+                server_log.flush()
+                out = server_log_path.read_text(encoding="utf-8", errors="replace")
+                print(f"[Backend] Failed to start. Output:\n{out[-4000:]}")
                 log_step("Temporary Backend Startup", False, "Process exited prematurely")
                 return False
             try:
@@ -438,12 +454,17 @@ def validate_api_endpoints_live() -> bool:
             log_step("POST /api/knowledge/upload", False, str(e))
             all_ok = False
 
-        # Clean up test upload
+        # Clean up test upload (the client holds the admin session cookie from 4.4).
+        # If it fails anyway, startup purge_probe_documents() removes the probe.
         if uploaded_source_id:
             try:
-                client.delete(f"{base_url}/api/knowledge/{uploaded_source_id}")
-            except Exception:
-                pass
+                del_r = client.delete(f"{base_url}/api/knowledge/{uploaded_source_id}")
+                if del_r.status_code not in (200, 204):
+                    print(f"[Validation] Warning: probe cleanup returned {del_r.status_code} — "
+                          f"server startup will purge it on next restart.")
+            except Exception as e:
+                print(f"[Validation] Warning: probe cleanup failed ({e}) — "
+                      f"server startup will purge it on next restart.")
 
     # 4.12 Clean Shutdown
     if we_started_server and server_proc:

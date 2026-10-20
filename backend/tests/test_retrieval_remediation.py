@@ -105,16 +105,12 @@ def test_p1_atomic_save_to_disk(tmp_path):
 
 
 def test_p1_bm25_normalized_rank():
-    """Verify FTS5 BM25 score normalization produces distinct values by rank (Issue #5)."""
-    # Formula: score = round(1.0 / (1.0 + abs(float(rank))), 4)
-    rank_best = -0.5   # better match
-    rank_worst = -10.0 # worse match
-    score_best = round(1.0 / (1.0 + abs(rank_best)), 4)
-    score_worst = round(1.0 / (1.0 + abs(rank_worst)), 4)
-
-    assert score_best > score_worst
-    assert 0.0 < score_best <= 1.0
-    assert 0.0 < score_worst <= 1.0
+    """FTS5 rank → score is monotonic in BM25 strength and stays inside (0, 1) (Issue #5)."""
+    from app.search.keyword_search import _rank_to_score
+    strong, weak = _rank_to_score(-10.0), _rank_to_score(-0.5)
+    assert strong > weak
+    assert 0.0 < weak < strong < 1.0
+    assert _rank_to_score(-1.0) == pytest.approx(0.41, abs=0.01)
 
 
 # ─── PHASE 2 TESTS ────────────────────────────────────────────────────────────
@@ -137,102 +133,93 @@ def test_p2_shared_constants_and_helpers():
     assert preview == "This is the content."
 
 
-def test_p2_composite_score_no_synergy_and_face_isolation():
+def _signal(**overrides):
+    base = {
+        "text_vec_scores": [], "image_vec_scores": [], "face_vec_scores": [], "fts_scores": [],
+        "title_score": 0.0, "phash_scores": [], "snippets": ["Test snippet text"], "timestamps": [],
+        "frames": [], "is_face_query": False, "is_face_match": False, "is_exact_image_match": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def _resolve_one(sig, file_type="pdf"):
+    with patch("app.search.multimodal_retrieval.db_all") as mock_db_all:
+        mock_db_all.return_value = [
+            {"id": "src_1", "original_name": "report." + file_type, "file_type": file_type, "file_size": 1024}
+        ]
+        res = resolve_parent_files({"src_1": sig})
+    return next(item for bucket in res.values() for item in bucket)
+
+
+def test_p2_composite_score_face_isolation():
     """
-    Verify composite score formula:
-    - No synergy term (never exceeds 0.99 for perfect scores, sums 0.70 + 0.30)
-    - Face vector score only counts if is_face_query is True (Issue #9).
+    Face similarity only counts when the query itself carries a face, and only an
+    actual face query above FACE_MATCH_THRESHOLD is reported as a match (Issue #9/#22).
     """
-    # Case 1: Pure text/image query with high face similarity should NOT use face similarity
-    signals_non_face = {
-        "src_1": {
-            "source_id": "src_1",
-            "text_vec_scores": [0.8],
-            "image_vec_scores": [],
-            "face_vec_scores": [0.95], # Irrelevant face match from background
-            "fts_scores": [0.8],
-            "title_score": 0.0,
-            "phash_scores": [],
-            "snippets": ["Test snippet"],
-            "timestamps": [],
-            "frames": [],
-            "is_face_query": False, # NOT a face query!
-            "is_face_match": False,
-            "is_exact_image_match": False,
-        }
-    }
-    with patch("app.search.multimodal_retrieval.db_all") as mock_db_all:
-        mock_db_all.return_value = [
-            {"id": "src_1", "original_name": "report.pdf", "file_type": "pdf", "file_size": 1024, "face_count": 0}
-        ]
-        res = resolve_parent_files(signals_non_face)
-        doc = res["documents"][0]
-        # vector_score should be 0.8 (from text_vec_scores), NOT 0.95 (from face_vec_scores)
-        # score = 0.70 * 0.8 + 0.30 * 0.8 = 0.80
-        assert doc["relevanceScore"] == pytest.approx(0.80, abs=0.01)
+    # Case 1: text query; a background face similarity must be ignored
+    doc = _resolve_one(_signal(text_vec_scores=[0.8], fts_scores=[0.8], face_vec_scores=[0.95]))
+    assert doc["relevanceScore"] == pytest.approx(0.816, abs=0.005)
+    assert doc["isFaceMatch"] is False
 
-    # Case 2: Query WITH face intent (is_face_query=True) but below exact face recognition threshold (is_face_match=False)
-    # SHOULD blend face vector into vector_score: 0.70 * 0.95 + 0.30 * 0.50 = 0.815
-    signals_face = {
-        "src_1": {
-            "source_id": "src_1",
-            "text_vec_scores": [0.5],
-            "image_vec_scores": [],
-            "face_vec_scores": [0.95],
-            "fts_scores": [0.5],
-            "title_score": 0.0,
-            "phash_scores": [],
-            "snippets": ["Test snippet"],
-            "timestamps": [],
-            "frames": [],
-            "is_face_query": True, # IS a face query!
-            "is_face_match": False,
-            "is_exact_image_match": False,
-        }
-    }
-    with patch("app.search.multimodal_retrieval.db_all") as mock_db_all:
-        mock_db_all.return_value = [
-            {"id": "src_1", "original_name": "report.pdf", "file_type": "pdf", "file_size": 1024, "face_count": 1}
-        ]
-        res_face = resolve_parent_files(signals_face)
-        doc_face = res_face["documents"][0]
-        assert doc_face["relevanceScore"] == pytest.approx(0.815, abs=0.01)
+    # Case 2: face query below match confirmation — face score blends in, no match flag
+    doc = _resolve_one(_signal(text_vec_scores=[0.5], fts_scores=[0.5], face_vec_scores=[0.95], is_face_query=True))
+    assert doc["relevanceScore"] == pytest.approx(0.9525, abs=0.005)
+    assert doc["isFaceMatch"] is False
 
-    # Case 3: Recognized face match (is_face_match=True) gives direct face similarity
-    signals_recognized = {
-        "src_1": {
-            "source_id": "src_1",
-            "text_vec_scores": [0.5],
-            "image_vec_scores": [],
-            "face_vec_scores": [0.95],
-            "fts_scores": [0.5],
-            "title_score": 0.0,
-            "phash_scores": [],
-            "snippets": ["Test snippet"],
-            "timestamps": [],
-            "frames": [],
-            "is_face_query": True,
-            "is_face_match": True,
-            "is_exact_image_match": False,
-        }
-    }
-    with patch("app.search.multimodal_retrieval.db_all") as mock_db_all:
-        mock_db_all.return_value = [
-            {"id": "src_1", "original_name": "report.pdf", "file_type": "pdf", "file_size": 1024, "face_count": 1}
-        ]
-        res_rec = resolve_parent_files(signals_recognized)
-        doc_rec = res_rec["documents"][0]
-        assert doc_rec["relevanceScore"] == 0.95
+    # Case 3: confirmed face match — calibrated face similarity decides
+    doc = _resolve_one(_signal(text_vec_scores=[0.5], fts_scores=[0.5], face_vec_scores=[0.95],
+                               is_face_query=True, is_face_match=True))
+    assert doc["relevanceScore"] == 0.98
+    assert doc["isFaceMatch"] is True
+
+    # Case 4: a match flag without a face query is not a face match
+    doc = _resolve_one(_signal(text_vec_scores=[0.5], face_vec_scores=[0.95], is_face_match=True))
+    assert doc["isFaceMatch"] is False
 
 
-def test_p2_phash_prefix_computation():
-    """Verify pHash prefix stores the integer value of the top 16 bits (Issue #12)."""
-    from app.search.perceptual_hash import compute_image_hashes
-    # 16-hex char hash e.g. "a1b2c3d4e5f67890" -> top 4 hex chars "a1b2" -> 0xa1b2 = 41394
-    phash_hex = "a1b2c3d4e5f67890"
-    prefix = int(phash_hex[:4], 16)
-    assert prefix == 0xa1b2
-    assert isinstance(prefix, int)
+def test_p2_best_snippet_and_timestamp_win():
+    """The snippet and jump time come from the strongest evidence, not the first found."""
+    video = _resolve_one(_signal(
+        text_vec_scores=[0.7],
+        snippets=[(0.3, "weak early snippet text here"), (0.9, "strong matching snippet text")],
+        timestamps=[(0.2, 5.0), (0.95, 120.0)],
+    ), file_type="mp4")
+    assert video["snippet"] == "strong matching snippet text"
+    assert video["startTime"] == 120.0
+
+
+def test_p2_title_score_whole_words():
+    """Title matching works on whole words: 'ai' must not match 'chairman' (Issue: 0.95 substring score)."""
+    assert compute_title_score("ai", "SSC Chairman Gopal Krishna.mp4") == 0.0
+    assert compute_title_score("gopal krishna", "SSC Chairman Gopal Krishna.mp4") >= 0.70
+    assert compute_title_score("annual report", "annual_report.pdf") == 0.95
+
+
+def test_p2_unicode_query_tokens():
+    """Hindi queries produce real tokens (previously only [a-z0-9] survived)."""
+    tokens = extract_query_tokens("परीक्षा परिणाम 2024")
+    assert tokens == ["परीक्षा", "परिणाम", "2024"]
+
+
+def test_p2_phash_near_duplicate_found_when_high_bits_differ(tmp_db):
+    """
+    Regression: the numeric prefix-bucket pre-filter dropped near-duplicates whose
+    differing bits were in the top 16 bits (adjacent buckets are not Hamming neighbours).
+    """
+    from app.database.session import db_run
+    from app.search.perceptual_hash import store_image_hash, search_image_hashes
+    db_run(
+        "INSERT INTO users (id, email, username, password_hash, role) VALUES ('u1', 'u@x', 'u', 'x', 'user')"
+    )
+    db_run(
+        "INSERT INTO knowledge_sources (id, filename, original_name, file_type, file_path, file_size, uploaded_by) "
+        "VALUES ('src_img', 'a.png', 'a.png', 'png', '/tmp/a.png', 1, 'u1')"
+    )
+    store_image_hash("src_img", "ent1", "/tmp/a.png", "8000000000000000", "8000000000000000", "image")
+    matches = search_image_hashes("0000000000000000", "0000000000000000", max_hamming_distance=8)
+    assert [m["source_id"] for m in matches] == ["src_img"]
+    assert matches[0]["p_dist"] == 1
 
 
 # ─── PHASE 3 TESTS ────────────────────────────────────────────────────────────

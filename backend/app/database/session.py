@@ -61,6 +61,38 @@ def run_migrations() -> None:
                 if "fts5" not in msg and "duplicate column" not in msg:
                     print(f"[DB] Notice on migration: {msg}")
         conn.commit()
+        _migrate_chat_context_types(conn)
+
+
+def _migrate_chat_context_types(conn: sqlite3.Connection) -> None:
+    """Rebuild chat_context when its CHECK constraint predates the 'audio' context type."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chat_context'"
+    ).fetchone()
+    if not row or "'audio'" in (row.get("sql") or ""):
+        return
+    print("[DB] Migrating chat_context to accept the 'audio' context type...")
+    conn.executescript("""
+        BEGIN;
+        CREATE TABLE chat_context_new (
+            id              TEXT PRIMARY KEY,
+            chat_id         TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            context_type    TEXT NOT NULL CHECK(context_type IN ('document','video','image','audio','web')),
+            context_ref_id  TEXT NOT NULL,
+            relevance_score REAL DEFAULT 0.0,
+            snippet         TEXT,
+            metadata_json   TEXT DEFAULT '{}',
+            added_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO chat_context_new
+            (id, chat_id, context_type, context_ref_id, relevance_score, snippet, metadata_json, added_at)
+            SELECT id, chat_id, context_type, context_ref_id, relevance_score, snippet, metadata_json, added_at
+            FROM chat_context;
+        DROP TABLE chat_context;
+        ALTER TABLE chat_context_new RENAME TO chat_context;
+        CREATE INDEX IF NOT EXISTS idx_context_chat ON chat_context(chat_id);
+        COMMIT;
+    """)
 
 
 def get_app_setting(key: str, default: Optional[str] = None) -> Optional[str]:

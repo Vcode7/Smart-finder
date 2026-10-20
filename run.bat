@@ -51,10 +51,15 @@ if not exist "%PROJECT_ROOT%backend\.env" (
     exit /b 1
 )
 
+REM Usage: run.bat          development mode (hot reload)
+REM        run.bat prod     production build (much faster over the network)
+set "RUN_MODE=dev"
+if /i "%~1"=="prod" set "RUN_MODE=prod"
+
 REM ------------------------------------------------------------------------------
-REM Start Backend Server
+REM Start Backend Server (loopback only: reachable through the frontend proxy)
 REM ------------------------------------------------------------------------------
-echo [1/3] Starting Smart Find AI Python Backend (Port 8000)...
+echo [1/3] Starting Smart Find AI Python Backend (127.0.0.1:8000)...
 start "Smart Find AI — Backend (Port 8000)" cmd /k "cd /d "%PROJECT_ROOT%backend" && call "%VENV_ACTIVATE%" && python run.py"
 
 REM ------------------------------------------------------------------------------
@@ -93,8 +98,12 @@ echo.
 REM ------------------------------------------------------------------------------
 REM Start Frontend Dev Server
 REM ------------------------------------------------------------------------------
-echo [3/3] Starting Smart Find AI Next.js Frontend (Port 3000)...
-start "Smart Find AI — Frontend (Port 3000)" cmd /k "cd /d "%PROJECT_ROOT%workspace" && npm run dev"
+echo [3/3] Starting Smart Find AI Next.js Frontend (Port 3000, all network interfaces, %RUN_MODE% mode)...
+if /i "%RUN_MODE%"=="prod" (
+    start "Smart Find AI — Frontend (Port 3000)" cmd /k "cd /d "%PROJECT_ROOT%workspace" && npm run build && npm run start -- -H 0.0.0.0 -p 3000"
+) else (
+    start "Smart Find AI — Frontend (Port 3000)" cmd /k "cd /d "%PROJECT_ROOT%workspace" && npm run dev -- -H 0.0.0.0 -p 3000"
+)
 
 REM Brief pause for Next.js to bind port
 timeout /t 2 /nobreak >nul
@@ -108,9 +117,9 @@ echo                 SMART FIND AI — SERVICES STARTED
 echo ==============================================================================
 echo.
 echo   Web Application:    http://localhost:3000
-echo   Backend API:        http://localhost:8000
-echo   API Documentation:  http://localhost:8000/docs
-echo   Health Check:       http://localhost:8000/health
+for /f "usebackq tokens=*" %%a in (`powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }).IPAddress"`) do echo   On your network:    http://%%a:3000
+echo   Backend API:        http://127.0.0.1:8000  (this computer only)
+echo   API Documentation:  http://127.0.0.1:8000/docs
 echo.
 echo ==============================================================================
 echo Both services are running in their dedicated terminal windows.

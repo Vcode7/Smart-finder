@@ -2,9 +2,9 @@
 // src/components/ai/KeyEventsViewer.tsx
 // Structured Key Events with significance badges and source citations
 
-import { Flag, ExternalLink, Sparkles, CheckCircle2 } from 'lucide-react';
+import { Flag, ExternalLink } from 'lucide-react';
 
-interface KeyEventItem {
+export interface KeyEventItem {
   id: string;
   title: string;
   description: string;

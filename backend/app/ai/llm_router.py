@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import asyncio
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Generator, AsyncGenerator
 import httpx
@@ -232,49 +233,62 @@ class LLMRouter:
         """
         ready, provider, model = self.is_ollama_ready()
         is_streaming = kwargs.get("stream", False)
+        caller_timeout = kwargs.pop("timeout", None)
+        timeout = float(caller_timeout if caller_timeout is not None else settings.OLLAMA_TIMEOUT)
+        if caller_timeout is not None:
+            kwargs["timeout"] = float(caller_timeout)  # honoured by the Groq fallback
 
         if ready:
             endpoint = self.get_endpoint()
             try:
                 # Prepare payload for Ollama
                 ollama_payload = self._build_ollama_payload(kwargs, model)
-                timeout = float(settings.OLLAMA_TIMEOUT)
 
                 if is_streaming:
-                    return self._stream_ollama(endpoint, ollama_payload, model, kwargs)
+                    return self._stream_ollama(endpoint, ollama_payload, model, kwargs, timeout)
                 else:
                     return self._call_ollama_sync(endpoint, ollama_payload, model, timeout)
             except Exception as e:
-                print(
-                    f"[LLMRouter] ⚠️ Ollama execution error ({type(e).__name__}: {e}) → "
-                    f"Falling back to Groq ({settings.GROQ_MODEL})...",
-                    flush=True
-                )
+                try:
+                    print(
+                        f"[LLMRouter] [WARN] Ollama execution error ({type(e).__name__}: {e}) -> "
+                        f"Falling back to Groq ({settings.GROQ_MODEL})...",
+                        flush=True
+                    )
+                except Exception:
+                    pass
 
         # Fallback to Groq
         return self._call_groq_sync(kwargs)
 
     async def execute_async_chat_completion(self, **kwargs) -> Any:
         """Async equivalent for FastAPI async route handlers."""
-        ready, provider, model = self.is_ollama_ready()
+        # The readiness probe is a blocking HTTP call (up to 3 s): keep it off the event loop
+        ready, provider, model = await asyncio.to_thread(self.is_ollama_ready)
         is_streaming = kwargs.get("stream", False)
+        caller_timeout = kwargs.pop("timeout", None)
+        timeout = float(caller_timeout if caller_timeout is not None else settings.OLLAMA_TIMEOUT)
+        if caller_timeout is not None:
+            kwargs["timeout"] = float(caller_timeout)  # honoured by the Groq fallback
 
         if ready:
             endpoint = self.get_endpoint()
             try:
                 ollama_payload = self._build_ollama_payload(kwargs, model)
-                timeout = float(settings.OLLAMA_TIMEOUT)
 
                 if is_streaming:
-                    return self._stream_ollama_async(endpoint, ollama_payload, model, kwargs)
+                    return self._stream_ollama_async(endpoint, ollama_payload, model, kwargs, timeout)
                 else:
                     return await self._call_ollama_async(endpoint, ollama_payload, model, timeout)
             except Exception as e:
-                print(
-                    f"[LLMRouter] ⚠️ Ollama async call error ({type(e).__name__}: {e}) → "
-                    f"Falling back to Groq ({settings.GROQ_MODEL})...",
-                    flush=True
-                )
+                try:
+                    print(
+                        f"[LLMRouter] [WARN] Ollama async call error ({type(e).__name__}: {e}) -> "
+                        f"Falling back to Groq ({settings.GROQ_MODEL})...",
+                        flush=True
+                    )
+                except Exception:
+                    pass
 
         # Fallback to Groq
         return await self._call_groq_async(kwargs)
@@ -364,11 +378,12 @@ class LLMRouter:
             return ChatCompletionWrapper(content=content, model=model, provider="ollama")
 
     def _stream_ollama(
-        self, endpoint: str, payload: Dict[str, Any], model: str, original_kwargs: Dict[str, Any]
+        self, endpoint: str, payload: Dict[str, Any], model: str, original_kwargs: Dict[str, Any], timeout: Optional[float] = None
     ) -> Generator[ChatCompletionChunkWrapper, None, None]:
         url = f"{endpoint}/v1/chat/completions"
+        effective_timeout = timeout if timeout is not None else float(settings.OLLAMA_TIMEOUT)
         try:
-            with httpx.Client(timeout=settings.OLLAMA_TIMEOUT) as client:
+            with httpx.Client(timeout=effective_timeout) as client:
                 with client.stream("POST", url, json=payload) as response:
                     if response.status_code != 200:
                         raise RuntimeError(f"Ollama stream error: HTTP {response.status_code}")
@@ -391,11 +406,12 @@ class LLMRouter:
             yield from self._stream_groq(original_kwargs)
 
     async def _stream_ollama_async(
-        self, endpoint: str, payload: Dict[str, Any], model: str, original_kwargs: Dict[str, Any]
+        self, endpoint: str, payload: Dict[str, Any], model: str, original_kwargs: Dict[str, Any], timeout: Optional[float] = None
     ) -> AsyncGenerator[ChatCompletionChunkWrapper, None]:
         url = f"{endpoint}/v1/chat/completions"
+        effective_timeout = timeout if timeout is not None else float(settings.OLLAMA_TIMEOUT)
         try:
-            async with httpx.AsyncClient(timeout=settings.OLLAMA_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=effective_timeout) as client:
                 async with client.stream("POST", url, json=payload) as response:
                     if response.status_code != 200:
                         raise RuntimeError(f"Ollama async stream error: HTTP {response.status_code}")
@@ -415,9 +431,10 @@ class LLMRouter:
                                 pass
         except Exception as e:
             print(f"[LLMRouter] Async stream error from Ollama ({e}), falling back to Groq...", flush=True)
-            # Fallback to sync generator wrapped or Groq call
-            groq_stream = self._stream_groq(original_kwargs)
-            for chunk in groq_stream:
+            fallback_kwargs = dict(original_kwargs)
+            fallback_kwargs["stream"] = True
+            groq_stream = await self._call_groq_async(fallback_kwargs)
+            async for chunk in groq_stream:
                 yield chunk
 
     # ─── Internal Groq Fallback Helpers ──────────────────────────────────────
@@ -453,12 +470,15 @@ class LLMRouter:
         return await km.execute_async_with_fallback(_fn)
 
     def _stream_groq(self, kwargs: Dict[str, Any]):
-        from app.ai.groq_client import get_groq_client
-        client = get_groq_client()
+        # Call Groq directly through the key manager. Going through get_groq_client()
+        # would re-enter this router and could retry the Ollama stream that just failed.
+        from app.ai.groq_client import get_groq_key_manager
         call_kwargs = dict(kwargs)
         call_kwargs["model"] = settings.GROQ_MODEL
         call_kwargs["stream"] = True
-        return client.chat.completions.create(**call_kwargs)
+        return get_groq_key_manager().execute_with_fallback(
+            lambda client: client.chat.completions.create(**call_kwargs)
+        )
 
     @staticmethod
     def _strip_think_tags(text: str) -> str:

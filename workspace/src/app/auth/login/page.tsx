@@ -1,14 +1,15 @@
 'use client';
 // src/app/auth/login/page.tsx — Premium animated login page
 
-import { useState, FormEvent } from 'react';
+import { useState, useEffect, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { Sparkles, Mail, Lock, ArrowRight, Eye, EyeOff, Zap, Shield, Sun, Moon } from 'lucide-react';
-import { useAuthStore } from '@/store/auth';
+import { useAuthStore, type AuthUser } from '@/store/auth';
 import { useUIStore } from '@/store/ui';
 import { toast } from 'sonner';
+import { apiErrorMessage, readJson } from '@/lib/utils/api';
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
@@ -18,6 +19,14 @@ export default function LoginPage() {
   const { setUser } = useAuthStore();
   const { theme, setTheme } = useUIStore();
   const router = useRouter();
+  const [allowSignup, setAllowSignup] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/auth/config')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((cfg) => setAllowSignup(Boolean(cfg?.allowSignup)))
+      .catch(() => setAllowSignup(false));
+  }, []);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -30,10 +39,10 @@ export default function LoginPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      const data = await res.json();
+      const data = await readJson<{ user: AuthUser }>(res);
 
-      if (!res.ok) {
-        toast.error(data.error || 'Login failed');
+      if (!res.ok || !data) {
+        toast.error(apiErrorMessage(data, 'Login failed'));
         return;
       }
 
@@ -210,35 +219,17 @@ export default function LoginPage() {
             </motion.button>
           </form>
 
-          {/* Quick Admin fill */}
-          {/* <div className="mt-4 p-3 rounded-2xl flex items-center justify-between gap-2 text-xs"
-            style={{ background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.15)' }}>
-            <div>
-              <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>Admin Demo Account</p>
-              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>admin@smartfind.ai</p>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setEmail('admin@smartfind.ai');
-                setPassword('Admin@123456');
-              }}
-              className="px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-all hover:scale-105"
-              style={{ background: 'var(--accent)', color: '#fff' }}
-            >
-              Fill Credentials
-            </button>
-          </div> */}
-
-          {/* Sign up link */}
-          <p className="text-center text-sm mt-4" style={{ color: 'var(--text-secondary)' }}>
-            Don&apos;t have an account?{' '}
-            <Link href="/auth/signup"
-              className="font-semibold transition-colors hover:underline"
-              style={{ color: 'var(--accent)' }}>
-              Create one free
-            </Link>
-          </p>
+          {/* Sign up link (only when the server allows self-registration) */}
+          {allowSignup && (
+            <p className="text-center text-sm mt-4" style={{ color: 'var(--text-secondary)' }}>
+              Don&apos;t have an account?{' '}
+              <Link href="/auth/signup"
+                className="font-semibold transition-colors hover:underline"
+                style={{ color: 'var(--accent)' }}>
+                Create one free
+              </Link>
+            </p>
+          )}
         </div>
 
         {/* Security note */}

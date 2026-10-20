@@ -1,40 +1,80 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.8.0
-pydantic-settings>=2.4.0
-python-multipart>=0.0.9
-PyJWT>=2.8.0
-bcrypt>=4.2.0
-groq>=0.9.0
-httpx>=0.27.0
-numpy>=1.26.0
-pillow>=10.4.0
-pypdf>=4.3.0
-python-docx>=1.1.2
-openpyxl>=3.1.5
-beautifulsoup4>=4.12.3
-sentence-transformers>=3.0.0
+# Smart-Finder backend — versions pinned to the tested environment.
+# torch is the CUDA 12.4 build:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-# Vector search
-faiss-cpu>=1.7.4
+# API
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.30.1
+pydantic==2.13.4
+pydantic-settings==2.15.0
+email-validator==2.1.0.post1
+python-multipart==0.0.32
+PyJWT==2.10.1
+bcrypt==5.0.0
+httpx==0.28.1
 
-# ML / embedding models
-torch>=2.1.0
-transformers>=4.40.0
-huggingface-hub>=0.23.0
+# LLM providers
+groq==1.7.0
 
-# Image processing & OCR
-pymupdf>=1.24.0
-pytesseract>=0.3.10
-imagehash>=4.3.1
-opencv-python-headless>=4.9.0
+# Document parsing
+pymupdf==1.28.2
+pypdf==5.5.0
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+xlrd==2.0.2
+beautifulsoup4==4.15.0
 
-# Face detection & embeddings
-insightface>=0.7.3
-onnxruntime>=1.17.0
+# Images / OCR
+pillow==12.3.0
+pillow-heif==1.8.1
+pytesseract==0.3.13
+ImageHash==4.3.2
+opencv-python-headless==4.11.0.86
+# PaddleOCR PP-OCRv6 runs on onnxruntime-gpu (below), without the Paddle framework.
+# paddleocr==3.7.0 and paddlex==3.7.2 are installed by setup.bat with --no-deps: paddlex
+# declares numpy<2.4 and opencv-contrib-python, which would downgrade numpy and add a
+# second cv2. These are the dependencies they really use:
+aiohttp==3.11.12
+aistudio-sdk==0.3.9
+chardet==7.4.3
+colorlog==6.12.0
+imagesize==2.0.0
+pandas==2.2.2
+prettytable==3.18.0
+py-cpuinfo==9.0.0
+pyclipper==1.4.0
+pypdfium2==5.12.1
+python-bidi==0.6.11
+PyYAML==6.0.2
+ruamel.yaml==0.18.6
+shapely==2.1.2
+ujson==5.12.0
 
-# Audio transcription
-faster-whisper>=1.0.0
+# ML / embeddings / vector search
+numpy==2.5.4
+torch==2.6.0
+transformers==4.57.6
+tokenizers==0.22.2
+sentence-transformers==3.0.1
+faiss-cpu==1.11.0
+regex==2026.7.19
 
-# Misc
-python-multipart>=0.0.9
+# Faces (GPU via onnxruntime-gpu; do not also install the CPU-only "onnxruntime" package)
+insightface==1.0.1
+onnxruntime-gpu==1.22.0
+scikit-learn==1.9.0
+
+# Audio / video
+faster-whisper==1.2.1
+av==16.1.0
+librosa==0.11.0
+soundfile==0.13.1
+
+# Folder watching
+watchdog==6.0.0
+
+# Tests
+pytest==8.2.2
+pytest-asyncio==1.2.0

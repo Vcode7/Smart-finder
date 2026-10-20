@@ -3,8 +3,14 @@
 
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'smart-find-dev-secret-change-in-production';
+// Must equal JWT_SECRET in backend/.env: the backend signs the session cookie and this
+// proxy verifies it. There is deliberately no fallback secret.
+const JWT_SECRET = process.env.JWT_SECRET || '';
 const JWT_EXPIRES_IN = '7d';
+
+if (!JWT_SECRET) {
+  console.error('[auth] JWT_SECRET is not set in workspace/.env — every session will be rejected. Copy the value from backend/.env.');
+}
 
 export interface JWTPayload {
   userId: string;
@@ -20,8 +26,9 @@ export function signToken(payload: Omit<JWTPayload, 'iat' | 'exp'>): string {
 }
 
 export function verifyToken(token: string): JWTPayload | null {
+  if (!JWT_SECRET) return null;
   try {
-    return jwt.verify(token, JWT_SECRET) as JWTPayload;
+    return jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as JWTPayload;
   } catch {
     return null;
   }

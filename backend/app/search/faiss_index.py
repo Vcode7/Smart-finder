@@ -13,7 +13,7 @@ from app.core.config import settings
 
 # Default dimensions
 TEXT_DIM = 1024      # Qwen3-Embedding-0.6B
-IMAGE_DIM = 1024     # Jina CLIP v2
+IMAGE_DIM = 1024     # Qwen3-VL-Embedding-2B (Matryoshka-truncated)
 FACE_DIM = 512       # InsightFace ArcFace
 
 class FAISSVectorManager:
@@ -259,10 +259,12 @@ class FAISSVectorManager:
         then reconstructs the FAISS indexes cleanly.
         """
         with self._lock:
+            changed = False
             # 1. Text Index
             if self.text_index.ntotal > 0:
                 keep_text_idx = [i for i, m in enumerate(self.text_meta) if m["source_id"] != source_id]
                 if len(keep_text_idx) < len(self.text_meta):
+                    changed = True
                     new_text_index = faiss.IndexFlatIP(TEXT_DIM)
                     new_text_meta = []
                     for i in keep_text_idx:
@@ -281,6 +283,7 @@ class FAISSVectorManager:
             if self.image_index.ntotal > 0:
                 keep_img_idx = [i for i, m in enumerate(self.image_meta) if m["source_id"] != source_id]
                 if len(keep_img_idx) < len(self.image_meta):
+                    changed = True
                     new_image_index = faiss.IndexFlatIP(IMAGE_DIM)
                     new_image_meta = []
                     for i in keep_img_idx:
@@ -298,6 +301,7 @@ class FAISSVectorManager:
             if self.face_index.ntotal > 0:
                 keep_face_idx = [i for i, m in enumerate(self.face_meta) if m["source_id"] != source_id]
                 if len(keep_face_idx) < len(self.face_meta):
+                    changed = True
                     new_face_index = faiss.IndexFlatIP(FACE_DIM)
                     new_face_meta = []
                     for i in keep_face_idx:
@@ -311,7 +315,8 @@ class FAISSVectorManager:
                     self.face_index = new_face_index
                     self.face_meta = new_face_meta
 
-            self.save_to_disk()
+            if changed:
+                self.save_to_disk()
 
     def clear_all(self) -> None:
         """
@@ -382,6 +387,16 @@ class FAISSVectorManager:
                     self.text_meta = meta_data.get("text", [])
                     self.image_meta = meta_data.get("image", [])
                     self.face_meta = meta_data.get("face", [])
+                    # Vector ids are list positions: a count mismatch means every result past
+                    # the divergence would map to the wrong file. Refuse to serve garbage.
+                    for name, index, meta in (("text", self.text_index, self.text_meta),
+                                              ("image", self.image_index, self.image_meta),
+                                              ("face", self.face_index, self.face_meta)):
+                        if index.ntotal != len(meta):
+                            raise ValueError(
+                                f"{name} index has {index.ntotal} vectors but {len(meta)} metadata entries; "
+                                f"run reindex to rebuild"
+                            )
                     print(f"[FAISS] Loaded indexes from disk: text={self.text_index.ntotal}, image={self.image_index.ntotal}, face={self.face_index.ntotal}")
                 except Exception as e:
                     print(f"[FAISS] Could not load saved index, initializing empty: {e}")
@@ -403,6 +418,7 @@ class FAISSVectorManager:
 
 # Global singleton
 _manager_instance: Optional[FAISSVectorManager] = None
+_manager_lock = threading.Lock()
 
 def get_faiss_manager(storage_dir: Optional[Path] = None) -> FAISSVectorManager:
     """
@@ -411,9 +427,12 @@ def get_faiss_manager(storage_dir: Optional[Path] = None) -> FAISSVectorManager:
     (useful in tests for isolation — combine with reset_faiss_manager()).
     """
     global _manager_instance
-    if _manager_instance is None or storage_dir is not None:
-        _manager_instance = FAISSVectorManager(storage_dir=storage_dir)
-    return _manager_instance
+    if _manager_instance is not None and storage_dir is None:
+        return _manager_instance
+    with _manager_lock:
+        if _manager_instance is None or storage_dir is not None:
+            _manager_instance = FAISSVectorManager(storage_dir=storage_dir)
+        return _manager_instance
 
 def reset_faiss_manager() -> None:
     """

@@ -5,8 +5,8 @@
 import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as d3 from 'd3';
-import { Share2, ZoomIn, ZoomOut, RotateCcw, X, ExternalLink, Info, Layers, Tag } from 'lucide-react';
-import type { KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge } from '@/types/research';
+import { Share2, RotateCcw, X, ExternalLink } from 'lucide-react';
+import type { KnowledgeGraph, KnowledgeGraphNode } from '@/types/research';
 
 interface Props {
   graph: KnowledgeGraph;
@@ -21,6 +21,9 @@ interface SimNode extends KnowledgeGraphNode {
   fy?: number | null;
 }
 
+/** Once the simulation starts, d3's link force has replaced edge endpoint ids with their nodes. */
+const linked = (end: unknown) => end as SimNode;
+
 const ENTITY_CONFIG: Record<string, { label: string; color: string; bg: string; border: string }> = {
   person: { label: 'People', color: '#06b6d4', bg: 'rgba(6, 182, 212, 0.15)', border: '#06b6d4' },
   organization: { label: 'Organizations', color: '#6366f1', bg: 'rgba(99, 102, 241, 0.15)', border: '#6366f1' },
@@ -31,10 +34,9 @@ const ENTITY_CONFIG: Record<string, { label: string; color: string; bg: string; 
   source: { label: 'Documents', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b' },
 };
 
-export default function InteractiveKnowledgeGraphView({ graph, topic, onOpenSource }: Props) {
+export default function InteractiveKnowledgeGraphView({ graph, onOpenSource }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [selectedNode, setSelectedNode] = useState<SimNode | null>(null);
-  const [activeTypeFilter, setActiveTypeFilter] = useState<string>('all');
   const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
 
   useEffect(() => {
@@ -159,14 +161,14 @@ export default function InteractiveKnowledgeGraphView({ graph, topic, onOpenSour
 
     simulation.on('tick', () => {
       link
-        .attr('x1', (d: any) => d.source.x)
-        .attr('y1', (d: any) => d.source.y)
-        .attr('x2', (d: any) => d.target.x)
-        .attr('y2', (d: any) => d.target.y);
+        .attr('x1', (d) => linked(d.source).x ?? 0)
+        .attr('y1', (d) => linked(d.source).y ?? 0)
+        .attr('x2', (d) => linked(d.target).x ?? 0)
+        .attr('y2', (d) => linked(d.target).y ?? 0);
 
       linkLabels
-        .attr('x', (d: any) => (d.source.x + d.target.x) / 2)
-        .attr('y', (d: any) => (d.source.y + d.target.y) / 2);
+        .attr('x', (d) => ((linked(d.source).x ?? 0) + (linked(d.target).x ?? 0)) / 2)
+        .attr('y', (d) => ((linked(d.source).y ?? 0) + (linked(d.target).y ?? 0)) / 2);
 
       node.attr('transform', (d) => `translate(${d.x || 0}, ${d.y || 0})`);
     });

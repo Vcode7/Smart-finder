@@ -96,7 +96,7 @@ export function SourceDetailModal({ sessionId }: SourceDetailModalProps) {
     }
     setIsSummarizing(true);
     try {
-      toast.loading('Synthesizing source with Groq Qwen 3.6...', { id: 'modal-summarize' });
+      toast.loading('Synthesizing source with the configured LLM...', { id: 'modal-summarize' });
       const res = await fetch('/api/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -502,7 +502,7 @@ export function SourceDetailModal({ sessionId }: SourceDetailModalProps) {
                         No AI Insights Generated Yet
                       </h4>
                       <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
-                        Extract executive synthesis, core arguments, key facts, statistics, and entities using Qwen 3.6 on Groq.
+                        Extract executive synthesis, core arguments, key facts, statistics, and entities using the configured LLM.
                       </p>
                     </div>
 

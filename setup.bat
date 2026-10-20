@@ -79,7 +79,7 @@ if %ERRORLEVEL% equ 0 (
 ) else if exist "C:\Program Files\Tesseract-OCR\tesseract.exe" (
     echo [PASS] tesseract OCR detected at "C:\Program Files\Tesseract-OCR\tesseract.exe"
 ) else (
-    echo [INFO] tesseract OCR not found in default locations (optional for OCR)
+    echo [INFO] tesseract OCR not found in default locations (optional: reads Hindi text in images)
 )
 echo.
 
@@ -116,11 +116,14 @@ if not exist "%PROJECT_ROOT%workspace\.env" (
     echo [PASS] workspace\.env exists
 )
 
-REM Ensure required storage directories exist
-if not exist "%PROJECT_ROOT%workspace\data" mkdir "%PROJECT_ROOT%workspace\data"
-if not exist "%PROJECT_ROOT%workspace\uploads" mkdir "%PROJECT_ROOT%workspace\uploads"
-if not exist "%PROJECT_ROOT%workspace\knowledge_base" mkdir "%PROJECT_ROOT%workspace\knowledge_base"
-echo [PASS] Storage directories verified (data, uploads, knowledge_base)
+REM Secure configuration: random shared JWT secret, loopback-only backend,
+REM random admin password on fresh installs (printed once below).
+python "%PROJECT_ROOT%backend\scripts\configure_env.py"
+if %ERRORLEVEL% neq 0 (
+    echo [FAIL] Could not prepare the .env files!
+    goto :FAIL_STOP
+)
+echo [PASS] Environment secured (storage folders under backend\data are created on first start)
 echo.
 
 REM ------------------------------------------------------------------------------
@@ -159,6 +162,28 @@ if %ERRORLEVEL% neq 0 (
     goto :FAIL_STOP
 )
 echo [PASS] Backend dependencies verified.
+
+REM PaddleOCR PP-OCRv6 (text in images). --no-deps: their declared pins would downgrade
+REM numpy and add a second OpenCV; the dependencies they use are in requirements.txt.
+"%VENV_PYTHON%" -m pip install --no-deps paddleocr==3.7.0 paddlex==3.7.2
+if %ERRORLEVEL% neq 0 (
+    echo [FAIL] Failed to install PaddleOCR!
+    goto :FAIL_STOP
+)
+echo [PASS] PaddleOCR installed.
+
+REM Hindi OCR (PP-OCRv6 has no Devanagari model): Tesseract with project-local tessdata
+set "TESSDATA_LOCAL=%PROJECT_ROOT%backend\tessdata"
+if not exist "%TESSDATA_LOCAL%" mkdir "%TESSDATA_LOCAL%"
+if exist "C:\Program Files\Tesseract-OCR\tessdata\eng.traineddata" (
+    if not exist "%TESSDATA_LOCAL%\eng.traineddata" copy "C:\Program Files\Tesseract-OCR\tessdata\eng.traineddata" "%TESSDATA_LOCAL%\" >nul
+    if not exist "%TESSDATA_LOCAL%\osd.traineddata" copy "C:\Program Files\Tesseract-OCR\tessdata\osd.traineddata" "%TESSDATA_LOCAL%\" >nul
+)
+if not exist "%TESSDATA_LOCAL%\hin.traineddata" (
+    echo [INFO] Downloading Hindi OCR language data...
+    powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/tesseract-ocr/tessdata/raw/main/hin.traineddata' -OutFile '%TESSDATA_LOCAL%\hin.traineddata'" >nul 2>&1
+)
+if exist "%TESSDATA_LOCAL%\hin.traineddata" (echo [PASS] OCR languages: eng + hin) else (echo [INFO] Hindi OCR data unavailable; OCR will use English only)
 set "STATUS_DEPENDENCIES=PASS"
 echo.
 
@@ -184,14 +209,16 @@ echo.
 REM ------------------------------------------------------------------------------
 REM STEP 5: Verify AI/ML Models & Local Caches
 REM ------------------------------------------------------------------------------
-echo [STEP 5/7] Verifying AI/ML Models (Qwen3, Jina CLIP, InsightFace, Whisper)...
+echo [STEP 5/7] Downloading AI models (text, reranker, images, captions, sound, speech, faces, OCR)...
+echo        About 7 GB on the first run; models already downloaded are skipped.
 
-"%VENV_PYTHON%" -c "import sys; sys.path.insert(0, r'%PROJECT_ROOT%backend'); from app.search.model_pipeline import get_text_embedding, _get_insightface_app, _get_whisper_model; v = get_text_embedding('test'); assert v and len(v)==1024; _get_insightface_app(); _get_whisper_model(); print('[PASS] Core AI/ML models loaded and functional.')"
+"%VENV_PYTHON%" "%PROJECT_ROOT%backend\scripts\prefetch_models.py"
 if %ERRORLEVEL% neq 0 (
-    echo [FAIL] AI/ML model verification failed!
+    echo [FAIL] Some AI models could not be downloaded. Check the internet connection and run setup again.
     goto :FAIL_STOP
 )
-echo [PASS] AI/ML models verified without re-downloading existing weights.
+echo [PASS] All AI models are available.
+
 set "STATUS_MODELS=PASS"
 echo.
 

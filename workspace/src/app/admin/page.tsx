@@ -1,17 +1,19 @@
 'use client';
 // src/app/admin/page.tsx — Create/Update Repository Management with Local Uploads & Internet Data Scraper
 
-import { useState, useEffect, useCallback, useRef, FormEvent } from 'react';
+import { useState, useEffect, useCallback, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Upload, FileText, Video, Image as ImageIcon, Trash2, RefreshCw, CheckCircle,
-  XCircle, Clock, Loader2, Database, ChevronLeft, AlertCircle,
+  XCircle, Clock, Loader2, Database,
   File, BarChart3, Sparkles, Info, Globe, Search, Plus, CheckSquare, Square,
-  BookOpen, Newspaper, ExternalLink, Layers, Check, ArrowRight, Filter
+  BookOpen, Newspaper, ExternalLink, Layers
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth';
+import { UploadPanel } from '@/components/library/UploadPanel';
 import { toast } from 'sonner';
+import { apiErrorMessage, readJson } from '@/lib/utils/api';
 import Sidebar from '@/components/layout/Sidebar';
 import DocumentMetadataModal from '@/components/modals/DocumentMetadataModal';
 import type { ScrapedSourceItem } from '@/types/research';
@@ -88,9 +90,6 @@ export default function AdminRepositoryPage() {
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
   const { user } = useAuthStore();
 
@@ -115,107 +114,21 @@ export default function AdminRepositoryPage() {
   const [inventoryFilter, setInventoryFilter] = useState<'all' | 'local' | 'internet'>('all');
   const [inventorySearch, setInventorySearch] = useState('');
 
-  // ─── Duplicate File Warning State ────────────────────────────────
-  const [duplicateConflicts, setDuplicateConflicts] = useState<{ originalName: string; suggestedName: string }[]>([]);
-  const [pendingUploadFiles, setPendingUploadFiles] = useState<File[] | null>(null);
-  const [showDuplicateModal, setShowDuplicateModal] = useState(false);
-
-  const fetchSources = useCallback(async () => {
-    try {
-      const res = await fetch('/api/knowledge');
-      if (res.ok) {
-        const data = await res.json();
-        setSources(data.sources || []);
-      }
-    } finally {
-      setLoading(false);
-    }
+  const fetchSources = useCallback(() => {
+    return fetch('/api/knowledge')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (data) setSources(data.sources || []); })
+      .catch(() => { /* backend temporarily unreachable; the next poll retries */ })
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
     if (user && user.role !== 'admin') { router.push('/'); return; }
     fetchSources();
-    const interval = setInterval(fetchSources, 4000);
+    // Poll only while the page is visible: the inventory can be thousands of rows
+    const interval = setInterval(() => { if (document.visibilityState === 'visible') fetchSources(); }, 4000);
     return () => clearInterval(interval);
   }, [user, router, fetchSources]);
-
-  // ─── Core Upload Execution ────────────────────────────────────────
-  const executeUpload = async (files: File[], resolveDuplicates: boolean = false) => {
-    setUploading(true);
-    const formData = new FormData();
-    for (const file of files) formData.append('files', file);
-    if (resolveDuplicates) {
-      formData.append('resolve_duplicates', 'true');
-    }
-
-    try {
-      const res = await fetch('/api/knowledge/upload', { method: 'POST', body: formData });
-      const data = await res.json();
-      if (res.ok) {
-        const success = data.results?.filter((r: { error?: string }) => !r.error).length || 0;
-        const failed = data.results?.filter((r: { error?: string }) => r.error).length || 0;
-        if (success > 0) toast.success(`${success} file${success > 1 ? 's' : ''} uploaded & queued for processing`);
-        if (failed > 0) toast.error(`${failed} file${failed > 1 ? 's' : ''} failed validation`);
-        await fetchSources();
-        setActiveTab('inventory');
-      } else {
-        toast.error(data.error || 'Upload failed');
-      }
-    } catch {
-      toast.error('Upload failed. Please try again.');
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
-  };
-
-  // ─── Upload Handler with Pre-Check for Duplicates ─────────────────
-  const handleUpload = async (files: FileList | File[]) => {
-    const fileArray = Array.from(files);
-    if (fileArray.length === 0) return;
-
-    // Check whether any file with the same name already exists
-    try {
-      const checkRes = await fetch('/api/knowledge/check-conflicts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filenames: fileArray.map((f) => f.name) }),
-      });
-
-      if (checkRes.ok) {
-        const checkData = await checkRes.json();
-        if (checkData.hasConflicts && checkData.conflicts?.length > 0) {
-          setDuplicateConflicts(checkData.conflicts);
-          setPendingUploadFiles(fileArray);
-          setShowDuplicateModal(true);
-          return;
-        }
-      }
-    } catch (e) {
-      console.warn('[Upload] Conflict pre-check failed, proceeding with direct upload', e);
-    }
-
-    // No conflict detected: upload directly with original filename
-    await executeUpload(fileArray, false);
-  };
-
-  const handleConfirmDuplicateUpload = async () => {
-    if (!pendingUploadFiles) return;
-    const filesToUpload = pendingUploadFiles;
-    setShowDuplicateModal(false);
-    setPendingUploadFiles(null);
-    setDuplicateConflicts([]);
-    // Upload with resolve_duplicates=true so backend assigns unique suffixes without overwriting
-    await executeUpload(filesToUpload, true);
-  };
-
-  const handleCancelDuplicateUpload = () => {
-    setShowDuplicateModal(false);
-    setPendingUploadFiles(null);
-    setDuplicateConflicts([]);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    toast.info('Upload cancelled.');
-  };
 
   // ─── Scrape Internet Search Handler ──────────────────────────────
   const handleScrapeSearch = async (e?: FormEvent) => {
@@ -349,13 +262,13 @@ export default function AdminRepositoryPage() {
         body: JSON.stringify({ sources: selectedItems }),
       });
 
-      const data = await res.json();
+      const data = await readJson<{ message?: string }>(res);
       if (res.ok) {
-        toast.success(data.message || `Added ${selectedItems.length} internet sources to local repository!`);
+        toast.success(data?.message || `Added ${selectedItems.length} internet sources to local repository!`);
         await fetchSources();
         setActiveTab('inventory');
       } else {
-        toast.error(data.error || 'Failed to import internet sources');
+        toast.error(apiErrorMessage(data, 'Failed to import internet sources'));
       }
     } catch {
       toast.error('Failed to import internet sources to repository');
@@ -373,7 +286,7 @@ export default function AdminRepositoryPage() {
         setSources((prev) => prev.filter((s) => s.id !== id));
         toast.success('Source deleted from repository');
       } else {
-        toast.error('Delete failed');
+        toast.error(apiErrorMessage(await readJson(res), 'Delete failed'));
       }
     } catch {
       toast.error('Delete failed');
@@ -387,7 +300,7 @@ export default function AdminRepositoryPage() {
         toast.success('Reprocessing started');
         await fetchSources();
       } else {
-        toast.error('Reprocess failed');
+        toast.error(apiErrorMessage(await readJson(res), 'Reprocess failed'));
       }
     } catch {
       toast.error('Reprocess failed');
@@ -402,12 +315,12 @@ export default function AdminRepositoryPage() {
     setSyncingFolder(true);
     try {
       const res = await fetch('/api/knowledge/sync', { method: 'POST' });
-      const data = await res.json();
+      const data = await readJson<{ message?: string }>(res);
       if (res.ok) {
-        toast.success(data.message || 'Knowledge Base folder synced successfully!');
+        toast.success(data?.message || 'Knowledge Base folder synced successfully!');
         await fetchSources();
       } else {
-        toast.error(data.error || 'Failed to sync knowledge folder');
+        toast.error(apiErrorMessage(data, 'Failed to sync knowledge folder'));
       }
     } catch {
       toast.error('Sync request failed');
@@ -417,16 +330,16 @@ export default function AdminRepositoryPage() {
   };
 
   const handleResetKnowledgeBase = async () => {
-    if (!confirm('Are you sure you want to reset all indexed knowledge records and derived embeddings? The physical files in knowledge_base will be preserved.')) return;
+    if (!confirm('Reset the legacy index? Its records, frames and embeddings are deleted. Stored files are kept, and folder libraries are not affected.')) return;
     setResettingKb(true);
     try {
       const res = await fetch('/api/knowledge/reset', { method: 'POST' });
-      const data = await res.json();
+      const data = await readJson<{ message?: string }>(res);
       if (res.ok) {
-        toast.success(data.message || 'Repository database reset successfully!');
+        toast.success(data?.message || 'Repository database reset successfully!');
         await fetchSources();
       } else {
-        toast.error(data.error || 'Failed to reset repository');
+        toast.error(apiErrorMessage(data, 'Failed to reset repository'));
       }
     } catch {
       toast.error('Reset request failed');
@@ -466,7 +379,7 @@ export default function AdminRepositoryPage() {
   });
 
   return (
-    <div className="flex h-screen overflow-hidden" style={{ background: 'var(--bg-base)' }}>
+    <div className="flex flex-col md:flex-row h-dvh overflow-hidden" style={{ background: 'var(--bg-base)' }}>
       <Sidebar />
 
       <div className="flex-1 overflow-y-auto">
@@ -494,7 +407,7 @@ export default function AdminRepositoryPage() {
                 onClick={handleResetKnowledgeBase}
                 disabled={resettingKb || syncingFolder}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold transition-all text-rose-300 bg-rose-500/10 border border-rose-500/25 hover:bg-rose-500/20 disabled:opacity-50"
-                title="Reset all indexed database tables, chunk vectors, and embeddings"
+                title="Clear the legacy index (records, frames, embeddings). Stored files and folder libraries are kept."
               >
                 <Trash2 className="w-3.5 h-3.5 text-rose-400" />
                 <span>{resettingKb ? 'Resetting...' : 'Reset Indexes'}</span>
@@ -508,10 +421,10 @@ export default function AdminRepositoryPage() {
                   background: 'linear-gradient(135deg, #6366f1 0%, #06b6d4 100%)',
                   boxShadow: '0 4px 14px rgba(99,102,241,0.3)',
                 }}
-                title="Scan and index all files in the knowledge_base folder"
+                title="Rescan every library folder for new, changed and deleted files"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${syncingFolder ? 'animate-spin' : ''}`} />
-                <span>{syncingFolder ? 'Syncing...' : 'Sync Local Folder'}</span>
+                <span>{syncingFolder ? 'Rescanning...' : 'Rescan Libraries'}</span>
               </button>
             </div>
           </div>
@@ -833,7 +746,6 @@ export default function AdminRepositoryPage() {
              ═══════════════════════════════════════════════════════════════ */}
           {activeTab === 'upload' && (
             <div className="space-y-6">
-              {/* Permanent Knowledge Folder Banner */}
               <div
                 className="p-4 rounded-3xl border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs"
                 style={{
@@ -846,60 +758,24 @@ export default function AdminRepositoryPage() {
                     <File className="w-4 h-4" />
                   </div>
                   <div>
-                    <p className="font-bold text-slate-200">
-                      Permanent Knowledge Directory: <code className="px-2 py-0.5 rounded bg-slate-900/80 text-cyan-300 font-mono text-[11px]">knowledge_base/</code>
+                    <p className="font-bold" style={{ color: 'var(--text-primary)' }}>
+                      Uploads are saved to the Uploads library and searched together with every folder library
                     </p>
-                    <p className="text-slate-400 text-[11px] mt-0.5">
-                      All documents, videos, audio, and images in this folder are auto-discovered and indexed with vector embeddings.
+                    <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                      Files already on this computer don&apos;t need uploading: add their folder on the Libraries page and they are indexed where they are, with no copies.
                     </p>
                   </div>
                 </div>
+                <button
+                  onClick={() => router.push('/libraries')}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white flex-shrink-0"
+                  style={{ background: 'linear-gradient(135deg, #6366f1, #06b6d4)' }}
+                >
+                  Open Libraries
+                </button>
               </div>
 
-              {/* Upload Zone */}
-              <motion.div
-                className={`relative rounded-3xl border-2 border-dashed p-10 text-center cursor-pointer transition-all ${dragOver ? 'scale-[1.01]' : ''}`}
-                style={{
-                  borderColor: dragOver ? 'var(--accent)' : 'var(--border)',
-                  background: dragOver ? 'var(--accent-muted)' : 'var(--bg-elevated)',
-                }}
-                onClick={() => fileInputRef.current?.click()}
-                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={(e) => { e.preventDefault(); setDragOver(false); handleUpload(e.dataTransfer.files); }}
-                whileHover={{ scale: 1.005 }}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.json,.xml,.html,.jpg,.jpeg,.png,.webp,.mp4,.avi,.mov,.mkv,.webm"
-                  onChange={(e) => e.target.files && handleUpload(e.target.files)}
-                />
-                {uploading ? (
-                  <div className="flex flex-col items-center gap-3">
-                    <Loader2 className="w-10 h-10 animate-spin" style={{ color: 'var(--accent)' }} />
-                    <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>Uploading & queuing files...</p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-3">
-                    <div className="w-14 h-14 rounded-2xl flex items-center justify-center"
-                      style={{ background: 'var(--accent-muted)' }}>
-                      <Upload className="w-7 h-7" style={{ color: 'var(--accent)' }} />
-                    </div>
-                    <div>
-                      <p className="font-semibold text-lg" style={{ color: 'var(--text-primary)' }}>
-                        Drop local files here or click to browse
-                      </p>
-                      <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>
-                        PDF, DOCX, TXT, CSV, XLSX, JSON · JPG, PNG, WEBP · MP4, AVI, MOV, MKV, WEBM
-                      </p>
-                      <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>Auto-chunked & indexed with vector embeddings</p>
-                    </div>
-                  </div>
-                )}
-              </motion.div>
+              <UploadPanel />
             </div>
           )}
 
@@ -993,7 +869,7 @@ export default function AdminRepositoryPage() {
                                 key={source.id}
                                 initial={{ opacity: 0, y: 4 }}
                                 animate={{ opacity: 1, y: 0 }}
-                                transition={{ delay: i * 0.02 }}
+                                transition={{ delay: Math.min(i, 20) * 0.02 }}
                                 className="border-b last:border-b-0 hover:bg-[var(--bg-hover)] transition-colors cursor-pointer group"
                                 style={{ borderColor: 'var(--border)' }}
                                 onClick={() => setSelectedSourceId(source.id)}
@@ -1112,112 +988,6 @@ export default function AdminRepositoryPage() {
         }}
       />
 
-      {/* ─── Duplicate File Warning Confirmation Modal ───────────────── */}
-      <AnimatePresence>
-        {showDuplicateModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-            {/* Backdrop */}
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={handleCancelDuplicateUpload}
-              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            />
-
-            {/* Modal Card */}
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              transition={{ duration: 0.18 }}
-              className="relative w-full max-w-lg rounded-3xl border shadow-2xl p-6 overflow-hidden z-10"
-              style={{
-                background: 'var(--bg-elevated)',
-                borderColor: 'var(--border)',
-                color: 'var(--text-primary)',
-              }}
-            >
-              {/* Header Icon + Title */}
-              <div className="flex items-start gap-4 mb-4">
-                <div
-                  className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0"
-                  style={{ background: 'rgba(245, 158, 11, 0.15)', color: '#f59e0b' }}
-                >
-                  <AlertCircle className="w-7 h-7" />
-                </div>
-                <div>
-                  <h3 className="text-lg font-bold leading-tight" style={{ color: 'var(--text-primary)' }}>
-                    A file with this name already exists. Do you want to upload it anyway?
-                  </h3>
-                  <p className="text-xs mt-1.5" style={{ color: 'var(--text-secondary)' }}>
-                    If you choose Yes, the new file will be uploaded with an automatically generated unique name so the existing file is not overwritten.
-                  </p>
-                </div>
-              </div>
-
-              {/* Conflict Details List */}
-              <div
-                className="my-4 p-3.5 rounded-2xl border max-h-48 overflow-y-auto space-y-2 text-xs"
-                style={{ background: 'var(--bg-base)', borderColor: 'var(--border)' }}
-              >
-                {duplicateConflicts.map((c, idx) => (
-                  <div
-                    key={idx}
-                    className="flex items-center justify-between gap-3 p-2.5 rounded-xl border"
-                    style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="font-medium truncate" style={{ color: 'var(--text-primary)' }} title={c.originalName}>
-                        {c.originalName}
-                      </p>
-                      <p className="text-[11px] text-amber-400 mt-0.5 font-medium">
-                        Already exists in repository
-                      </p>
-                    </div>
-                    <div
-                      className="flex items-center gap-1.5 text-[11px] shrink-0 font-medium px-2.5 py-1 rounded-lg border"
-                      style={{ background: 'var(--accent-muted)', borderColor: 'var(--accent)', color: 'var(--accent)' }}
-                    >
-                      <span className="opacity-75">Saved as:</span>
-                      <span className="font-semibold">{c.suggestedName}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Action Buttons */}
-              <div
-                className="flex items-center justify-end gap-3 mt-6 pt-3 border-t"
-                style={{ borderColor: 'var(--border)' }}
-              >
-                <button
-                  type="button"
-                  onClick={handleCancelDuplicateUpload}
-                  className="px-5 py-2.5 rounded-xl text-xs font-semibold transition-all border hover:bg-[var(--bg-hover)]"
-                  style={{
-                    borderColor: 'var(--border)',
-                    color: 'var(--text-secondary)',
-                  }}
-                >
-                  No, Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={handleConfirmDuplicateUpload}
-                  className="px-6 py-2.5 rounded-xl text-xs font-semibold text-white shadow-lg transition-all flex items-center gap-2 hover:opacity-90 active:scale-95"
-                  style={{
-                    background: 'linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%)',
-                  }}
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  Yes, Upload Anyway
-                </button>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
     </div>
   );
 }

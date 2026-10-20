@@ -5,19 +5,15 @@ from app.core.security import verify_token
 from app.database.session import db_get
 
 async def get_current_user(request: Request) -> Optional[Dict[str, Any]]:
+    # Identity comes only from a signed JWT (cookie or Bearer header). Client-supplied
+    # identity headers such as x-user-id are never trusted.
     token = request.cookies.get(settings.COOKIE_NAME)
     if not token:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.split(" ")[1]
+            token = auth_header.split(" ", 1)[1].strip()
 
     if not token:
-        # Check if forwarded headers exist from edge proxy
-        uid = request.headers.get("x-user-id")
-        if uid:
-            user = db_get("SELECT id, email, username, role FROM users WHERE id = ?", (uid,))
-            if user:
-                return user
         return None
 
     payload = verify_token(token)

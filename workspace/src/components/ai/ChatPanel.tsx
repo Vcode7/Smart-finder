@@ -50,7 +50,7 @@ export function ChatPanel({ source, sessionId, fullHeight }: ChatPanelProps) {
             Source Deep-Dive AI Chat
           </span>
         </div>
-        <span className="text-[10px] font-mono text-muted-foreground">Groq Qwen 3.6 27B</span>
+        <span className="text-[10px] font-mono text-muted-foreground">LLM (Ollama / Groq)</span>
       </div>
 
       {/* Message History */}

@@ -210,8 +210,11 @@ def seed_demo_knowledge() -> None:
     print("[DB] Seeded demo knowledge source for SSC Chairman Gopal Krishna")
 
     try:
-        from app.search.sync_faiss import sync_existing_data_to_faiss
-        sync_existing_data_to_faiss()
+        # sync_existing_data_to_faiss appends every row; only safe on an empty index
+        from app.search.faiss_index import get_faiss_manager
+        if get_faiss_manager().get_stats()["total"] == 0:
+            from app.search.sync_faiss import sync_existing_data_to_faiss
+            sync_existing_data_to_faiss()
     except Exception as e:
         print(f"[DB] Notice syncing demo data to FAISS: {e}")
 

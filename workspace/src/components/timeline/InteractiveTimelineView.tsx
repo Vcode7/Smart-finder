@@ -3,8 +3,8 @@
 // Interactive Chronological Timeline Component with event filtering, date markers, and source provenance links
 
 import { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { Calendar, Search, ExternalLink, Sparkles, Filter, ChevronRight, CheckCircle2, Clock } from 'lucide-react';
+import { motion } from 'framer-motion';
+import { Calendar, Search, ExternalLink } from 'lucide-react';
 import type { TimelineEvent } from '@/types/research';
 
 interface Props {

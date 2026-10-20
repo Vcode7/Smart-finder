@@ -4,11 +4,11 @@
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Database, FileText, Video, Image as ImageIcon, Globe, X, Trash2,
+  Database, FileText, Video, Image as ImageIcon, Globe, Trash2,
   ChevronRight, ChevronLeft, Info, Sparkles, Eye, CheckCircle2,
-  Search, Tag, Loader2, ArrowRight, ExternalLink
+  Search, Loader2, ArrowRight, ExternalLink, Music
 } from 'lucide-react';
-import { useChatStore, ContextItem } from '@/store/chat';
+import { useChatStore } from '@/store/chat';
 import DocumentMetadataModal from '@/components/modals/DocumentMetadataModal';
 
 interface ExtractedSearchInfo {
@@ -30,6 +30,7 @@ interface ContextPanelProps {
 const TYPE_ICONS: Record<string, typeof FileText> = {
   document: FileText,
   video: Video,
+  audio: Music,
   image: ImageIcon,
   web: Globe,
 };
@@ -46,7 +47,7 @@ export function ContextPanel({
   const [inspectSourceId, setInspectSourceId] = useState<string | null>(null);
   const [showQueryDetails, setShowQueryDetails] = useState(true);
 
-  const handleRemoveSource = async (itemId: string, sourceId?: string) => {
+  const handleRemoveSource = async (itemId: string) => {
     removeContextItem(itemId);
     // Also delete from backend chat_context if chat is active
     if (activeChatId) {
@@ -75,7 +76,8 @@ export function ContextPanel({
 
   return (
     <>
-      <div className="relative flex h-full">
+      {/* Phones: the drawer overlays the chat instead of squeezing it */}
+      <div className="absolute inset-y-0 right-0 z-30 flex md:relative md:z-auto h-full">
         {/* Drawer Toggle Button */}
         <button
           onClick={onToggle}
@@ -97,7 +99,7 @@ export function ContextPanel({
               animate={{ width: 330, opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
               transition={{ duration: 0.2 }}
-              className="h-full flex flex-col overflow-hidden select-none"
+              className="h-full flex flex-col overflow-hidden select-none max-w-[calc(100vw-3rem)] shadow-2xl md:shadow-none"
               style={{
                 background: 'var(--bg-elevated)',
                 borderLeft: '1px solid var(--border)',
@@ -233,8 +235,10 @@ export function ContextPanel({
                 ) : (
                   activeContext.map((item, idx) => {
                     const Icon = TYPE_ICONS[item.type] || FileText;
-                    const sourceId = (item.metadata?.sourceId as string) || (item.type !== 'web' && !item.metadata?.isInternet && !item.metadata?.isUserAttachment ? item.id : null);
-                    const matchPercent = Math.round((item.relevanceScore || 0.85) * 100);
+                    const rawSourceId = (item.metadata?.sourceId as string) || (item.type !== 'web' && !item.metadata?.isInternet && !item.metadata?.isUserAttachment ? item.id : null);
+                    const sourceId = rawSourceId ? String(rawSourceId).replace(/^src-/, '') : null;
+                    const rawScore = item.relevanceScore ?? 0.85;
+                    const matchPercent = rawScore > 1 ? Math.min(100, Math.round(rawScore)) : Math.round(rawScore * 100);
                     const isUserAtt = Boolean(item.metadata?.isUserAttachment || item.title.startsWith('[Attached'));
                     const isInternet = Boolean(item.metadata?.isInternet || item.type === 'web' || (!sourceId && item.metadata?.url));
                     const itemUrl = item.metadata?.url as string | undefined;
@@ -287,7 +291,7 @@ export function ContextPanel({
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleRemoveSource(item.id, sourceId || undefined);
+                              handleRemoveSource(item.id);
                             }}
                             className="p-1 rounded-lg hover:bg-red-500/10 text-zinc-400 hover:text-red-400 transition-colors"
                             title="Remove from context"
@@ -346,6 +350,18 @@ export function ContextPanel({
                         {/* Footer Badges */}
                         <div className="flex items-center justify-between mt-2 pt-2 border-t border-[var(--border)]">
                           <div className="flex items-center gap-1.5 flex-wrap">
+                            {!isUserAtt && (
+                              <span
+                                className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                                  idx === 0
+                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                                    : 'bg-zinc-800 text-zinc-400 border border-zinc-700/50'
+                                }`}
+                              >
+                                {idx === 0 ? '🏆 Rank #1' : `Rank #${idx + 1}`}
+                              </span>
+                            )}
+
                             <span
                               className="text-[10px] font-bold px-1.5 py-0.5 rounded"
                               style={{

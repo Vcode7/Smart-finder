@@ -1,20 +1,15 @@
-import os
+import asyncio
 import shutil
 import uuid
-from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any
 from app.core.config import settings
 from app.database.session import db_get, db_run
-from app.processing.queue import enqueue_source_processing
+from app.processing.queue import enqueue_source_processing, MAX_ATTEMPTS
+from app.search.constants import SUPPORTED_EXTENSIONS
 
-SUPPORTED_EXTENSIONS = {
-    'pdf', 'docx', 'doc', 'txt', 'md', 'csv', 'xlsx', 'xls', 'json', 'xml', 'html',
-    'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp',
-    'mp4', 'avi', 'mov', 'mkv', 'webm',
-    'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac'
-}
 
 async def sync_knowledge_folder() -> Dict[str, Any]:
+    """Import supported files dropped into KB_DIR (top level) into the knowledge base."""
     from app.database.seed import seed_system_user
     seed_system_user()
 
@@ -27,7 +22,7 @@ async def sync_knowledge_folder() -> Dict[str, Any]:
     skipped_files = []
     errors = []
 
-    files = list(kb_dir.glob("*"))
+    files = await asyncio.to_thread(lambda: sorted(kb_dir.glob("*")))
     for file_path in files:
         if file_path.is_dir() or file_path.name.startswith("."):
             continue
@@ -38,27 +33,39 @@ async def sync_knowledge_folder() -> Dict[str, Any]:
             continue
 
         original_name = file_path.name
+        file_size = file_path.stat().st_size
         existing = db_get(
-            "SELECT id, processing_status FROM knowledge_sources WHERE original_name = ?",
+            "SELECT id, processing_status, file_size, attempts FROM knowledge_sources "
+            "WHERE original_name = ? COLLATE NOCASE",
             (original_name,)
         )
 
-        if existing and existing["processing_status"] in ("completed", "processing", "indexing"):
-            skipped_files.append({"filename": original_name, "reason": "already_indexed", "id": existing["id"]})
-            continue
+        changed = bool(existing) and int(existing.get("file_size") or 0) != file_size
+        if existing and not changed:
+            status = existing["processing_status"]
+            if status in ("completed", "processing", "indexing"):
+                skipped_files.append({"filename": original_name, "reason": "already_indexed", "id": existing["id"]})
+                continue
+            if status == "uploaded":
+                await enqueue_source_processing(existing["id"])
+                skipped_files.append({"filename": original_name, "reason": "already_queued", "id": existing["id"]})
+                continue
+            if status == "failed" and int(existing.get("attempts") or 0) >= MAX_ATTEMPTS:
+                skipped_files.append({"filename": original_name, "reason": "failed", "id": existing["id"]})
+                continue
 
         source_id = existing["id"] if existing else str(uuid.uuid4())
         dest_filename = f"{source_id}.{ext}"
         dest_path = upload_dir / dest_filename
 
         try:
-            shutil.copy2(file_path, dest_path)
-            file_size = file_path.stat().st_size
+            await asyncio.to_thread(shutil.copy2, file_path, dest_path)
 
             if existing:
                 db_run(
-                    "UPDATE knowledge_sources SET file_path = ?, file_size = ?, processing_status = 'uploaded' WHERE id = ?",
-                    (str(dest_path), file_size, source_id)
+                    "UPDATE knowledge_sources SET file_path = ?, file_size = ?, processing_status = 'uploaded', "
+                    "attempts = CASE WHEN ? THEN 0 ELSE attempts END WHERE id = ?",
+                    (str(dest_path), file_size, 1 if changed else 0, source_id)
                 )
             else:
                 db_run(
@@ -81,4 +88,5 @@ async def sync_knowledge_folder() -> Dict[str, Any]:
         "syncedFiles": synced_files,
         "skippedFiles": skipped_files,
         "errorDetails": errors,
+        "message": f"Scanned {len(files)} file(s): {len(synced_files)} queued, {len(skipped_files)} skipped, {len(errors)} error(s).",
     }

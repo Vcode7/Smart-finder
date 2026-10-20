@@ -1,29 +1,39 @@
 // src/hooks/useKeyboard.ts
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useSyncExternalStore } from 'react';
 import { useUIStore } from '@/store/ui';
 
-export function useKeyboard() {
+/**
+ * Ctrl/Cmd+K opens the command palette. CommandPalette (mounted in the root layout)
+ * registers this on every page; calling it again elsewhere is harmless.
+ */
+export function useKeyboard(enabled = true) {
   const { setCommandPaletteOpen } = useUIStore();
 
   useEffect(() => {
+    if (!enabled) return;
     const handler = (e: KeyboardEvent) => {
-      const meta = e.metaKey || e.ctrlKey;
-
-      // Cmd/Ctrl+K — command palette
-      if (meta && e.key === 'k') {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
-        setCommandPaletteOpen(true);
-      }
-
-      // Escape — close command palette
-      if (e.key === 'Escape') {
+        setCommandPaletteOpen(!useUIStore.getState().commandPaletteOpen);
+      } else if (e.key === 'Escape' && useUIStore.getState().commandPaletteOpen) {
         setCommandPaletteOpen(false);
       }
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [setCommandPaletteOpen]);
+  }, [enabled, setCommandPaletteOpen]);
+}
+
+const noSubscribe = () => () => {};
+
+/** "⌘K" on Apple devices, "Ctrl K" elsewhere (server render: "Ctrl K"). */
+export function useShortcutLabel(): string {
+  return useSyncExternalStore(
+    noSubscribe,
+    () => (/Mac|iPhone|iPad/.test(navigator.userAgent) ? '⌘K' : 'Ctrl K'),
+    () => 'Ctrl K',
+  );
 }

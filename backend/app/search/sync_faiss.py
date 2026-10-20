@@ -19,7 +19,7 @@ def sync_existing_data_to_faiss():
     Syncs existing SQLite records into FAISS:
     - document_chunks -> FAISS text_index (1024-dim Qwen3)
     - video_transcripts -> FAISS text_index (1024-dim Qwen3)
-    - video_frames & images -> FAISS image_index (1024-dim Jina CLIP)
+    - video_frames & images -> FAISS image_index (1024-dim Qwen3-VL-Embedding)
     - face_embeddings -> FAISS face_index (512-dim InsightFace)
     """
     sys.stdout.reconfigure(encoding="utf-8")

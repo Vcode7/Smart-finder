@@ -1,0 +1,77 @@
+#!/bin/sh
+# Quick and offline: prepares config, folders and services. Downloads happen in
+# `sudo smartfinder-ctl setup`.
+set -e
+
+ETC=/etc/smartfinder
+SHARE=/usr/share/smartfinder
+DATA=/var/lib/smartfinder
+
+[ "$1" = "configure" ] || exit 0
+
+mkdir -p "$ETC" "$DATA/data" "$DATA/models" /var/cache/smartfinder /var/log/smartfinder /opt/smartfinder/state
+chmod 700 /var/log/smartfinder
+
+# ── account the services run as ──────────────────────────────────────────────
+[ -f "$ETC/smartfinder.conf" ] || cp "$SHARE/smartfinder.conf.template" "$ETC/smartfinder.conf"
+RUN_USER=$(sed -n 's/^RUN_USER=//p' "$ETC/smartfinder.conf" | tr -d '"' | tail -n 1)
+if [ -z "$RUN_USER" ]; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        RUN_USER=$SUDO_USER
+    else
+        # The only regular login account on this machine, if there is exactly one
+        candidates=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ {print $1}')
+        [ "$(printf '%s\n' "$candidates" | grep -c .)" = "1" ] && RUN_USER=$candidates
+    fi
+    if [ -n "$RUN_USER" ]; then
+        sed -i "s/^RUN_USER=.*/RUN_USER=$RUN_USER/" "$ETC/smartfinder.conf"
+    fi
+fi
+if [ -n "$RUN_USER" ] && ! id "$RUN_USER" >/dev/null 2>&1; then
+    echo "smartfinder: user '$RUN_USER' from $ETC/smartfinder.conf does not exist" >&2
+    RUN_USER=""
+fi
+
+# ── config files (never overwritten) ─────────────────────────────────────────
+if [ ! -f "$ETC/backend.env" ]; then
+    TESSDATA=/usr/share/tesseract-ocr/5/tessdata
+    for d in /usr/share/tesseract-ocr/5/tessdata /usr/share/tesseract-ocr/4.00/tessdata /usr/share/tessdata; do
+        if [ -f "$d/eng.traineddata" ]; then TESSDATA=$d; break; fi
+    done
+    sed "s|@TESSDATA_DIR@|$TESSDATA|" "$SHARE/backend.env.template" > "$ETC/backend.env"
+fi
+[ -f "$ETC/workspace.env" ] || cp "$SHARE/workspace.env.template" "$ETC/workspace.env"
+
+if [ -n "$RUN_USER" ]; then
+    RUN_GROUP=$(id -gn "$RUN_USER")
+    chown root:"$RUN_GROUP" "$ETC"/smartfinder.conf "$ETC"/backend.env "$ETC"/workspace.env
+    chmod 640 "$ETC"/smartfinder.conf "$ETC"/backend.env "$ETC"/workspace.env
+    chown "$RUN_USER":"$RUN_GROUP" "$DATA" "$DATA/data" "$DATA/models"
+    for svc in backend frontend; do
+        mkdir -p "/etc/systemd/system/smartfinder-$svc.service.d"
+        printf '[Service]\nUser=%s\nGroup=%s\n' "$RUN_USER" "$RUN_GROUP" \
+            > "/etc/systemd/system/smartfinder-$svc.service.d/user.conf"
+    done
+else
+    chmod 600 "$ETC"/smartfinder.conf "$ETC"/backend.env "$ETC"/workspace.env
+fi
+
+sysctl -q -p /usr/lib/sysctl.d/60-smartfinder.conf >/dev/null 2>&1 || true
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+echo
+if [ -f /opt/smartfinder/state/setup-complete ]; then
+    [ -d /run/systemd/system ] && systemctl try-restart smartfinder-backend.service smartfinder-frontend.service || true
+    echo "Smart Finder package updated. Get the latest code with: sudo smartfinder-ctl update-code"
+else
+    if [ -z "$RUN_USER" ]; then
+        echo "Smart Finder: choose the account it runs as: sudo smartfinder-ctl set-user <your-user>"
+    else
+        echo "Smart Finder will run as user '$RUN_USER' (change with: sudo smartfinder-ctl set-user <user>)."
+    fi
+    echo "Next step (downloads ~20 GB and starts Smart Finder):  sudo smartfinder-ctl setup"
+fi
+echo
+exit 0

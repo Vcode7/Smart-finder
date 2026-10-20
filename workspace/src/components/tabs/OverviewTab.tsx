@@ -23,7 +23,7 @@ interface OverviewTabProps {
 }
 
 const SECTION_TABS = [
-  { id: 'briefing', label: 'AI Executive Briefing', icon: Zap, badge: 'Qwen 3.6 27B', color: '#a855f7' },
+  { id: 'briefing', label: 'AI Executive Briefing', icon: Zap, badge: 'LLM', color: '#a855f7' },
   { id: 'workspace', label: 'Multi-Source Workspace', icon: Layers, badge: '2×2 Fullscreen', color: '#6366f1' },
   { id: 'graph', label: 'Knowledge Graph', icon: Network, badge: 'Interactive', color: '#06b6d4' },
   { id: 'timeline', label: 'Research Timeline', icon: GitBranch, badge: 'Chronological', color: '#10b981' },

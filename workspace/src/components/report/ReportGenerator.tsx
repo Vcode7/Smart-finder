@@ -89,7 +89,7 @@ ${report.conclusion}
 ${report.sources.map((s, i) => `${i + 1}. [${s.title}](${s.url}) — *${s.provider}*`).join('\n')}
 
 ---
-*Synthesized via Smart Finder (Groq Qwen 3.6 27B)*
+*Synthesized via Smart Finder (LLM (Ollama / Groq))*
 `;
     const blob = new Blob([md], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);

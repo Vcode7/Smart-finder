@@ -4,11 +4,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  X, FileText, Video, Image as ImageIcon, CheckCircle, Clock,
-  Loader2, XCircle, Copy, Check, Plus, Database, Sparkles,
-  Layers, FileCode, ChevronRight, User, Calendar, HardDrive, RefreshCw,
-  Play, Pause, Volume2, Maximize2, ExternalLink, Cpu, Music, BookOpen, Newspaper, Globe,
-  Terminal, AlertCircle, ScanFace, Activity, Search, ShieldCheck, Workflow
+  X, FileText, Video, Image as ImageIcon, Clock,
+  Loader2, Copy, Check, Plus, Database, Sparkles,
+  Layers, FileCode, HardDrive, RefreshCw,
+  Play, ExternalLink, Cpu, Music, BookOpen, Newspaper, Globe,
+  Terminal, AlertCircle, Activity, Search, Workflow
 } from 'lucide-react';
 import { useChatStore, ContextItem } from '@/store/chat';
 import { toast } from 'sonner';
@@ -138,17 +138,6 @@ function formatBytes(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function formatDate(dateStr?: string): string {
-  if (!dateStr) return '—';
-  return new Date(dateStr).toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
 function formatSeconds(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
@@ -194,6 +183,18 @@ function getPrefixBadgeStyle(prefix: string) {
   }
 }
 
+const VIDEO_EXTS = ['mp4', 'mov', 'webm', 'avi', 'mkv', 'm4v', 'wmv', 'mpg', 'mpeg', '3gp'];
+const AUDIO_EXTS = ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'opus', 'wma'];
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif', 'tif', 'tiff'];
+
+function mediaKind(ext: string): 'video' | 'audio' | 'image' | 'document' {
+  const e = (ext || '').toLowerCase();
+  if (VIDEO_EXTS.includes(e)) return 'video';
+  if (AUDIO_EXTS.includes(e)) return 'audio';
+  if (IMAGE_EXTS.includes(e)) return 'image';
+  return 'document';
+}
+
 export function DocumentMetadataModal({
   sourceId,
   initialTimestamp,
@@ -216,31 +217,43 @@ export function DocumentMetadataModal({
   const [copied, setCopied] = useState(false);
 
   const mediaRef = useRef<HTMLMediaElement | null>(null);
+  // Seek target applied once the player has loaded metadata (the player mounts only
+  // on the 'player' tab, so seeking immediately after switching tabs would be lost).
+  const pendingSeekRef = useRef<number | null>(null);
   const { activeContext, addContextItem, removeContextItem } = useChatStore();
 
+  // A different item (or the same one reopened) starts from a clean slate: never show the
+  // previously opened source while, or if, this one fails to load
+  const requestKey = isOpen ? `${internetItem?.id ?? ''}|${sourceId ?? ''}|${initialTimestamp ?? ''}` : '';
+  const [shownKey, setShownKey] = useState('');
+  if (requestKey !== shownKey) {
+    setShownKey(requestKey);
+    setSource(null);
+    setProcessingInfo(null);
+    setSections([]);
+    setChunks([]);
+    setTranscripts([]);
+    setFrames([]);
+    setLoading(isOpen && !internetItem && Boolean(sourceId));
+    setActiveTab(internetItem && (internetItem.category === 'video' || internetItem.category === 'image') ? 'player' : 'overview');
+  }
+
   useEffect(() => {
-    if (!isOpen) return;
-
-    if (internetItem) {
-      // Internet item view
-      setActiveTab(internetItem.category === 'video' || internetItem.category === 'image' ? 'player' : 'overview');
-      return;
-    }
-
-    if (!sourceId) {
-      setSource(null);
-      setProcessingInfo(null);
-      return;
-    }
+    if (!isOpen || internetItem || !sourceId) return;
 
     let isMounted = true;
-    setLoading(true);
+    pendingSeekRef.current = null;
 
-    fetch(`/api/knowledge/${sourceId}`)
-      .then((res) => res.json())
+    const cleanSourceId = sourceId.replace(/^src-/, '');
+    fetch(`/api/knowledge/${cleanSourceId}`)
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw new Error(data?.detail || `Request failed (${res.status})`);
+        return data;
+      })
       .then((data) => {
         if (!isMounted) return;
-        if (data.source) {
+        if (data?.source) {
           setSource(data.source);
           setSections(data.sections || []);
           setChunks(data.chunks || []);
@@ -256,24 +269,17 @@ export function DocumentMetadataModal({
           }
           setProcessingInfo(pInfo);
 
-          const ext = (data.source.file_type || '').toLowerCase();
-          const isMedia = ['mp4', 'webm', 'mov', 'avi', 'mkv', 'mp3', 'wav', 'm4a', 'ogg', 'jpg', 'png', 'webp'].includes(ext);
-          if (isMedia) {
-            setActiveTab('player');
-          } else {
-            setActiveTab('overview');
-          }
+          const kind = mediaKind(data.source.file_type);
+          setActiveTab(kind === 'document' ? 'overview' : 'player');
 
-          // Initial timestamp seek
+          // Applied by the player's onLoadedMetadata
           if (initialTimestamp !== undefined && initialTimestamp > 0) {
-            setTimeout(() => {
-              seekMedia(initialTimestamp);
-            }, 300);
+            pendingSeekRef.current = initialTimestamp;
           }
         }
       })
-      .catch(() => {
-        if (isMounted) toast.error('Failed to load document metadata');
+      .catch((err: Error) => {
+        if (isMounted) toast.error(err?.message || 'Failed to load document metadata');
       })
       .finally(() => {
         if (isMounted) setLoading(false);
@@ -283,6 +289,13 @@ export function DocumentMetadataModal({
       isMounted = false;
     };
   }, [isOpen, sourceId, initialTimestamp, internetItem]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isOpen, onClose]);
 
   if (!isOpen) return null;
 
@@ -321,7 +334,7 @@ export function DocumentMetadataModal({
       const firstChunkSnippet = chunks.length > 0 ? chunks[0].chunk_text : `${source.original_name} (${source.file_type.toUpperCase()})`;
       const item: ContextItem = {
         id: source.id,
-        type: ['mp4', 'mov', 'webm'].includes(source.file_type) ? 'video' : ['jpg', 'png', 'webp'].includes(source.file_type) ? 'image' : 'document',
+        type: mediaKind(source.file_type),
         title: source.original_name,
         snippet: firstChunkSnippet.slice(0, 500),
         metadata: {
@@ -344,18 +357,33 @@ export function DocumentMetadataModal({
   };
 
   const seekMedia = (seconds: number) => {
-    if (mediaRef.current) {
-      mediaRef.current.currentTime = seconds;
-      mediaRef.current.play().catch(() => {});
+    const el = mediaRef.current;
+    if (el && el.readyState >= 1) {
+      el.currentTime = seconds;
+      el.play().catch(() => {});
+      pendingSeekRef.current = null;
+    } else {
+      pendingSeekRef.current = seconds;
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    const el = mediaRef.current;
+    const target = pendingSeekRef.current;
+    pendingSeekRef.current = null;
+    if (el && target !== null && target > 0) {
+      el.currentTime = target;
+      el.play().catch(() => {});
     }
   };
 
   // Local Type Checks
   const fileExt = (source?.file_type || '').toLowerCase();
-  const isVideo = ['mp4', 'mov', 'webm', 'avi', 'mkv'].includes(fileExt);
-  const isAudio = ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac'].includes(fileExt);
-  const isImage = ['jpg', 'png', 'webp', 'jpeg', 'gif', 'bmp'].includes(fileExt);
-  const isDocument = ['pdf', 'docx', 'doc', 'txt', 'md', 'csv', 'xlsx', 'xls', 'json'].includes(fileExt);
+  const fileKind = mediaKind(fileExt);
+  const isVideo = fileKind === 'video';
+  const isAudio = fileKind === 'audio';
+  const isImage = fileKind === 'image';
+  const isDocument = fileKind === 'document';
 
   // Parse custom metadata for internet sources
   let sourceMetadata: Record<string, unknown> = {};
@@ -366,16 +394,17 @@ export function DocumentMetadataModal({
   }
   const sourceUrl = (sourceMetadata.url || sourceMetadata.original_url || (source?.file_path?.startsWith('http') ? source.file_path : undefined)) as string | undefined;
 
-  // AI Model attribution for local source
-  const aiModelName = isVideo || isAudio
-    ? 'Groq Whisper Large v3 (Audio & Video Transcription) + CLIP Keyframe Visual Embeddings'
+  // Fallback model attribution when the source didn't record processing_info.models_used
+  // (the local indexing pipeline: see README "How it works")
+  const aiModelName = sourceUrl
+    ? 'Web import · Qwen3-Embedding text vectors'
+    : isVideo
+    ? 'Whisper large-v3 transcription · video keyframes · Qwen3-VL picture vectors · InsightFace faces'
+    : isAudio
+    ? 'Whisper large-v3 transcription · CLAP sound embeddings'
     : isImage
-    ? 'Groq Vision (Visual OCR & Scene Extraction) + CLIP Image Embeddings'
-    : isDocument
-    ? 'PDFParse v2 + MiniLM Text Vector Embeddings + FTS5 Section Chunker'
-    : sourceUrl
-    ? 'Web Scraper & Multi-Vector Text Embedding Pipeline'
-    : 'Groq Ingestion Pipeline';
+    ? 'PaddleOCR text · Florence-2 description · Qwen3-VL picture vectors · InsightFace faces'
+    : 'Text extraction & OCR · Qwen3-Embedding text vectors · full-text index';
 
   const modelsList = processingInfo?.models_used
     ? Object.values(processingInfo.models_used).join(' · ')
@@ -627,12 +656,7 @@ export function DocumentMetadataModal({
                           controls
                           className="w-full h-full object-contain"
                           src={`/api/knowledge/${source.id}/file`}
-                          onLoadedMetadata={() => {
-                            if (initialTimestamp !== undefined && initialTimestamp > 0 && mediaRef.current) {
-                              mediaRef.current.currentTime = initialTimestamp;
-                              mediaRef.current.play().catch(() => {});
-                            }
-                          }}
+                          onLoadedMetadata={handleLoadedMetadata}
                         />
                       </div>
                     )}
@@ -653,12 +677,7 @@ export function DocumentMetadataModal({
                           controls
                           className="w-full max-w-md mt-2"
                           src={`/api/knowledge/${source.id}/file`}
-                          onLoadedMetadata={() => {
-                            if (initialTimestamp !== undefined && initialTimestamp > 0 && mediaRef.current) {
-                              mediaRef.current.currentTime = initialTimestamp;
-                              mediaRef.current.play().catch(() => {});
-                            }
-                          }}
+                          onLoadedMetadata={handleLoadedMetadata}
                         />
                       </div>
                     )}

@@ -3,111 +3,111 @@ app/search/keyword_search.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 SQLite FTS5 keyword search for document chunks and video transcripts.
 
-Scoring: Uses real BM25-derived `rank` from FTS5 (NOT a fabricated position score).
-  - FTS5 rank is negative; lower (more negative) = less relevant.
-  - rank_score = 1 / (1 + abs(rank))  → maps to (0, 1], higher is better.
-  - OR-path also blends token_ratio: 0.70 * rank_score + 0.30 * token_ratio
+Scoring: uses the real BM25-derived `rank` from FTS5.
+  - FTS5 rank is negative BM25; more negative = stronger match.
+  - rank_score = log1p(|rank|) / (1 + log1p(|rank|))  → (0, 1)
+  - final score = 0.70 * rank_score + 0.30 * token_coverage
+    (token_coverage is 1.0 for rows from the all-terms AND query)
 
 Search strategy per function:
   1. AND query (all tokens required) — best precision
-  2. OR query (any token, scored by token coverage) — wider recall
+  2. OR query (any token) — fills remaining slots for recall
   3. LIKE fallback (FTS5 virtual table missing or corrupt) — last resort
+
+Tokenization is Unicode-aware (constants.tokenize), so Hindi and other
+non-Latin queries produce real FTS terms.
 """
-import re
 import math
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 from app.database.session import db_all
-from app.search.constants import STOPWORDS
+from app.search.constants import tokenize
 
 
 def extract_query_tokens(query: str) -> List[str]:
-    cleaned = re.sub(r"[^a-z0-9\s]", " ", query.lower())
-    return [w for w in cleaned.split() if len(w) >= 2 and w not in STOPWORDS]
+    return tokenize(query)
 
 
 def _rank_to_score(rank: float) -> float:
     """Convert FTS5 rank (negative BM25) to a [0, 1) relevance score.
 
-    FTS5 rank is negative BM25: lower (more negative) = stronger match.
-    Uses log-scale so the score grows with BM25 magnitude:
-      abs(rank) = 0.10  →  ~0.19  (weak hit)
-      abs(rank) = 1.0   →  ~0.50  (moderate hit)
-      abs(rank) = 5.0   →  ~0.83  (strong hit)
-      abs(rank) = 10.0  →  ~0.91  (very strong hit)
-    Formula: log1p(v) / (1 + log1p(v)) where v = abs(rank)
+    |rank| = 1.0 → 0.41, 5.0 → 0.64, 10.0 → 0.71
     """
     v = abs(float(rank))
     return round(min(0.99, math.log1p(v) / (1.0 + math.log1p(v))), 4)
 
 
-def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    clean_q = query.strip()
-    if not clean_q:
-        return []
+def _coverage(text: str, tokens: List[str]) -> float:
+    lower_text = (text or "").lower()
+    matched = [t for t in tokens if t in lower_text]
+    return len(matched) / len(tokens) if tokens else 0.0
 
-    tokens = extract_query_tokens(clean_q)
+
+def _fts_query(tokens: List[str], joiner: str) -> str:
+    return f" {joiner} ".join(f'"{t}"*' for t in tokens)
+
+
+def _run_fts(
+    sql: str,
+    tokens: List[str],
+    limit: int,
+    text_key: str,
+    to_result: Callable[[Dict[str, Any], float], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """AND query first, then OR query to fill the remaining slots. Raises if FTS is unusable."""
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    if len(tokens) > 1:
+        for r in db_all(sql, (_fts_query(tokens, "AND"), limit)):
+            score = round(0.70 * _rank_to_score(r["rank"]) + 0.30, 4)
+            item = to_result(r, score)
+            seen.add(item["id"])
+            results.append(item)
+        if len(results) >= limit:
+            return results
+
+    for r in db_all(sql, (_fts_query(tokens, "OR"), limit)):
+        score = round(0.70 * _rank_to_score(r["rank"]) + 0.30 * _coverage(r[text_key], tokens), 4)
+        item = to_result(r, score)
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        results.append(item)
+        if len(results) >= limit:
+            break
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    tokens = extract_query_tokens(query.strip() if query else "")
     if not tokens:
         return []
 
-    # 1. Strict FTS5 AND query (all tokens required)
-    if len(tokens) > 1:
-        strict_fts = " AND ".join([f'"{t}"*' for t in tokens])
-        try:
-            rows = db_all(
-                """SELECT chunk_id, chunk_text, source_id, doc_id, rank
-                   FROM chunks_fts
-                   WHERE chunk_text MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (strict_fts, limit)
-            )
-            if rows:
-                return [
-                    {
-                        "id": r["chunk_id"],
-                        "text": r["chunk_text"],
-                        "sourceId": r["source_id"],
-                        "docId": r["doc_id"],
-                        "type": "chunk",
-                        "score": _rank_to_score(r["rank"]),
-                    }
-                    for r in rows
-                ]
-        except Exception:
-            pass
+    def to_result(r: Dict[str, Any], score: float) -> Dict[str, Any]:
+        return {
+            "id": r["chunk_id"],
+            "text": r["chunk_text"],
+            "sourceId": r["source_id"],
+            "docId": r["doc_id"],
+            "type": "chunk",
+            "score": score,
+        }
 
-    # 2. Standard FTS5 OR query (blend rank + token coverage)
     try:
-        or_fts = " OR ".join([f'"{t}"*' for t in tokens])
-        rows = db_all(
+        return _run_fts(
             """SELECT chunk_id, chunk_text, source_id, doc_id, rank
                FROM chunks_fts
                WHERE chunk_text MATCH ?
                ORDER BY rank
                LIMIT ?""",
-            (or_fts, limit)
+            tokens, limit, "chunk_text", to_result,
         )
-        if rows:
-            results = []
-            for r in rows:
-                lower_text = r["chunk_text"].lower()
-                matched = [t for t in tokens if t in lower_text]
-                token_ratio = len(matched) / len(tokens)
-                rank_score = _rank_to_score(r["rank"])
-                score = round(0.70 * rank_score + 0.30 * token_ratio, 4)
-                results.append({
-                    "id": r["chunk_id"],
-                    "text": r["chunk_text"],
-                    "sourceId": r["source_id"],
-                    "docId": r["doc_id"],
-                    "type": "chunk",
-                    "score": score,
-                })
-            return results
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[KeywordSearch] FTS5 chunk search unavailable ({e}); using LIKE fallback")
 
-    # 3. Fallback: LIKE query on document_chunks (FTS5 unavailable)
+    # Fallback: LIKE query on document_chunks (FTS5 unavailable)
     try:
         like_clauses = " AND ".join(["chunk_text LIKE ?"] * len(tokens))
         params = tuple([f"%{t}%" for t in tokens] + [limit])
@@ -127,98 +127,53 @@ def search_document_chunks(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                     LIMIT ?""",
                 params
             )
-        results = []
-        for r in rows:
-            lower_text = r["chunk_text"].lower()
-            matched = [t for t in tokens if t in lower_text]
-            token_ratio = len(matched) / len(tokens)
-            results.append({
+        return [
+            {
                 "id": r["id"],
                 "text": r["chunk_text"],
                 "sourceId": r["source_id"],
                 "docId": r["doc_id"],
                 "pageNum": r.get("page_num", 1),
                 "type": "chunk",
-                "score": round(token_ratio * 0.85, 4),
-            })
-        return results
+                "score": round(_coverage(r["chunk_text"], tokens) * 0.85, 4),
+            }
+            for r in rows
+        ]
     except Exception as e:
         print(f"[KeywordSearch] Document search error: {e}")
         return []
 
 
 def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    clean_q = query.strip()
-    if not clean_q:
-        return []
-
-    tokens = extract_query_tokens(clean_q)
+    tokens = extract_query_tokens(query.strip() if query else "")
     if not tokens:
         return []
 
-    # 1. Strict FTS5 AND query
-    if len(tokens) > 1:
-        strict_fts = " AND ".join([f'"{t}"*' for t in tokens])
-        try:
-            rows = db_all(
-                """SELECT transcript_id, text, video_id, source_id, start_time, end_time, rank
-                   FROM transcripts_fts
-                   WHERE text MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (strict_fts, limit)
-            )
-            if rows:
-                return [
-                    {
-                        "id": r["transcript_id"],
-                        "text": r["text"],
-                        "sourceId": r["source_id"],
-                        "videoId": r["video_id"],
-                        "startTime": r["start_time"],
-                        "endTime": r["end_time"],
-                        "type": "transcript",
-                        "score": _rank_to_score(r["rank"]),
-                    }
-                    for r in rows
-                ]
-        except Exception:
-            pass
+    def to_result(r: Dict[str, Any], score: float) -> Dict[str, Any]:
+        return {
+            "id": r["transcript_id"],
+            "text": r["text"],
+            "sourceId": r["source_id"],
+            "videoId": r["video_id"],
+            "startTime": r["start_time"],
+            "endTime": r["end_time"],
+            "type": "transcript",
+            "score": score,
+        }
 
-    # 2. Standard FTS5 OR query
     try:
-        or_fts = " OR ".join([f'"{t}"*' for t in tokens])
-        rows = db_all(
+        return _run_fts(
             """SELECT transcript_id, text, video_id, source_id, start_time, end_time, rank
                FROM transcripts_fts
                WHERE text MATCH ?
                ORDER BY rank
                LIMIT ?""",
-            (or_fts, limit)
+            tokens, limit, "text", to_result,
         )
-        if rows:
-            results = []
-            for r in rows:
-                lower_text = r["text"].lower()
-                matched = [t for t in tokens if t in lower_text]
-                token_ratio = len(matched) / len(tokens)
-                rank_score = _rank_to_score(r["rank"])
-                score = round(0.70 * rank_score + 0.30 * token_ratio, 4)
-                results.append({
-                    "id": r["transcript_id"],
-                    "text": r["text"],
-                    "sourceId": r["source_id"],
-                    "videoId": r["video_id"],
-                    "startTime": r["start_time"],
-                    "endTime": r["end_time"],
-                    "type": "transcript",
-                    "score": score,
-                })
-            return results
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[KeywordSearch] FTS5 transcript search unavailable ({e}); using LIKE fallback")
 
-    # 3. Fallback: LIKE query on video_transcripts
+    # Fallback: LIKE query on video_transcripts
     try:
         like_clauses = " AND ".join(["text LIKE ?"] * len(tokens))
         params = tuple([f"%{t}%" for t in tokens] + [limit])
@@ -238,12 +193,8 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                     LIMIT ?""",
                 params
             )
-        results = []
-        for r in rows:
-            lower_text = r["text"].lower()
-            matched = [t for t in tokens if t in lower_text]
-            token_ratio = len(matched) / len(tokens)
-            results.append({
+        return [
+            {
                 "id": r["id"],
                 "text": r["text"],
                 "sourceId": r["source_id"],
@@ -251,9 +202,10 @@ def search_transcripts(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                 "startTime": r["start_time"],
                 "endTime": r["end_time"],
                 "type": "transcript",
-                "score": round(token_ratio * 0.85, 4),
-            })
-        return results
+                "score": round(_coverage(r["text"], tokens) * 0.85, 4),
+            }
+            for r in rows
+        ]
     except Exception as e:
         print(f"[KeywordSearch] Transcript search error: {e}")
         return []

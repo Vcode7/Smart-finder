@@ -125,7 +125,7 @@ export function FullScreenWorkspace({ session, sessionId, onClose }: FullScreenW
                   style={{ background: 'rgba(16, 185, 129, 0.12)', color: '#10b981' }}
                 >
                   <Zap className="w-2.5 h-2.5 mr-1" />
-                  Groq Qwen 3.6 27B
+                  LLM (Ollama / Groq)
                 </span>
               </div>
               <p className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>

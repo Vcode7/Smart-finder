@@ -1,0 +1,17 @@
+[Unit]
+Description=Smart Finder web app (Next.js)
+After=smartfinder-backend.service
+Wants=smartfinder-backend.service
+PartOf=smartfinder.target
+ConditionPathExists=/opt/smartfinder/state/setup-complete
+
+[Service]
+Type=simple
+# User= and Group= come from smartfinder-frontend.service.d/user.conf (smartfinder-ctl set-user)
+ExecStart=/usr/bin/smartfinder-ctl _run-frontend
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=smartfinder.target

@@ -15,14 +15,17 @@ import {
   HardDrive,
   Layers,
   ChevronDown,
-  ExternalLink,
   ShieldCheck,
   Sparkles,
   Loader2,
-  Check
+  Check,
+  KeyRound,
+  Lock
 } from 'lucide-react';
 import { useUIStore } from '@/store/ui';
+import { useAuthStore } from '@/store/auth';
 import { toast } from 'sonner';
+import { apiErrorMessage, readJson } from '@/lib/utils/api';
 
 interface OllamaModel {
   name: string;
@@ -56,10 +59,62 @@ interface TestResult {
   error?: string;
 }
 
+function AccountSection() {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const handleChangePassword = async () => {
+    if (newPassword.length < 8) { toast.error('The new password must be at least 8 characters'); return; }
+    if (newPassword !== confirmPassword) { toast.error('The new passwords do not match'); return; }
+    setSaving(true);
+    try {
+      const res = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      if (!res.ok) {
+        toast.error(apiErrorMessage(await readJson(res), 'Could not change the password'));
+        return;
+      }
+      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
+      toast.success('Password changed');
+    } catch {
+      toast.error('Could not change the password');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const inputClass = 'w-full px-3 py-2 rounded-xl border bg-[var(--bg-base)] text-xs outline-none';
+  return (
+    <div className="p-5 rounded-2xl border space-y-4" style={{ background: 'var(--bg-surface, rgba(255,255,255,0.02))', borderColor: 'var(--border, rgba(255,255,255,0.08))' }}>
+      <div className="flex items-center gap-2.5">
+        <KeyRound className="w-5 h-5 text-indigo-400" />
+        <span className="font-semibold text-sm">Account</span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <input type="password" autoComplete="current-password" placeholder="Current password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} className={inputClass} style={{ borderColor: 'var(--border)' }} />
+        <input type="password" autoComplete="new-password" placeholder="New password (8+ characters)" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} className={inputClass} style={{ borderColor: 'var(--border)' }} />
+        <input type="password" autoComplete="new-password" placeholder="Confirm new password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className={inputClass} style={{ borderColor: 'var(--border)' }} />
+      </div>
+      <div className="flex justify-end">
+        <button type="button" onClick={handleChangePassword} disabled={saving || !currentPassword || !newPassword}
+          className="px-4 py-2 rounded-xl text-xs font-semibold text-white disabled:opacity-50" style={{ background: 'var(--accent)' }}>
+          {saving ? 'Saving...' : 'Change password'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsModal() {
   const { settingsModalOpen, setSettingsModalOpen } = useUIStore();
+  // Changing or testing the model is admin-only on the backend
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
 
-  const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -74,80 +129,82 @@ export function SettingsModal() {
   const [fallbackModel, setFallbackModel] = useState('llama-3.3-70b-versatile');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const fetchSettings = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/settings/ollama');
-      if (res.ok) {
-        const data: OllamaSettingsData = await res.json();
-        setEndpoint(data.endpoint || 'http://localhost:11434');
-        setConnected(data.connected);
-        setModels(data.models || []);
-        setSelectedModel(data.selected_model || '');
-        setActiveProvider(data.active_provider || (data.connected ? 'ollama' : 'groq'));
-        setActiveModel(data.active_model || '');
-        setFallbackModel(data.fallback_model || 'llama-3.3-70b-versatile');
-        setErrorMsg(data.error || null);
-      } else {
-        toast.error('Failed to load Ollama settings');
-      }
-    } catch (err: any) {
-      toast.error(err.message || 'Error fetching Ollama status');
-    } finally {
-      setLoading(false);
-    }
+  const applyStatus = useCallback((data: OllamaSettingsData) => {
+    setEndpoint(data.endpoint || 'http://localhost:11434');
+    setConnected(data.connected);
+    setModels(data.models || []);
+    setSelectedModel(data.selected_model || '');
+    setActiveProvider(data.active_provider || (data.connected ? 'ollama' : 'groq'));
+    setActiveModel(data.active_model || '');
+    setFallbackModel(data.fallback_model || 'llama-3.3-70b-versatile');
+    setErrorMsg(data.error || null);
   }, []);
 
   useEffect(() => {
-    if (settingsModalOpen) {
-      fetchSettings();
-      setTestResult(null);
-    }
-  }, [settingsModalOpen, fetchSettings]);
+    if (!settingsModalOpen) return;
+    let current = true;
+    fetch('/api/settings/ollama')
+      .then(async (res) => {
+        const data = await readJson<OllamaSettingsData>(res);
+        if (!res.ok || !data) throw new Error(apiErrorMessage(data, 'Failed to load Ollama settings'));
+        if (current) applyStatus(data);
+      })
+      .catch((err) => { if (current) toast.error(err instanceof Error ? err.message : 'Error fetching Ollama status'); });
+    return () => { current = false; };
+  }, [settingsModalOpen, applyStatus]);
+
+  const close = useCallback(() => {
+    setSettingsModalOpen(false);
+    setTestResult(null);
+  }, [setSettingsModalOpen]);
+
+  useEffect(() => {
+    if (!settingsModalOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [settingsModalOpen, close]);
+
+  // POST to a settings route; the backend answers with the full status
+  const postSettings = async (url: string, body?: object): Promise<OllamaSettingsData> => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await readJson<OllamaSettingsData>(res);
+    if (!res.ok || !data) throw new Error(apiErrorMessage(data, `Request failed (${res.status})`));
+    return data;
+  };
 
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      const res = await fetch('/api/settings/ollama/refresh', { method: 'POST' });
-      if (res.ok) {
-        const data: OllamaSettingsData = await res.json();
-        setConnected(data.connected);
-        setModels(data.models || []);
-        setSelectedModel(data.selected_model || '');
-        setActiveProvider(data.active_provider);
-        setActiveModel(data.active_model);
-        setErrorMsg(data.error || null);
-        toast.success(
-          data.connected
-            ? `Discovered ${data.models.length} Ollama model${data.models.length === 1 ? '' : 's'}`
-            : 'Ollama endpoint is unreachable'
-        );
-      }
-    } catch {
-      toast.error('Failed to refresh models');
+      const data = await postSettings('/api/settings/ollama/refresh');
+      applyStatus(data);
+      toast.success(
+        data.connected
+          ? `Discovered ${data.models.length} Ollama model${data.models.length === 1 ? '' : 's'}`
+          : 'Ollama endpoint is unreachable'
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to refresh models');
     } finally {
       setRefreshing(false);
     }
   };
 
   const handleSaveModel = async (newModel: string) => {
+    if (newModel === selectedModel) return;
+    const previous = selectedModel;
     setSelectedModel(newModel);
     setSaving(true);
     try {
-      const res = await fetch('/api/settings/ollama', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ selected_model: newModel }),
-      });
-      if (res.ok) {
-        const data: OllamaSettingsData = await res.json();
-        setSelectedModel(data.selected_model);
-        setActiveProvider(data.active_provider);
-        setActiveModel(data.active_model);
-        toast.success(`Selected model updated: ${newModel}`);
-      }
-    } catch {
-      toast.error('Failed to update selected model');
+      applyStatus(await postSettings('/api/settings/ollama', { selected_model: newModel }));
+      toast.success(`Selected model updated: ${newModel}`);
+    } catch (err) {
+      setSelectedModel(previous);
+      toast.error(err instanceof Error ? err.message : 'Failed to update selected model');
     } finally {
       setSaving(false);
     }
@@ -156,21 +213,10 @@ export function SettingsModal() {
   const handleSaveEndpoint = async () => {
     setSaving(true);
     try {
-      const res = await fetch('/api/settings/ollama', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: endpoint.trim() }),
-      });
-      if (res.ok) {
-        const data: OllamaSettingsData = await res.json();
-        setConnected(data.connected);
-        setModels(data.models || []);
-        setSelectedModel(data.selected_model);
-        setActiveProvider(data.active_provider);
-        toast.success('Ollama endpoint updated');
-      }
-    } catch {
-      toast.error('Failed to update endpoint');
+      applyStatus(await postSettings('/api/settings/ollama', { endpoint: endpoint.trim() }));
+      toast.success('Ollama endpoint updated');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to update endpoint');
     } finally {
       setSaving(false);
     }
@@ -181,22 +227,26 @@ export function SettingsModal() {
     setTestResult(null);
     try {
       const res = await fetch('/api/settings/ollama/test', { method: 'POST' });
-      const data: TestResult = await res.json();
+      const data = await readJson<TestResult>(res);
+      if (!res.ok || !data) throw new Error(apiErrorMessage(data, `Request failed (${res.status})`));
       setTestResult(data);
       if (data.success) {
         toast.success(`Test passed via ${data.provider?.toUpperCase()} (${data.latency_ms}ms)`);
       } else {
         toast.error(`Test failed: ${data.error || 'Unknown error'}`);
       }
-    } catch (err: any) {
-      setTestResult({ success: false, error: err.message });
-      toast.error('Test request encountered an error');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Test request encountered an error';
+      setTestResult({ success: false, error: message });
+      toast.error(message);
     } finally {
       setTesting(false);
     }
   };
 
   if (!settingsModalOpen) return null;
+
+  const usingOllama = activeProvider === 'ollama';
 
   return (
     <AnimatePresence>
@@ -206,7 +256,7 @@ export function SettingsModal() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          onClick={() => setSettingsModalOpen(false)}
+          onClick={close}
           className="fixed inset-0 bg-black/60 backdrop-blur-sm"
         />
 
@@ -246,7 +296,8 @@ export function SettingsModal() {
             </div>
 
             <button
-              onClick={() => setSettingsModalOpen(false)}
+              onClick={close}
+              aria-label="Close settings"
               className="p-2 rounded-xl transition-colors hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
             >
               <X className="w-5 h-5" />
@@ -255,6 +306,8 @@ export function SettingsModal() {
 
           {/* ─── Body ───────────────────────────────────────────── */}
           <div className="flex-1 overflow-y-auto p-6 space-y-6">
+            <AccountSection />
+
             {/* Section: Ollama Configuration */}
             <div
               className="p-5 rounded-2xl border space-y-5"
@@ -286,6 +339,14 @@ export function SettingsModal() {
                 </div>
               </div>
 
+              {!isAdmin && (
+                <p className="flex items-center gap-2 text-[11px] px-3 py-2 rounded-xl"
+                  style={{ background: 'var(--bg-base)', color: 'var(--text-muted)' }}>
+                  <Lock className="w-3.5 h-3.5 flex-shrink-0" />
+                  Only an administrator can change or test the AI model.
+                </p>
+              )}
+
               {/* Endpoint Input */}
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-[var(--text-secondary)]">
@@ -302,21 +363,24 @@ export function SettingsModal() {
                       value={endpoint}
                       onChange={(e) => setEndpoint(e.target.value)}
                       placeholder="http://localhost:11434"
-                      className="w-full bg-transparent outline-none text-xs font-mono"
+                      disabled={!isAdmin}
+                      aria-label="Ollama endpoint URL"
+                      className="w-full bg-transparent outline-none text-xs font-mono disabled:opacity-60"
                     />
                   </div>
                   <button
                     onClick={handleSaveEndpoint}
-                    disabled={saving}
+                    disabled={saving || !isAdmin}
                     className="px-3 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-all disabled:opacity-50"
                   >
                     Save
                   </button>
                   <button
                     onClick={handleRefresh}
-                    disabled={refreshing}
+                    disabled={refreshing || !isAdmin}
                     title="Refresh Models"
-                    className="p-2 rounded-xl border hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-all flex items-center gap-1 text-xs"
+                    aria-label="Refresh models"
+                    className="p-2 rounded-xl border hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-all flex items-center gap-1 text-xs disabled:opacity-50"
                     style={{ borderColor: 'var(--border)' }}
                   >
                     <RefreshCw
@@ -343,6 +407,9 @@ export function SettingsModal() {
                       <span className="font-mono text-amber-200">{fallbackModel}</span>) with no
                       interruption. Start Ollama and click Refresh to switch back to local inference.
                     </p>
+                    {errorMsg && (
+                      <p className="text-[11px] font-mono break-all opacity-80">{errorMsg}</p>
+                    )}
                   </div>
                 </motion.div>
               )}
@@ -379,7 +446,8 @@ export function SettingsModal() {
                         <select
                           value={selectedModel}
                           onChange={(e) => handleSaveModel(e.target.value)}
-                          disabled={saving}
+                          disabled={saving || !isAdmin}
+                          aria-label="Selected Ollama model"
                           className="w-full appearance-none px-3.5 py-2.5 rounded-xl border bg-[var(--bg-base)] text-xs font-medium cursor-pointer outline-none transition-all focus:border-indigo-500 pr-9"
                           style={{ borderColor: 'var(--border)' }}
                         >
@@ -397,10 +465,13 @@ export function SettingsModal() {
                         {models.map((m) => {
                           const isSelected = selectedModel === m.name;
                           return (
-                            <div
+                            <button
+                              type="button"
                               key={m.name}
                               onClick={() => handleSaveModel(m.name)}
-                              className={`flex items-center justify-between p-3 rounded-xl border cursor-pointer transition-all ${
+                              disabled={saving || !isAdmin}
+                              aria-pressed={isSelected}
+                              className={`w-full text-left flex items-center justify-between p-3 rounded-xl border transition-all enabled:cursor-pointer disabled:cursor-default ${
                                 isSelected
                                   ? 'border-indigo-500/60 bg-indigo-500/10'
                                   : 'hover:border-[var(--border)] hover:bg-[var(--bg-hover)]'
@@ -455,7 +526,7 @@ export function SettingsModal() {
                                   Active
                                 </span>
                               )}
-                            </div>
+                            </button>
                           );
                         })}
                       </div>
@@ -472,12 +543,12 @@ export function SettingsModal() {
                 <div className="space-y-0.5">
                   <p className="text-[11px] font-medium text-[var(--text-muted)]">Active LLM Provider</p>
                   <p className="font-semibold flex items-center gap-1.5">
-                    {connected && selectedModel ? (
+                    {usingOllama ? (
                       <>
                         <Zap className="w-3.5 h-3.5 text-emerald-400" />
                         <span className="text-emerald-400">Ollama Local</span>
                         <span className="text-[var(--text-muted)] font-mono text-[11px]">
-                          ({selectedModel})
+                          ({activeModel || selectedModel})
                         </span>
                       </>
                     ) : (
@@ -485,7 +556,7 @@ export function SettingsModal() {
                         <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
                         <span className="text-indigo-400">Groq Cloud API</span>
                         <span className="text-[var(--text-muted)] font-mono text-[11px]">
-                          ({fallbackModel})
+                          ({activeModel || fallbackModel})
                         </span>
                       </>
                     )}
@@ -494,7 +565,7 @@ export function SettingsModal() {
 
                 <button
                   onClick={handleTestConnection}
-                  disabled={testing}
+                  disabled={testing || !isAdmin}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border transition-all disabled:opacity-50"
                   style={{ borderColor: 'var(--border)' }}
                 >
@@ -541,7 +612,7 @@ export function SettingsModal() {
                       </p>
                       {testResult.response && (
                         <p className="italic bg-black/20 p-2 rounded border border-emerald-500/10 mt-1">
-                          "{testResult.response}"
+                          &ldquo;{testResult.response}&rdquo;
                         </p>
                       )}
                     </div>
@@ -585,7 +656,7 @@ export function SettingsModal() {
               Smart Finder AI • LLM Router
             </span>
             <button
-              onClick={() => setSettingsModalOpen(false)}
+              onClick={close}
               className="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-all shadow-md"
             >
               Done

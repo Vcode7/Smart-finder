@@ -1,0 +1,675 @@
+#!/usr/bin/env bash
+# smartfinder-ctl — install, update and control Smart Finder on Linux.
+# Installed as /usr/bin/smartfinder-ctl (a shim that runs this file from the live code).
+# Run `smartfinder-ctl help` for the commands.
+
+PREFIX=/opt/smartfinder
+APP=$PREFIX/app
+VENV=$PREFIX/venv
+RUNTIME=$PREFIX/runtime
+STATE=$PREFIX/state
+ETC=/etc/smartfinder
+DATA=/var/lib/smartfinder
+CACHE=/var/cache/smartfinder
+LOGDIR=/var/log/smartfinder
+SHARE=/usr/share/smartfinder
+CONF=$ETC/smartfinder.conf
+BACKEND_ENV=$ETC/backend.env
+WORKSPACE_ENV=$ETC/workspace.env
+
+# Pinned runtimes (bump here; `update-code` then installs them on the next run)
+UV_VERSION=0.12.22
+NODE_VERSION=v22.23.3
+PYTHON_VERSION=3.12
+# PaddleOCR is installed without its declared dependencies (see setup.bat / requirements.txt)
+PADDLE_PINS="paddleocr==3.7.0 paddlex==3.7.2"
+
+FORCE=0
+SKIP_MODELS=0
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; N=$'\e[0m'; else B=; G=; R=; Y=; N=; fi
+say()  { echo "${B}==>${N} $*"; }
+ok()   { echo "  ${G}ok${N}  $*"; }
+warn() { echo "  ${Y}!!${N}  $*" >&2; }
+die()  { echo "${R}error:${N} $*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" = "0" ] || die "this command needs root: sudo smartfinder-ctl $*"; }
+
+conf_get() {  # conf_get FILE KEY -> value of the last KEY= line
+    [ -r "$1" ] || return 0
+    sed -n "s/^$2=//p" "$1" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e 's/[[:space:]]*$//'
+}
+conf_set() {  # conf_set FILE KEY VALUE
+    if grep -q "^$2=" "$1" 2>/dev/null; then
+        local tmp; tmp=$(mktemp)
+        awk -v k="$2" -v v="$3" 'BEGIN{FS=OFS="="} $1==k{print k "=" v; next} {print}' "$1" > "$tmp"
+        cat "$tmp" > "$1"; rm -f "$tmp"     # keep the file's owner and mode
+    else
+        printf '%s=%s\n' "$2" "$3" >> "$1"
+    fi
+}
+
+load_conf() {
+    RUN_USER=$(conf_get "$CONF" RUN_USER)
+    FRONTEND_HOST=$(conf_get "$CONF" FRONTEND_HOST); FRONTEND_HOST=${FRONTEND_HOST:-0.0.0.0}
+    FRONTEND_PORT=$(conf_get "$CONF" FRONTEND_PORT); FRONTEND_PORT=${FRONTEND_PORT:-3000}
+    GIT_REPO_URL=$(conf_get "$CONF" GIT_REPO_URL)
+    GIT_BRANCH=$(conf_get "$CONF" GIT_BRANCH); GIT_BRANCH=${GIT_BRANCH:-main}
+    BACKEND_PORT=$(conf_get "$BACKEND_ENV" PORT); BACKEND_PORT=${BACKEND_PORT:-8000}
+}
+
+have_systemd() { [ -d /run/systemd/system ]; }
+
+sha() { sha256sum "$@" 2>/dev/null | awk '{print $1}'; }
+
+# The checkout is owned by root; safe.directory lets RUN_USER read it too (status, version)
+gitapp() { git -c safe.directory="$APP" -C "$APP" "$@"; }
+
+stamp_ok()  { [ "$FORCE" = "0" ] && [ "$(cat "$STATE/$1" 2>/dev/null)" = "$2" ]; }
+stamp_set() { mkdir -p "$STATE"; printf '%s\n' "$2" > "$STATE/$1"; }
+
+as_user() {  # run a command as RUN_USER (or directly when we already are that user)
+    if [ "$(id -un)" = "$RUN_USER" ]; then "$@"
+    elif [ "$(id -u)" = "0" ]; then runuser -u "$RUN_USER" -- "$@"
+    else die "run with sudo (or as $RUN_USER)"; fi
+}
+
+nvidia_libs() {  # CUDA libraries that come with the torch wheel (cuDNN, cuBLAS, ...)
+    local sp
+    sp=$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null) || return 0
+    ls -d "$sp"/nvidia/*/lib 2>/dev/null | tr '\n' ':'
+}
+
+port_valid() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+port_listening() { [ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]; }
+
+download() {  # download URL FILE (resumes; retries)
+    curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 -C - -o "$2" "$1" \
+        || { rm -f "$2"; curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o "$2" "$1"; }
+}
+
+wait_healthy() {  # wait_healthy SECONDS
+    local i
+    for ((i = 0; i < $1; i++)); do
+        curl -fsS -m 2 "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
+svc_active() { have_systemd && systemctl is-active --quiet "smartfinder-$1.service"; }
+
+# ── setup steps (each is skipped when its inputs did not change) ─────────────
+step_code() {
+    if [ -d "$APP/backend" ]; then return 0; fi
+    rm -rf "$APP.tmp"
+    if [ -n "$GIT_REPO_URL" ]; then
+        say "Getting the code from $GIT_REPO_URL ($GIT_BRANCH)"
+        if git clone --quiet --branch "$GIT_BRANCH" "$GIT_REPO_URL" "$APP.tmp"; then
+            mv "$APP.tmp" "$APP"; ok "code at $(gitapp log -1 --format='%h %s')"
+            return 0
+        fi
+        warn "could not clone the repository; using the code shipped in the package"
+    fi
+    cp -a "$SHARE/src" "$APP"
+    ok "code copied from the package (run update-code later to switch to GitHub)"
+}
+
+step_links() {
+    ln -sfn "$BACKEND_ENV" "$APP/backend/.env"
+    ln -sfn "$WORKSPACE_ENV" "$APP/workspace/.env"
+}
+
+step_uv() {
+    [ -x "$RUNTIME/uv/uv" ] && [ "$("$RUNTIME/uv/uv" --version 2>/dev/null | awk '{print $2}')" = "$UV_VERSION" ] && return 0
+    say "Downloading uv $UV_VERSION (Python package installer)"
+    local name=uv-x86_64-unknown-linux-gnu tmp
+    tmp=$(mktemp -d)
+    download "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$name.tar.gz" "$tmp/$name.tar.gz" || return 1
+    download "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$name.tar.gz.sha256" "$tmp/$name.tar.gz.sha256" || return 1
+    (cd "$tmp" && sha256sum -c --status "$name.tar.gz.sha256") || { rm -rf "$tmp"; warn "uv checksum mismatch"; return 1; }
+    rm -rf "$RUNTIME/uv"; mkdir -p "$RUNTIME/uv"
+    tar -xzf "$tmp/$name.tar.gz" -C "$RUNTIME/uv" --strip-components=1 || return 1
+    rm -rf "$tmp"
+    ok "uv $UV_VERSION"
+}
+
+uv() {
+    UV_CACHE_DIR="$CACHE/uv" UV_PYTHON_INSTALL_DIR="$RUNTIME/python" UV_PYTHON_PREFERENCE=only-managed \
+    UV_HTTP_TIMEOUT=600 UV_NO_PROGRESS=1 "$RUNTIME/uv/uv" "$@"
+}
+
+step_python() {
+    local req="$APP/backend/requirements.txt" key
+    key="$(sha "$req") $PADDLE_PINS $PYTHON_VERSION"
+    if [ -x "$VENV/bin/python" ] && stamp_ok python-deps "$key"; then return 0; fi
+    step_uv || return 1
+    if [ ! -x "$VENV/bin/python" ]; then
+        say "Creating the Python $PYTHON_VERSION environment"
+        uv venv --quiet --python "$PYTHON_VERSION" "$VENV" || return 1
+    fi
+    say "Installing Python packages (first time: about 6 GB, includes CUDA torch)"
+    uv pip install --python "$VENV/bin/python" -r "$req" || return 1
+    # shellcheck disable=SC2086
+    uv pip install --python "$VENV/bin/python" --no-deps $PADDLE_PINS || return 1
+    stamp_set python-deps "$key"
+    ok "Python packages"
+}
+
+step_node() {
+    [ -x "$RUNTIME/node/bin/node" ] && [ "$("$RUNTIME/node/bin/node" --version 2>/dev/null)" = "$NODE_VERSION" ] && return 0
+    say "Downloading Node.js $NODE_VERSION"
+    local name="node-$NODE_VERSION-linux-x64" tmp
+    tmp=$(mktemp -d)
+    download "https://nodejs.org/dist/$NODE_VERSION/$name.tar.xz" "$tmp/$name.tar.xz" || return 1
+    download "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt" "$tmp/SHASUMS256.txt" || return 1
+    (cd "$tmp" && grep " $name.tar.xz\$" SHASUMS256.txt | sha256sum -c --status) \
+        || { rm -rf "$tmp"; warn "Node.js checksum mismatch"; return 1; }
+    rm -rf "$RUNTIME/node"; mkdir -p "$RUNTIME/node"
+    tar -xJf "$tmp/$name.tar.xz" -C "$RUNTIME/node" --strip-components=1 || return 1
+    rm -rf "$tmp"
+    ok "Node.js $NODE_VERSION"
+}
+
+npm_env() {
+    PATH="$RUNTIME/node/bin:$PATH" npm_config_cache="$CACHE/npm" npm_config_update_notifier=false \
+    NEXT_TELEMETRY_DISABLED=1 "$@"
+}
+
+step_npm() {
+    local lock="$APP/workspace/package-lock.json" key
+    key="$(sha "$lock" "$APP/workspace/package.json" | tr '\n' ' ')$NODE_VERSION"
+    if [ -d "$APP/workspace/node_modules" ] && stamp_ok node-deps "$key"; then return 0; fi
+    step_node || return 1
+    # npm ci replaces node_modules under the running web app; it starts again after the build
+    svc_active frontend && systemctl stop smartfinder-frontend.service
+    say "Installing web app packages"
+    if [ -f "$lock" ]; then
+        (cd "$APP/workspace" && npm_env npm ci --no-audit --no-fund) \
+            || { warn "npm ci failed; retrying with npm install"; (cd "$APP/workspace" && npm_env npm install --no-audit --no-fund); } \
+            || return 1
+    else
+        (cd "$APP/workspace" && npm_env npm install --no-audit --no-fund) || return 1
+    fi
+    stamp_set node-deps "$key"
+    ok "web app packages"
+}
+
+workspace_hash() {
+    # git's index hashes: unaffected by files the build itself writes (next-env.d.ts, ...)
+    if [ -d "$APP/.git" ]; then
+        gitapp ls-files -s workspace | sha256sum | awk '{print $1}'
+    else
+        (cd "$APP/workspace" && find . \( -path ./node_modules -o -path ./.next -o -name .env -o -name next-env.d.ts \
+            -o -name '*.tsbuildinfo' \) -prune -o -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+    fi
+}
+
+step_build() {
+    local key was_running=0
+    key="$(workspace_hash) backend:$BACKEND_PORT"
+    if [ -f "$APP/workspace/.next/BUILD_ID" ] && stamp_ok frontend-build "$key"; then return 0; fi
+    step_node || return 1
+    if svc_active frontend; then was_running=1; systemctl stop smartfinder-frontend.service; fi
+    say "Building the web app"
+    (cd "$APP/workspace" && npm_env npm run build) || return 1
+    chown -R "$RUN_USER": "$APP/workspace/.next"
+    stamp_set frontend-build "$key"
+    ok "web app built"
+    [ "$was_running" = "1" ] && systemctl start smartfinder-frontend.service
+    return 0
+}
+
+step_configure() {
+    "$VENV/bin/python" "$APP/backend/scripts/configure_env.py" || return 1
+}
+
+step_models() {
+    [ "$SKIP_MODELS" = "1" ] && return 0
+    local script="$APP/backend/scripts/prefetch_models.py" key home
+    key=$(sha "$script")
+    stamp_ok models "$key" && return 0
+    say "Downloading AI models (first time: about 14 GB; already downloaded ones are skipped)"
+    home=$(getent passwd "$RUN_USER" | cut -d: -f6)
+    (cd "$APP/backend" && runuser -u "$RUN_USER" -- env -i HOME="$home" USER="$RUN_USER" \
+        PATH="/usr/local/bin:/usr/bin:/bin" LD_LIBRARY_PATH="$(nvidia_libs)" HF_HUB_DISABLE_XET=1 \
+        PYTHONUNBUFFERED=1 "$VENV/bin/python" "$script") || return 1
+    stamp_set models "$key"
+    ok "AI models"
+}
+
+run_steps() {  # everything after the code is in place
+    # configure before build: the web app reads JWT_SECRET / BACKEND_URL from workspace.env
+    step_links && step_python && step_configure && step_npm && step_build && step_models
+}
+
+require_user() {
+    [ -n "$RUN_USER" ] || die "no account set to run Smart Finder: sudo smartfinder-ctl set-user <user>"
+    id "$RUN_USER" >/dev/null 2>&1 || die "user '$RUN_USER' does not exist: sudo smartfinder-ctl set-user <user>"
+}
+
+start_logging() {  # copy everything this command prints into a log file
+    mkdir -p "$LOGDIR"; chmod 700 "$LOGDIR"
+    echo "---- $(date '+%F %T') smartfinder-ctl $* ----" >> "$LOGDIR/$1.log"
+    chmod 600 "$LOGDIR/$1.log"
+    exec > >(tee -a "$LOGDIR/$1.log") 2>&1
+}
+
+print_urls() {
+    echo
+    echo "  Web app:          http://localhost:$FRONTEND_PORT"
+    if [ "$FRONTEND_HOST" = "0.0.0.0" ]; then
+        local ip
+        for ip in $(hostname -I 2>/dev/null); do
+            [[ "$ip" == *:* ]] || echo "  On your network:  http://$ip:$FRONTEND_PORT"
+        done
+    fi
+    echo "  Sign in as:       $(conf_get "$BACKEND_ENV" ADMIN_EMAIL)"
+    echo
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+cmd_setup() {
+    need_root setup
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) FORCE=1 ;;
+            --skip-models) SKIP_MODELS=1 ;;
+            *) die "unknown option: $1" ;;
+        esac; shift
+    done
+    load_conf; require_user
+    start_logging setup
+    mkdir -p "$PREFIX" "$STATE" "$CACHE" "$DATA/data" "$DATA/models"
+    step_code || die "could not get the code"
+    if ! run_steps; then
+        die "setup did not finish (log: $LOGDIR/setup.log). Fix the problem and run 'sudo smartfinder-ctl setup' again; finished parts are skipped."
+    fi
+    touch "$STATE/setup-complete"
+    if have_systemd; then
+        systemctl daemon-reload
+        systemctl enable --quiet smartfinder.target smartfinder-backend.service smartfinder-frontend.service
+        systemctl restart smartfinder-backend.service smartfinder-frontend.service
+        say "Starting Smart Finder"
+        if wait_healthy 120; then ok "backend is up"; else warn "backend not answering yet: smartfinder-ctl logs backend"; fi
+    else
+        warn "systemd is not running; start the services yourself"
+    fi
+    say "Smart Finder is installed"
+    print_urls
+    [ "$SKIP_MODELS" = "1" ] && warn "models were skipped: sudo smartfinder-ctl models"
+    return 0
+}
+
+changed_areas() {  # changed_areas OLD NEW -> one line per area touched
+    local files
+    if [ -n "$1" ]; then files=$(gitapp diff --name-only "$1" "$2"); else files=$(gitapp ls-tree -r --name-only "$2"); fi
+    grep -q '^backend/requirements.txt$' <<<"$files" && echo "Python packages (requirements.txt)"
+    grep -q '^backend/scripts/prefetch_models.py$' <<<"$files" && echo "AI models (prefetch_models.py)"
+    grep -q '^backend/' <<<"$files" && echo "backend code -> backend restart"
+    grep -q '^workspace/package' <<<"$files" && echo "web app packages"
+    grep -q '^workspace/' <<<"$files" && echo "web app code -> rebuild (~1 min)"
+    grep -q '^packaging/linux/smartfinder-ctl$' <<<"$files" && echo "smartfinder-ctl itself"
+    grep -qE '^packaging/linux/.*\.(service|target)$|^packaging/linux/(postinst|prerm|postrm)$' <<<"$files" \
+        && echo "service files -> these need a new .deb (python packaging/build_deb.py)"
+    return 0
+}
+
+cmd_update_code() {
+    need_root update-code
+    local check=0 branch=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --check) check=1 ;;
+            --branch) branch=$2; shift ;;
+            --skip-models) SKIP_MODELS=1 ;;
+            *) die "unknown option: $1" ;;
+        esac; shift
+    done
+    load_conf; require_user
+    [ -n "$branch" ] || branch=$GIT_BRANCH
+    [ -n "$GIT_REPO_URL" ] || die "no repository set: sudo smartfinder-ctl set-repo <url> [branch]"
+    [ -d "$APP/backend" ] || die "Smart Finder is not set up yet: sudo smartfinder-ctl setup"
+    [ "$check" = "1" ] || start_logging update
+
+    if [ ! -d "$APP/.git" ]; then
+        gitapp init --quiet && gitapp remote add origin "$GIT_REPO_URL"
+    fi
+    gitapp remote set-url origin "$GIT_REPO_URL"
+    say "Fetching $GIT_REPO_URL ($branch)"
+    gitapp fetch --quiet origin "$branch" || die "could not fetch branch '$branch'"
+    local old new
+    old=$(gitapp rev-parse -q --verify HEAD 2>/dev/null || true)
+    new=$(gitapp rev-parse FETCH_HEAD)
+
+    if [ "$old" = "$new" ]; then ok "already up to date ($(gitapp log -1 --format='%h %s'))"; return 0; fi
+    if [ "$check" = "1" ]; then
+        if [ -n "$old" ]; then
+            echo "Incoming commits:"; gitapp log --oneline "$old..$new" | sed 's/^/  /'
+        else
+            echo "The current code was copied from the package; updating switches it to $branch at $(gitapp log -1 --format='%h %s' "$new")."
+        fi
+        echo "What would be updated:"; changed_areas "$old" "$new" | sed 's/^/  /'
+        return 0
+    fi
+
+    echo "$old" > "$STATE/previous-commit"
+    gitapp reset --quiet --hard "$new" && gitapp clean -fdq || die "could not update the files"
+    [ "$branch" != "$GIT_BRANCH" ] && conf_set "$CONF" GIT_BRANCH "$branch"
+    ok "code now at $(gitapp log -1 --format='%h %s')"
+    # Continue with the new version of this script: it may know new steps
+    local ctl="$APP/packaging/linux/smartfinder-ctl"
+    [ -f "$ctl" ] || ctl="$SHARE/src/packaging/linux/smartfinder-ctl"
+    local skip=""; [ "$SKIP_MODELS" = "1" ] && skip="--skip-models"
+    exec bash "$ctl" _apply-update "$old" "$new" $skip
+}
+
+restart_changed() {  # restart_changed OLD NEW
+    have_systemd && [ -f "$STATE/setup-complete" ] || return 0
+    local files
+    if [ -n "$1" ]; then files=$(gitapp diff --name-only "$1" "$2"); else files="backend/ workspace/"; fi
+    if grep -q '^backend/' <<<"$files" || [ "${RESTART_BACKEND:-0}" = "1" ]; then
+        say "Restarting the backend"; systemctl restart smartfinder-backend.service
+    fi
+    if ! svc_active frontend; then systemctl start smartfinder-frontend.service; fi
+}
+
+cmd_apply_update() {  # internal: runs from the updated script after update-code
+    need_root
+    local old=$1 new=$2; shift 2
+    [ "${1:-}" = "--skip-models" ] && SKIP_MODELS=1
+    load_conf
+    if run_steps; then
+        restart_changed "$old" "$new"
+        if wait_healthy 120; then
+            say "Updated to $(gitapp log -1 --format='%h %s')"
+            return 0
+        fi
+        warn "the backend did not come back after the update"
+    else
+        warn "the update failed"
+    fi
+    if [ -z "$old" ]; then
+        die "no previous version to go back to (the old code came from the package). Fix the repository and run update-code again."
+    fi
+    say "Rolling back to $(gitapp log -1 --format='%h %s' "$old")"
+    rollback_to "$old" "$new"
+    die "update failed and was rolled back (log: $LOGDIR/update.log)"
+}
+
+rollback_to() {  # rollback_to COMMIT FROM
+    gitapp reset --quiet --hard "$1" && gitapp clean -fdq || die "git reset failed"
+    echo "$2" > "$STATE/previous-commit"
+    SKIP_MODELS=1
+    run_steps || die "could not rebuild the previous version; see the log"
+    RESTART_BACKEND=1 restart_changed "" "$1"
+    wait_healthy 120 && ok "running $(gitapp log -1 --format='%h %s')"
+    return 0
+}
+
+cmd_rollback() {
+    need_root rollback
+    load_conf
+    [ -d "$APP/.git" ] || die "the code is not a git checkout; nothing to roll back"
+    local prev cur
+    prev=$(cat "$STATE/previous-commit" 2>/dev/null)
+    [ -n "$prev" ] || die "no previous version recorded"
+    cur=$(gitapp rev-parse HEAD)
+    start_logging update
+    say "Rolling back to $(gitapp log -1 --format='%h %s' "$prev")"
+    rollback_to "$prev" "$cur"
+    echo "Run 'sudo smartfinder-ctl rollback' again to return to the newer version."
+}
+
+cmd_status() {
+    load_conf
+    echo "${B}Smart Finder${N}  package $(dpkg-query -W -f='${Version}' smartfinder 2>/dev/null || echo '?')   runs as ${RUN_USER:-<not set>}"
+    if [ ! -f "$STATE/setup-complete" ]; then warn "not set up yet: sudo smartfinder-ctl setup"; fi
+    local svc port state since
+    for svc in backend frontend; do
+        [ "$svc" = backend ] && port=$BACKEND_PORT || port=$FRONTEND_PORT
+        state=$(systemctl is-active "smartfinder-$svc.service" 2>/dev/null)
+        since=$(systemctl show -p ActiveEnterTimestamp --value "smartfinder-$svc.service" 2>/dev/null)
+        if [ "$state" = "active" ]; then state="${G}running${N} since $since"; else state="${R}${state:-stopped}${N}"; fi
+        if port_listening "$port"; then port="$port (listening)"; else port="$port (${R}not listening${N})"; fi
+        printf '  %-9s %s, port %s\n' "$svc" "$state" "$port"
+    done
+    local health
+    if health=$(curl -fsS -m 3 "http://127.0.0.1:$BACKEND_PORT/health" 2>/dev/null); then
+        echo "  health    ${G}ok${N}  $health"
+    else
+        echo "  health    ${R}no answer${N} from http://127.0.0.1:$BACKEND_PORT/health"
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null \
+            | sed 's/^/  gpu       /'
+    else
+        echo "  gpu       none found (runs on the CPU, slowly)"
+    fi
+    if [ -d "$APP/.git" ]; then
+        local behind
+        behind=$(gitapp rev-list --count "HEAD..origin/$GIT_BRANCH" 2>/dev/null || echo 0)
+        echo "  code      $(gitapp log -1 --format='%h %cd %s' --date=short) ($GIT_BRANCH)"
+        [ "${behind:-0}" -gt 0 ] && echo "            ${Y}$behind newer commit(s) fetched${N}: sudo smartfinder-ctl update-code"
+    elif [ -d "$APP" ]; then
+        echo "  code      copied from the package (sudo smartfinder-ctl update-code switches to $GIT_REPO_URL)"
+    fi
+    echo "  disk      models $(du -sh "$DATA/models" 2>/dev/null | cut -f1), data $(du -sh "$DATA/data" 2>/dev/null | cut -f1)"
+    if [ -x "$VENV/bin/python" ] && { [ "$(id -u)" = 0 ] || [ "$(id -un)" = "$RUN_USER" ]; }; then
+        echo "  files     $(as_user "$VENV/bin/python" "$APP/backend/scripts/index_stats.py" --summary 2>/dev/null)"
+    fi
+    if [ "$(systemctl is-active smartfinder-frontend.service 2>/dev/null)" = "active" ]; then print_urls; fi
+}
+
+cmd_files() {
+    load_conf; require_user
+    [ -x "$VENV/bin/python" ] || die "Smart Finder is not set up yet: sudo smartfinder-ctl setup"
+    as_user "$VENV/bin/python" "$APP/backend/scripts/index_stats.py" "$@"
+}
+
+services_for() {
+    case "${1:-all}" in
+        all) echo "smartfinder-backend.service smartfinder-frontend.service" ;;
+        backend|frontend) echo "smartfinder-$1.service" ;;
+        *) die "unknown service '$1' (backend, frontend or all)" ;;
+    esac
+}
+
+cmd_service() {  # start|stop|restart [backend|frontend|all]
+    local action=$1; shift
+    need_root "$action"
+    have_systemd || die "systemd is not running"
+    [ "$action" = "stop" ] || [ -f "$STATE/setup-complete" ] || die "not set up yet: sudo smartfinder-ctl setup"
+    # shellcheck disable=SC2046
+    systemctl "$action" $(services_for "${1:-all}") || die "systemctl $action failed: smartfinder-ctl logs"
+    ok "$action ${1:-all}"
+    if [ "$action" != "stop" ] && [ "${1:-all}" != "frontend" ]; then
+        load_conf
+        if wait_healthy 60; then ok "backend is up"; else warn "backend not answering yet: smartfinder-ctl logs backend"; fi
+    fi
+}
+
+cmd_logs() {
+    local units=() follow=()
+    for a in "$@"; do
+        case "$a" in
+            -f|--follow) follow=(-f) ;;
+            backend|frontend) units+=(-u "smartfinder-$a.service") ;;
+            *) die "usage: smartfinder-ctl logs [backend|frontend] [-f]" ;;
+        esac
+    done
+    [ ${#units[@]} -gt 0 ] || units=(-u smartfinder-backend.service -u smartfinder-frontend.service)
+    journalctl "${units[@]}" -n 200 --no-pager "${follow[@]}"
+}
+
+cmd_port() {
+    load_conf
+    echo "frontend (web app):  $FRONTEND_HOST:$FRONTEND_PORT"
+    echo "backend (local API): 127.0.0.1:$BACKEND_PORT"
+}
+
+cmd_set_port() {
+    need_root set-port
+    local which=$1 port=$2
+    port_valid "$port" || die "usage: smartfinder-ctl set-port frontend|backend <1-65535>"
+    load_conf
+    case "$which" in
+        frontend)
+            [ "$port" = "$FRONTEND_PORT" ] && { ok "already $port"; return 0; }
+            port_listening "$port" && die "port $port is already in use"
+            conf_set "$CONF" FRONTEND_PORT "$port"
+            local cors; cors="http://localhost:$port,http://127.0.0.1:$port"
+            conf_set "$BACKEND_ENV" CORS_ORIGINS "$cors"
+            FRONTEND_PORT=$port
+            if svc_active frontend; then systemctl restart smartfinder-frontend.service smartfinder-backend.service; fi
+            ok "web app port is now $port"
+            ;;
+        backend)
+            [ "$port" = "$BACKEND_PORT" ] && { ok "already $port"; return 0; }
+            port_listening "$port" && die "port $port is already in use"
+            require_user
+            conf_set "$BACKEND_ENV" PORT "$port"
+            conf_set "$WORKSPACE_ENV" BACKEND_URL "http://127.0.0.1:$port"
+            BACKEND_PORT=$port
+            # The web app's /api forwarding address is fixed when it is built
+            step_build || die "web app rebuild failed"
+            if have_systemd && [ -f "$STATE/setup-complete" ]; then
+                systemctl restart smartfinder-backend.service smartfinder-frontend.service
+                wait_healthy 60 && ok "backend is up on $port"
+            fi
+            ok "backend port is now $port"
+            ;;
+        *) die "usage: smartfinder-ctl set-port frontend|backend <port>" ;;
+    esac
+    print_urls
+}
+
+cmd_set_user() {
+    need_root set-user
+    local user=$1
+    [ -n "$user" ] || die "usage: smartfinder-ctl set-user <user>"
+    id "$user" >/dev/null 2>&1 || die "user '$user' does not exist"
+    local group; group=$(id -gn "$user")
+    conf_set "$CONF" RUN_USER "$user"
+    chown root:"$group" "$CONF" "$BACKEND_ENV" "$WORKSPACE_ENV"; chmod 640 "$CONF" "$BACKEND_ENV" "$WORKSPACE_ENV"
+    say "Giving $user the Smart Finder data folder (this can take a while for large uploads)"
+    chown -R "$user":"$group" "$DATA"
+    [ -d "$APP/workspace/.next" ] && chown -R "$user":"$group" "$APP/workspace/.next"
+    local svc
+    for svc in backend frontend; do
+        mkdir -p "/etc/systemd/system/smartfinder-$svc.service.d"
+        printf '[Service]\nUser=%s\nGroup=%s\n' "$user" "$group" > "/etc/systemd/system/smartfinder-$svc.service.d/user.conf"
+    done
+    if have_systemd; then
+        systemctl daemon-reload
+        systemctl try-restart smartfinder-backend.service smartfinder-frontend.service
+    fi
+    ok "Smart Finder runs as $user"
+    [ -f "$STATE/setup-complete" ] || echo "Next: sudo smartfinder-ctl setup"
+    warn "models already downloaded for the previous user's face/OCR caches (~/.insightface, ~/.paddlex) download again: sudo smartfinder-ctl models"
+}
+
+cmd_set_repo() {
+    need_root set-repo
+    [ -n "$1" ] || die "usage: smartfinder-ctl set-repo <git url> [branch]"
+    conf_set "$CONF" GIT_REPO_URL "$1"
+    [ -n "$2" ] && conf_set "$CONF" GIT_BRANCH "$2"
+    [ -d "$APP/.git" ] && gitapp remote set-url origin "$1"
+    ok "code source: $1 (${2:-$(conf_get "$CONF" GIT_BRANCH)}). Apply with: sudo smartfinder-ctl update-code"
+}
+
+cmd_models() {
+    need_root models
+    load_conf; require_user
+    [ -x "$VENV/bin/python" ] || die "Smart Finder is not set up yet: sudo smartfinder-ctl setup"
+    FORCE=1 step_models || die "some models could not be downloaded; run this again when online"
+}
+
+cmd_config() {
+    need_root config
+    local before; before=$(sha "$BACKEND_ENV")
+    "${EDITOR:-nano}" "$BACKEND_ENV"
+    if [ "$(sha "$BACKEND_ENV")" != "$before" ] && svc_active backend; then
+        read -r -p "Restart the backend to apply the changes? [Y/n] " a
+        [[ "$a" =~ ^[Nn] ]] || cmd_service restart backend
+    fi
+}
+
+cmd_version() {
+    load_conf
+    echo "package  $(dpkg-query -W -f='${Version}' smartfinder 2>/dev/null || echo '?')"
+    if [ -d "$APP/.git" ]; then echo "code     $(gitapp log -1 --format='%h %cd %s' --date=short)"; fi
+    [ -x "$RUNTIME/node/bin/node" ] && echo "node     $("$RUNTIME/node/bin/node" --version)"
+    [ -x "$VENV/bin/python" ] && echo "python   $("$VENV/bin/python" --version 2>&1 | awk '{print $2}')"
+}
+
+cmd_run_backend() {  # internal: systemd ExecStart
+    load_conf
+    export LD_LIBRARY_PATH="$(nvidia_libs)${LD_LIBRARY_PATH:-}"
+    export HF_HUB_DISABLE_XET=1 PYTHONUNBUFFERED=1
+    cd "$APP/backend" || exit 1
+    exec "$VENV/bin/python" run.py
+}
+
+cmd_run_frontend() {  # internal: systemd ExecStart
+    load_conf
+    export NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
+    cd "$APP/workspace" || exit 1
+    exec "$RUNTIME/node/bin/node" node_modules/next/dist/bin/next start -H "$FRONTEND_HOST" -p "$FRONTEND_PORT"
+}
+
+usage() {
+    cat <<EOF
+Usage: smartfinder-ctl <command>
+
+Setup and updates
+  setup [--skip-models] [--force]   download everything, build and start (re-run any time;
+                                    finished parts are skipped)
+  update-code [--check] [--branch B] pull the latest code from GitHub; rebuilds only what
+                                    changed and rolls back by itself if it fails
+  rollback                          go back to the code before the last update
+  set-repo <url> [branch]           change where the code comes from
+  models                            download the AI models again
+
+Running
+  status                            services, ports, health, GPU, code version, file count
+  start|stop|restart [backend|frontend|all]
+  logs [backend|frontend] [-f]
+  files [--json]                    indexed files per library
+
+Settings
+  port                              show the ports
+  set-port frontend|backend <port>
+  set-user <user>                   account the services run as
+  config                            edit backend settings (API keys, models, OCR)
+  version
+EOF
+}
+
+main() {
+    local cmd=${1:-help}; [ $# -gt 0 ] && shift
+    case "$cmd" in
+        setup)          cmd_setup "$@" ;;
+        update-code)    cmd_update_code "$@" ;;
+        rollback)       cmd_rollback ;;
+        set-repo)       cmd_set_repo "$@" ;;
+        models)         cmd_models ;;
+        status)         cmd_status ;;
+        start|stop|restart) cmd_service "$cmd" "$@" ;;
+        logs)           cmd_logs "$@" ;;
+        files|index)    cmd_files "$@" ;;
+        port|ports)     cmd_port ;;
+        set-port)       cmd_set_port "$@" ;;
+        set-user)       cmd_set_user "$@" ;;
+        config)         cmd_config ;;
+        version|--version) cmd_version ;;
+        _apply-update)  cmd_apply_update "$@" ;;
+        _run-backend)   cmd_run_backend ;;
+        _run-frontend)  cmd_run_frontend ;;
+        help|-h|--help) usage ;;
+        *) usage; exit 1 ;;
+    esac
+}
+
+main "$@"

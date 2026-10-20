@@ -6,7 +6,7 @@ import ReactMarkdown from 'react-markdown';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Brain, ChevronDown, ChevronRight, Copy, Check, Terminal,
-  ExternalLink, Sparkles
+  ExternalLink
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -67,22 +67,22 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
           borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
         }}
       >
-        <div className="flex items-center gap-2 text-zinc-400 font-mono text-[11px]">
-          <Terminal className="w-3.5 h-3.5 text-indigo-400" />
-          <span className="uppercase tracking-wider font-semibold text-zinc-300">
+        <div className="flex items-center gap-2 text-slate-400 font-mono text-[11px]">
+          <Terminal className="w-3.5 h-3.5 text-[#818cf8]" />
+          <span className="uppercase tracking-wider font-semibold text-slate-300">
             {language || 'text'}
           </span>
         </div>
 
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all hover:bg-white/10 text-zinc-300"
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all hover:bg-white/10 text-slate-300"
           title="Copy code"
         >
           {copied ? (
             <>
-              <Check className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="text-emerald-400">Copied!</span>
+              <Check className="w-3.5 h-3.5 text-[#34d399]" />
+              <span className="text-[#34d399]">Copied!</span>
             </>
           ) : (
             <>
@@ -94,7 +94,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
       </div>
 
       {/* Code Content */}
-      <pre className="p-4 overflow-x-auto text-xs font-mono leading-relaxed text-zinc-200 selection:bg-indigo-500/30">
+      <pre className="p-4 overflow-x-auto text-xs font-mono leading-relaxed text-slate-200 selection:bg-indigo-500/30">
         <code>{code}</code>
       </pre>
     </div>
@@ -183,6 +183,8 @@ export function MarkdownMessage({ content, isStreaming }: MarkdownMessageProps) 
           <ReactMarkdown
             components={{
               // Custom code block renderer
+              // `node` is taken out so it isn't spread onto the DOM element
+              // eslint-disable-next-line @typescript-eslint/no-unused-vars
               code({ node, className, children, ...props }) {
                 const match = /language-(\w+)/.exec(className || '');
                 const isInline = !match && !String(children).includes('\n');

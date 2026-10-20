@@ -68,7 +68,7 @@ export function TopBar({ session }: TopBarProps) {
               </span>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded-full flex items-center gap-1" style={{ background: 'rgba(16, 185, 129, 0.12)', color: '#10b981' }}>
                 <Zap className="w-2.5 h-2.5" />
-                Groq Qwen 3.6 27B
+                LLM (Ollama / Groq)
               </span>
             </div>
           </div>

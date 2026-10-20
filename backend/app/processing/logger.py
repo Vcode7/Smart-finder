@@ -84,6 +84,17 @@ class IngestionTracker:
         if dir_name not in self.storage_info["file_directories"]:
             self.storage_info["file_directories"].append(dir_name)
 
+    MAX_STORED_LOGS = 200
+
+    def _capped_logs(self) -> List[Dict[str, str]]:
+        """Keep the head and tail of long logs (a 2,000-page PDF logs every page)."""
+        if len(self.logs) <= self.MAX_STORED_LOGS:
+            return self.logs
+        head, tail = 40, self.MAX_STORED_LOGS - 40
+        skipped = len(self.logs) - head - tail
+        marker = {"timestamp": "", "prefix": "[Storage]", "message": f"... {skipped} log entries omitted ..."}
+        return self.logs[:head] + [marker] + self.logs[-tail:]
+
     def to_dict(self, status: str = "completed", error: Optional[str] = None) -> Dict[str, Any]:
         elapsed = round(time.time() - self.start_time, 2)
         return {
@@ -98,7 +109,7 @@ class IngestionTracker:
             "models_used": self.models_used,
             "counts": self.counts,
             "storage_info": self.storage_info,
-            "logs": self.logs,
+            "logs": self._capped_logs(),
         }
 
     def save_to_db(self, status: str = "completed", error: Optional[str] = None) -> Dict[str, Any]:

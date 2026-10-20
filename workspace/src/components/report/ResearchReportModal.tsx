@@ -3,13 +3,9 @@
 // Structured Research Report Builder with live preview, Markdown copy, and Printable PDF Export
 
 import { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import {
-  FileText, Download, Copy, Check, Printer, X, Sparkles,
-  BookOpen, ExternalLink, ShieldCheck, Calendar, Share2
-} from 'lucide-react';
+import { motion } from 'framer-motion';
+import { Download, Copy, Check, Printer, X, Sparkles, BookOpen, ExternalLink, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
-import MarkdownMessage from '@/components/chat/MarkdownMessage';
 import type { ResearchReport } from '@/types/research';
 
 interface Props {
@@ -20,7 +16,6 @@ interface Props {
 }
 
 export default function ResearchReportModal({ report, isOpen, onClose, onOpenSource }: Props) {
-  const [activeTab, setActiveTab] = useState<'structured' | 'markdown'>('structured');
   const [copied, setCopied] = useState(false);
 
   if (!isOpen || !report) return null;

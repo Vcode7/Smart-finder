@@ -1,8 +1,14 @@
+import asyncio
 import datetime
 import json
 from typing import Any, Dict, List, Optional, AsyncGenerator
 from app.core.config import settings
-from app.ai.groq_client import get_groq_client, execute_groq_request
+from app.ai.groq_client import get_async_groq_client, execute_groq_request
+
+
+async def _structured(**kwargs) -> Dict[str, Any]:
+    """Run a blocking structured LLM request without stalling the event loop."""
+    return await asyncio.to_thread(execute_groq_request, **kwargs)
 from app.ai.prompts import (
     STRICT_JSON_SYSTEM_PROMPT,
     SUMMARY_TEMPLATE,
@@ -76,7 +82,7 @@ async def summarize_source(source: Dict[str, Any]) -> Dict[str, Any]:
         iso_now=iso_now(),
         context=context
     )
-    return execute_groq_request(
+    return await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=prompt,
         max_tokens=1000,
@@ -102,7 +108,7 @@ Return ONLY a JSON object in this format:
 Source:
 {context}"""
 
-    return execute_groq_request(
+    return await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         max_tokens=800,
@@ -115,7 +121,7 @@ async def chat_with_source(
     history: List[Dict[str, Any]]
 ) -> AsyncGenerator[str, None]:
     context = build_source_context(source, 2500)
-    client = get_groq_client()
+    client = get_async_groq_client()
 
     messages = [
         {
@@ -132,14 +138,13 @@ async def chat_with_source(
 
     messages.append({"role": "user", "content": message})
 
-    stream = client.chat.completions.create(
-        model=settings.GROQ_MODEL,
+    stream = await client.chat.completions.create(
         messages=messages,
         stream=True,
         max_tokens=1000,
     )
 
-    for chunk in stream:
+    async for chunk in stream:
         delta = chunk.choices[0].delta.content or ""
         if delta:
             yield delta
@@ -156,7 +161,7 @@ async def compare_sources(
         iso_now=iso_now(),
         contexts=contexts
     )
-    res = execute_groq_request(
+    res = await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=prompt,
         max_tokens=2500,
@@ -178,7 +183,7 @@ async def generate_overall_brief(
         iso_now=iso_now(),
         contexts=contexts
     )
-    return execute_groq_request(
+    return await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=prompt,
         max_tokens=2200,
@@ -198,7 +203,7 @@ async def extract_entities(
         first_source_id=first_id,
         contexts=contexts
     )
-    res = execute_groq_request(
+    res = await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=prompt,
         max_tokens=1200,
@@ -223,7 +228,7 @@ async def generate_timeline(
         first_source_id=first_id,
         contexts=contexts
     )
-    res = execute_groq_request(
+    res = await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=prompt,
         max_tokens=3000,
@@ -245,7 +250,7 @@ async def generate_research_report(
         iso_now=iso_now(),
         contexts=contexts
     )
-    res = execute_groq_request(
+    res = await _structured(
         system_prompt=STRICT_JSON_SYSTEM_PROMPT,
         user_prompt=prompt,
         max_tokens=3000,

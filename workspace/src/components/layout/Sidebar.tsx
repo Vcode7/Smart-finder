@@ -1,479 +1,411 @@
 'use client';
-// src/components/layout/Sidebar.tsx — Persistent sidebar with chat history, admin controls
+// src/components/layout/Sidebar.tsx — app navigation, chat history, theme, settings and account.
+// Desktop: a column that collapses to icons (remembered across pages). Phones: a top bar
+// with a menu button that opens the same content as a drawer.
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useSyncExternalStore } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
-import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Sparkles, Plus, MessageSquare, Clock, Trash2,
-  Pencil, Check, X, Upload, LogOut, User, Shield,
-  PanelLeftClose, PanelLeftOpen, Globe, Database, Layers, Search,
-  Sun, Moon, Settings
+  Sparkles, Plus, MessageSquare, Trash2, Pencil, Check, X, LogOut, User, Shield,
+  PanelLeftClose, PanelLeftOpen, Globe, Database, Layers, Search, Sun, Moon, Settings,
+  Library, Users, Menu, FolderCog,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth';
-import { useChatStore } from '@/store/chat';
+import { useChatStore, type ChatSummary } from '@/store/chat';
 import { useUIStore } from '@/store/ui';
 import { SettingsModal } from '@/components/modals/SettingsModal';
 import { toast } from 'sonner';
-
 import { formatDistanceToNow } from '@/lib/utils/date';
 
-export function Sidebar({ sessionId }: { sessionId?: string } = {}) {
-  const [collapsed, setCollapsed] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editTitle, setEditTitle] = useState('');
+const DESKTOP_QUERY = '(min-width: 768px)';
+
+function useIsDesktop(): boolean {
+  return useSyncExternalStore(
+    (onChange) => {
+      const mq = window.matchMedia(DESKTOP_QUERY);
+      mq.addEventListener('change', onChange);
+      return () => mq.removeEventListener('change', onChange);
+    },
+    () => window.matchMedia(DESKTOP_QUERY).matches,
+    () => true,
+  );
+}
+
+/** Chats bucketed by their last activity, newest bucket first. */
+function groupChats(chats: ChatSummary[]): { label: string; items: ChatSummary[] }[] {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const DAY = 86_400_000;
+  const groups = [
+    { label: 'Today', from: today.getTime(), items: [] as ChatSummary[] },
+    { label: 'Yesterday', from: today.getTime() - DAY, items: [] as ChatSummary[] },
+    { label: 'Previous 7 days', from: today.getTime() - 7 * DAY, items: [] as ChatSummary[] },
+    { label: 'Older', from: -Infinity, items: [] as ChatSummary[] },
+  ];
+  for (const chat of chats) {
+    const t = new Date(chat.updatedAt).getTime();
+    (groups.find((g) => t >= g.from) || groups[3]).items.push(chat);
+  }
+  return groups.filter((g) => g.items.length > 0);
+}
+
+const MODE_ICON = {
+  local: { icon: Database, color: 'var(--accent)', label: 'Local sources' },
+  internet: { icon: Globe, color: 'var(--accent-emerald)', label: 'Internet sources' },
+  both: { icon: Layers, color: 'var(--accent-ai)', label: 'Local and internet sources' },
+} as const;
+
+export function Sidebar() {
   const router = useRouter();
   const pathname = usePathname();
+  const isDesktop = useIsDesktop();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
 
   const { user, logout } = useAuthStore();
-  const { theme, setTheme, setSettingsModalOpen } = useUIStore();
-  const { chats, activeChatId, setActiveChatId, setMessages, setChats, updateChatTitle, removeChat, setLoading, setActiveContext, clearContext } = useChatStore();
-
+  const { theme, setTheme, setSettingsModalOpen, sidebarOpen, toggleSidebar } = useUIStore();
+  const {
+    chats, activeChatId, setActiveChatId, updateChatTitle, removeChat, refreshChats, startNewChat,
+  } = useChatStore();
 
   const isAdmin = user?.role === 'admin';
-
-  const loadChats = useCallback(async () => {
-    try {
-      const res = await fetch('/api/chats');
-      if (res.ok) {
-        const data = await res.json();
-        setChats(data.chats || []);
-      }
-    } catch {
-      // silent
-    }
-  }, [setChats]);
+  // Icon-only mode exists on desktop; the phone drawer always shows labels
+  const collapsed = isDesktop && !sidebarOpen;
 
   useEffect(() => {
-    loadChats();
-  }, [loadChats]);
+    refreshChats();
+  }, [refreshChats]);
 
-  const handleNewChat = async () => {
-    try {
-      const res = await fetch('/api/chats', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'New Chat' }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setActiveChatId(data.chat.id);
-        setMessages([]);
-        clearContext();
-        setChats([data.chat, ...chats]);
-        router.push('/');
-      }
-    } catch {
-      toast.error('Failed to create new chat');
-    }
+  // Escape closes the phone drawer
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMobileOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mobileOpen]);
+
+  const go = (path: string) => {
+    setMobileOpen(false);
+    if (pathname !== path) router.push(path);
   };
 
-  const handleChatClick = async (chatId: string) => {
-    if (chatId === activeChatId) return;
-    setLoading(true);
-    try {
-      const res = await fetch(`/api/chats/${chatId}`);
-      if (res.ok) {
-        const data = await res.json();
-        setActiveChatId(chatId);
-        if (data.contextItems && Array.isArray(data.contextItems)) {
-          setActiveContext(data.contextItems);
-        } else {
-          clearContext();
-        }
-        setMessages(data.messages.map((m: { id: string; role: 'user' | 'assistant'; content: string; citations_json: string; created_at: string }) => ({
-          id: m.id,
-          role: m.role,
-          content: m.content,
-          citations: JSON.parse(m.citations_json || '[]'),
-          createdAt: m.created_at,
-        })));
-        router.push('/');
-      }
-    } catch {
-      toast.error('Failed to load chat');
-    } finally {
-      setLoading(false);
-    }
+  const handleNewChat = () => {
+    startNewChat();
+    go('/');
   };
 
-  const handleDelete = async (chatId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  // ChatInterface loads the messages and saved sources of the active chat
+  const openChat = (chatId: string) => {
+    if (chatId !== activeChatId) setActiveChatId(chatId);
+    go('/');
+  };
+
+  const handleDelete = async (chat: ChatSummary) => {
+    if (!window.confirm(`Delete “${chat.title}”? Its messages and sources are removed for good.`)) return;
     try {
-      const res = await fetch(`/api/chats/${chatId}`, { method: 'DELETE' });
-      if (res.ok) {
-        removeChat(chatId);
-        toast.success('Chat deleted');
-      }
+      const res = await fetch(`/api/chats/${chat.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error();
+      removeChat(chat.id);
+      toast.success('Chat deleted');
     } catch {
       toast.error('Failed to delete chat');
     }
   };
 
   const handleRename = async (chatId: string) => {
-    if (!editTitle.trim()) { setEditingId(null); return; }
+    const title = editTitle.trim();
+    if (!title) { setEditingId(null); return; }
     try {
-      await fetch(`/api/chats/${chatId}`, {
+      const res = await fetch(`/api/chats/${chatId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: editTitle.trim() }),
+        body: JSON.stringify({ title }),
       });
-      updateChatTitle(chatId, editTitle.trim());
+      if (!res.ok) throw new Error();
+      updateChatTitle(chatId, title);
       setEditingId(null);
-      toast.success('Chat renamed');
     } catch {
       toast.error('Failed to rename chat');
     }
   };
 
-  const startEdit = (chatId: string, currentTitle: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setEditingId(chatId);
-    setEditTitle(currentTitle);
-  };
+  const nav = [
+    { path: '/', label: 'Chat', icon: MessageSquare },
+    { path: '/search', label: 'Smart Finder', icon: Search },
+    { path: '/knowledge', label: 'Knowledge Base', icon: Database },
+    { path: '/libraries', label: 'Libraries & Uploads', icon: Library },
+    { path: '/people', label: 'People', icon: Users },
+    ...(isAdmin ? [{ path: '/admin', label: 'Repository', icon: FolderCog }] : []),
+  ];
 
   return (
-    <motion.aside
-      initial={false}
-      animate={{ width: collapsed ? 64 : 280 }}
-      transition={{ type: 'spring', bounce: 0.1, duration: 0.4 }}
-      className="flex-shrink-0 h-screen flex flex-col relative z-30 overflow-hidden"
-      style={{
-        background: 'var(--bg-elevated)',
-        borderRight: '1px solid var(--border)',
-      }}
-    >
-      {/* ─── Header ─────────────────────────────────────────────── */}
-      <div className="flex items-center gap-3 px-4 py-4 flex-shrink-0"
-        style={{ borderBottom: '1px solid var(--border)' }}>
-        <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 shadow-md"
-          style={{ background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)', boxShadow: '0 0 16px rgba(99,102,241,0.3)' }}>
-          <Sparkles className="w-4 h-4 text-white" />
+    <>
+      {/* Phone top bar */}
+      <div
+        className="md:hidden flex items-center gap-2 h-12 px-2 flex-shrink-0"
+        style={{ background: 'var(--bg-elevated)', borderBottom: '1px solid var(--border)' }}
+      >
+        <button onClick={() => setMobileOpen(true)} aria-label="Open menu" aria-expanded={mobileOpen}
+          className="p-2 rounded-lg hover:bg-[var(--bg-hover)]" style={{ color: 'var(--text-secondary)' }}>
+          <Menu className="w-5 h-5" />
+        </button>
+        <Logo />
+        <span className="font-bold text-sm flex-1 truncate" style={{ color: 'var(--text-primary)' }}>
+          {nav.find((n) => n.path === pathname)?.label || 'Smart Finder'}
+        </span>
+        <button onClick={handleNewChat} aria-label="New chat"
+          className="p-2 rounded-lg hover:bg-[var(--bg-hover)]" style={{ color: 'var(--accent)' }}>
+          <Plus className="w-5 h-5" />
+        </button>
+      </div>
+
+      {mobileOpen && (
+        <div className="md:hidden fixed inset-0 z-40 bg-black/50 backdrop-blur-[2px]"
+          onClick={() => setMobileOpen(false)} aria-hidden />
+      )}
+
+      <aside
+        aria-label="Main navigation"
+        className={`fixed inset-y-0 left-0 z-50 w-[280px] flex flex-col overflow-hidden flex-shrink-0
+          transition-[transform,width] duration-300 ease-out
+          md:relative md:z-30 md:translate-x-0 md:w-[var(--sidebar-w)]
+          ${mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'}`}
+        style={{
+          '--sidebar-w': collapsed ? '64px' : '272px',
+          background: 'var(--bg-elevated)',
+          borderRight: '1px solid var(--border)',
+        } as React.CSSProperties}
+      >
+        {/* Header */}
+        <div className={`flex items-center gap-3 h-14 flex-shrink-0 ${collapsed ? 'justify-center px-2' : 'px-4'}`}
+          style={{ borderBottom: '1px solid var(--border)' }}>
+          {!collapsed && (
+            <>
+              <Logo />
+              <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                <span className="font-bold text-sm tracking-tight truncate" style={{ color: 'var(--text-primary)' }}>
+                  Smart Finder
+                </span>
+                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full"
+                  style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>AI</span>
+              </div>
+            </>
+          )}
+          <button
+            onClick={() => (isDesktop ? toggleSidebar() : setMobileOpen(false))}
+            className="p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-hover)] flex-shrink-0"
+            style={{ color: 'var(--text-muted)' }}
+            aria-label={!isDesktop ? 'Close menu' : collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={!isDesktop ? 'Close menu' : collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {!isDesktop ? <X className="w-4 h-4" />
+              : collapsed ? <PanelLeftOpen className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
+          </button>
         </div>
 
-        <AnimatePresence>
-          {!collapsed && (
-            <motion.div initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -8 }}
-              className="flex-1 min-w-0">
-              <span className="font-bold text-sm tracking-tight" style={{ color: 'var(--text-primary)' }}>
-                Smart Finder
-              </span>
-              <span className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full"
-                style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>AI</span>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        <button onClick={() => setCollapsed(!collapsed)}
-          className="p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-hover)] flex-shrink-0"
-          style={{ color: 'var(--text-muted)' }}>
-          {collapsed ? <PanelLeftOpen className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
-        </button>
-      </div>
-
-      {/* ─── Actions ────────────────────────────────────────────── */}
-      <div className="px-3 py-3 space-y-1 flex-shrink-0">
-        {/* New Chat */}
-        <motion.button
-          onClick={handleNewChat}
-          whileHover={{ scale: 1.01 }}
-          whileTap={{ scale: 0.98 }}
-          className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl font-semibold text-sm text-white transition-all shadow-md"
-          style={{
-            background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
-            boxShadow: '0 4px 12px rgba(99,102,241,0.3)',
-            justifyContent: collapsed ? 'center' : 'flex-start',
-          }}
-        >
-          <Plus className="w-4 h-4 flex-shrink-0" />
-          <AnimatePresence>
-            {!collapsed && (
-              <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                New Chat
-              </motion.span>
-            )}
-          </AnimatePresence>
-        </motion.button>
-
-        {/* Admin: Create/Update Repository */}
-        {isAdmin && (
+        {/* New chat + navigation */}
+        <div className="px-3 pt-3 pb-2 space-y-0.5 flex-shrink-0">
           <button
-            onClick={() => router.push('/admin')}
-            className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-all hover:bg-[var(--bg-hover)]"
-            style={{
-              color: '#f59e0b',
-              justifyContent: collapsed ? 'center' : 'flex-start',
-            }}
+            onClick={handleNewChat}
+            title={collapsed ? 'New chat' : undefined}
+            aria-label={collapsed ? 'New chat' : undefined}
+            className={`w-full flex items-center gap-2.5 px-3 py-2.5 mb-2 rounded-xl font-semibold text-sm text-white
+              transition-[filter,transform] hover:brightness-110 active:scale-[0.98] ${collapsed ? 'justify-center' : ''}`}
+            style={{ background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)', boxShadow: '0 4px 12px rgba(99,102,241,0.3)' }}
           >
-            <Upload className="w-4 h-4 flex-shrink-0" />
-            <AnimatePresence>
-              {!collapsed && (
-                <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                  📚 Create/Update Repository
-                </motion.span>
-              )}
-            </AnimatePresence>
+            <Plus className="w-4 h-4 flex-shrink-0" />
+            {!collapsed && <span>New Chat</span>}
           </button>
-        )}
 
-        {/* Smart Finder Multimodal Search */}
-        <button
-          onClick={() => router.push('/search')}
-          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-medium transition-all hover:bg-[var(--bg-hover)]"
-          style={{
-            color: pathname === '/search' ? 'var(--accent)' : 'var(--text-secondary)',
-            background: pathname === '/search' ? 'rgba(99,102,241,0.1)' : 'transparent',
-            border: pathname === '/search' ? '1px solid rgba(99,102,241,0.2)' : '1px solid transparent',
-            justifyContent: collapsed ? 'center' : 'flex-start',
-          }}
-        >
-          <Search className="w-4 h-4 flex-shrink-0" style={{ color: pathname === '/search' ? 'var(--accent)' : undefined }} />
-          <AnimatePresence>
-            {!collapsed && (
-              <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                Smart Finder
-              </motion.span>
-            )}
-          </AnimatePresence>
-        </button>
+          <nav className="space-y-0.5">
+            {nav.map((item) => {
+              const active = pathname === item.path;
+              const Icon = item.icon;
+              return (
+                <button
+                  key={item.path}
+                  onClick={() => go(item.path)}
+                  aria-current={active ? 'page' : undefined}
+                  title={collapsed ? item.label : undefined}
+                  aria-label={collapsed ? item.label : undefined}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-medium transition-colors
+                    ${collapsed ? 'justify-center' : ''} ${active ? '' : 'hover:bg-[var(--bg-hover)]'}`}
+                  style={{
+                    color: active ? 'var(--accent)' : 'var(--text-secondary)',
+                    background: active ? 'var(--accent-muted)' : 'transparent',
+                  }}
+                >
+                  <Icon className="w-4 h-4 flex-shrink-0" />
+                  {!collapsed && <span className="truncate">{item.label}</span>}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
 
-        {/* Browse Knowledge */}
-        <button
-          onClick={() => router.push('/knowledge')}
-          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-medium transition-all hover:bg-[var(--bg-hover)]"
-          style={{
-            color: pathname === '/knowledge' ? 'var(--accent)' : 'var(--text-secondary)',
-            background: pathname === '/knowledge' ? 'rgba(99,102,241,0.1)' : 'transparent',
-            border: pathname === '/knowledge' ? '1px solid rgba(99,102,241,0.2)' : '1px solid transparent',
-            justifyContent: collapsed ? 'center' : 'flex-start',
-          }}
-        >
-          <Database className="w-4 h-4 flex-shrink-0" />
-          <AnimatePresence>
-            {!collapsed && (
-              <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                Knowledge Base
-              </motion.span>
-            )}
-          </AnimatePresence>
-        </button>
-      </div>
-
-      {/* ─── Chat History ───────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto px-3 pb-2 min-h-0">
-        <AnimatePresence>
-          {!collapsed && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-              <div className="flex items-center gap-2 px-1 py-2 mb-1">
-                <Clock className="w-3.5 h-3.5" style={{ color: 'var(--text-muted)' }} />
-                <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                  Chat History
-                </span>
-              </div>
-
-              {chats.length === 0 ? (
-                <div className="text-center py-8 px-4">
-                  <MessageSquare className="w-8 h-8 mx-auto mb-2 opacity-30" style={{ color: 'var(--text-muted)' }} />
-                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No chats yet. Start a new one!</p>
-                </div>
-              ) : (
-                <div className="space-y-0.5">
-                  {chats.map((chat) => (
-                    <motion.div
-                      key={chat.id}
-                      initial={{ opacity: 0, x: -8 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      className={`group relative flex items-start gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition-all ${
-                        activeChatId === chat.id ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
-                      }`}
-                      onClick={() => handleChatClick(chat.id)}
-                    >
-                      <div className="flex-1 min-w-0">
+        {/* Chat history */}
+        <div className="flex-1 overflow-y-auto px-3 pb-2 min-h-0" style={{ borderTop: '1px solid var(--border-subtle)' }}>
+          {collapsed ? (
+            chats.slice(0, 8).map((chat) => (
+              <button key={chat.id} onClick={() => openChat(chat.id)} title={chat.title} aria-label={chat.title}
+                className={`w-full flex items-center justify-center p-2.5 rounded-xl my-0.5 transition-colors ${
+                  activeChatId === chat.id ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
+                }`}>
+                <MessageSquare className="w-4 h-4" style={{ color: activeChatId === chat.id ? 'var(--accent)' : 'var(--text-muted)' }} />
+              </button>
+            ))
+          ) : chats.length === 0 ? (
+            <div className="text-center py-8 px-4">
+              <MessageSquare className="w-8 h-8 mx-auto mb-2 opacity-30" style={{ color: 'var(--text-muted)' }} />
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No chats yet. Start a new one!</p>
+            </div>
+          ) : (
+            groupChats(chats).map((group) => (
+              <div key={group.label} className="pt-3">
+                <p className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                  {group.label}
+                </p>
+                <ul className="space-y-0.5">
+                  {group.items.map((chat) => {
+                    const active = activeChatId === chat.id && pathname === '/';
+                    const mode = MODE_ICON[chat.searchMode as keyof typeof MODE_ICON];
+                    return (
+                      <li key={chat.id}
+                        className={`group relative flex items-center gap-1 rounded-xl transition-colors ${
+                          active ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
+                        }`}>
                         {editingId === chat.id ? (
-                          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                          <form className="flex-1 flex items-center gap-1 px-2 py-2"
+                            onSubmit={(e) => { e.preventDefault(); handleRename(chat.id); }}>
                             <input
                               value={editTitle}
                               onChange={(e) => setEditTitle(e.target.value)}
-                              onKeyDown={(e) => { if (e.key === 'Enter') handleRename(chat.id); if (e.key === 'Escape') setEditingId(null); }}
+                              onKeyDown={(e) => { if (e.key === 'Escape') setEditingId(null); }}
                               autoFocus
-                              className="flex-1 text-xs bg-transparent outline-none border-b"
+                              aria-label="Chat title"
+                              className="flex-1 min-w-0 text-xs bg-transparent outline-none border-b py-0.5"
                               style={{ borderColor: 'var(--accent)', color: 'var(--text-primary)' }}
                             />
-                            <button onClick={() => handleRename(chat.id)} className="p-0.5 text-emerald-400"><Check className="w-3.5 h-3.5" /></button>
-                            <button onClick={() => setEditingId(null)} style={{ color: 'var(--text-muted)' }}><X className="w-3.5 h-3.5" /></button>
-                          </div>
+                            <button type="submit" aria-label="Save title" className="p-1 rounded-md hover:bg-[var(--bg-active)]"
+                              style={{ color: 'var(--success)' }}><Check className="w-3.5 h-3.5" /></button>
+                            <button type="button" onClick={() => setEditingId(null)} aria-label="Cancel rename"
+                              className="p-1 rounded-md hover:bg-[var(--bg-active)]" style={{ color: 'var(--text-muted)' }}>
+                              <X className="w-3.5 h-3.5" /></button>
+                          </form>
                         ) : (
                           <>
-                            <p className="text-xs font-medium truncate leading-5" style={{ color: 'var(--text-primary)' }}>
-                              {chat.title}
-                            </p>
-                            <div className="flex items-center gap-1.5 mt-0.5">
-                              {chat.searchMode === 'local' && <Database className="w-2.5 h-2.5" style={{ color: 'var(--accent)' }} />}
-                              {chat.searchMode === 'internet' && <Globe className="w-2.5 h-2.5" style={{ color: '#10b981' }} />}
-                              {chat.searchMode === 'both' && <Layers className="w-2.5 h-2.5" style={{ color: 'var(--accent-ai)' }} />}
-                              <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                            <button onClick={() => openChat(chat.id)} aria-current={active ? 'true' : undefined}
+                              className="flex-1 min-w-0 text-left px-3 py-2">
+                              <span className="block text-xs font-medium truncate leading-5"
+                                style={{ color: active ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
+                                {chat.title}
+                              </span>
+                              <span className="flex items-center gap-1.5 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                                {mode && <mode.icon className="w-2.5 h-2.5" style={{ color: mode.color }} aria-label={mode.label} />}
                                 {formatDistanceToNow(chat.updatedAt)}
-                              </p>
+                              </span>
+                            </button>
+                            {/* Always visible on touch screens; on desktop on hover or keyboard focus */}
+                            <div className="flex items-center gap-0.5 pr-1.5 flex-shrink-0 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 transition-opacity">
+                              <button onClick={() => { setEditingId(chat.id); setEditTitle(chat.title); }}
+                                aria-label={`Rename ${chat.title}`} title="Rename"
+                                className="p-1 rounded-lg hover:bg-[var(--bg-active)]" style={{ color: 'var(--text-muted)' }}>
+                                <Pencil className="w-3 h-3" />
+                              </button>
+                              <button onClick={() => handleDelete(chat)}
+                                aria-label={`Delete ${chat.title}`} title="Delete"
+                                className="p-1 rounded-lg hover:bg-red-500/15 hover:text-red-400" style={{ color: 'var(--text-muted)' }}>
+                                <Trash2 className="w-3 h-3" />
+                              </button>
                             </div>
                           </>
                         )}
-                      </div>
-
-                      {editingId !== chat.id && (
-                        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
-                          <button onClick={(e) => startEdit(chat.id, chat.title, e)}
-                            className="p-1 rounded-lg hover:bg-[var(--bg-active)]" style={{ color: 'var(--text-muted)' }}>
-                            <Pencil className="w-3 h-3" />
-                          </button>
-                          <button onClick={(e) => handleDelete(chat.id, e)}
-                            className="p-1 rounded-lg hover:bg-red-500/20 hover:text-red-400" style={{ color: 'var(--text-muted)' }}>
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        </div>
-                      )}
-                    </motion.div>
-                  ))}
-                </div>
-              )}
-            </motion.div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ))
           )}
-        </AnimatePresence>
+        </div>
 
-        {/* Collapsed: icon-only chat list */}
-        {collapsed && chats.slice(0, 8).map((chat) => (
-          <button key={chat.id} onClick={() => handleChatClick(chat.id)} title={chat.title}
-            className={`w-full flex items-center justify-center p-2.5 rounded-xl my-0.5 transition-all ${
-              activeChatId === chat.id ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
-            }`}>
-            <MessageSquare className="w-4 h-4" style={{ color: activeChatId === chat.id ? 'var(--accent)' : 'var(--text-muted)' }} />
-          </button>
-        ))}
-      </div>
+        {/* Theme, settings, account */}
+        <div className="flex-shrink-0 px-3 pb-3 pt-2 space-y-1" style={{ borderTop: '1px solid var(--border)' }}>
+          <FooterButton
+            collapsed={collapsed}
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            icon={theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-indigo-500" />}
+            label={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+          />
+          <FooterButton
+            collapsed={collapsed}
+            onClick={() => { setMobileOpen(false); setSettingsModalOpen(true); }}
+            icon={<Settings className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />}
+            label="Settings"
+          />
 
-      {/* ─── Bottom: Theme & User Profile ───────────────────────── */}
-      <div className="flex-shrink-0 px-3 pb-4 pt-2 space-y-1.5" style={{ borderTop: '1px solid var(--border)' }}>
-        {/* Theme Switch Button */}
-        <button
-          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-          className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-[var(--bg-hover)] ${
-            collapsed ? 'justify-center px-0' : ''
-          }`}
-          style={{
-            color: 'var(--text-secondary)',
-            border: '1px solid var(--border)',
-            background: 'var(--bg-surface, var(--bg-base))',
-          }}
-          title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-          aria-label="Toggle Light/Dark Theme"
-        >
-          {theme === 'dark' ? (
-            <Sun className="w-4 h-4 text-amber-400 flex-shrink-0" />
-          ) : (
-            <Moon className="w-4 h-4 text-indigo-500 flex-shrink-0" />
-          )}
-
-          <AnimatePresence>
+          <div className={`flex items-center gap-3 px-2 pt-2 ${collapsed ? 'flex-col' : ''}`}>
+            <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 font-bold text-xs text-white"
+              title={collapsed ? `${user?.username || 'User'} — ${user?.email || ''}` : undefined}
+              style={{ background: isAdmin ? 'linear-gradient(135deg, #f59e0b, #ef4444)' : 'linear-gradient(135deg, #6366f1, #8b5cf6)' }}>
+              {user?.username?.charAt(0).toUpperCase() || <User className="w-4 h-4" />}
+            </div>
             {!collapsed && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex items-center justify-between flex-1 min-w-0"
-              >
-                <span className="font-medium text-[11px]" style={{ color: 'var(--text-primary)' }}>
-                  {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
-                </span>
-                <span
-                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase font-semibold"
-                  style={{ background: 'var(--bg-active)', color: 'var(--text-muted)' }}
-                >
-                  {theme === 'dark' ? 'Dark' : 'Light'}
-                </span>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </button>
-
-        {/* Settings Button — Positioned directly below Light/Dark theme switch */}
-        <button
-          onClick={() => setSettingsModalOpen(true)}
-          className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-all hover:bg-[var(--bg-hover)] ${
-            collapsed ? 'justify-center px-0' : ''
-          }`}
-          style={{
-            color: 'var(--text-secondary)',
-            border: '1px solid var(--border)',
-            background: 'var(--bg-surface, var(--bg-base))',
-          }}
-          title="Open Settings"
-          aria-label="Settings"
-        >
-          <Settings className="w-4 h-4 text-indigo-400 flex-shrink-0" />
-
-          <AnimatePresence>
-            {!collapsed && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex items-center justify-between flex-1 min-w-0"
-              >
-                <span className="font-medium text-[11px]" style={{ color: 'var(--text-primary)' }}>
-                  Settings
-                </span>
-                <span
-                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase font-semibold"
-                  style={{ background: 'var(--bg-active)', color: 'var(--accent)' }}
-                >
-                  Ollama
-                </span>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </button>
-
-        {/* User Profile */}
-        <div className={`flex items-center gap-3 px-3 py-2 rounded-xl ${collapsed ? 'justify-center' : ''}`}>
-
-          <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 font-bold text-xs text-white shadow-sm"
-            style={{ background: isAdmin ? 'linear-gradient(135deg, #f59e0b, #ef4444)' : 'linear-gradient(135deg, #6366f1, #8b5cf6)' }}>
-            {user?.username?.charAt(0).toUpperCase() || <User className="w-4 h-4" />}
-          </div>
-
-          <AnimatePresence>
-            {!collapsed && (
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex-1 min-w-0">
+              <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-1.5">
                   <p className="text-xs font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
                     {user?.username || 'User'}
                   </p>
                   {isAdmin && (
                     <span className="flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded-full flex-shrink-0"
-                      style={{ background: 'rgba(245,158,11,0.15)', color: '#f59e0b' }}>
+                      style={{ background: 'var(--warning-muted)', color: 'var(--warning)' }}>
                       <Shield className="w-2.5 h-2.5" />ADMIN
                     </span>
                   )}
                 </div>
                 <p className="text-[10px] truncate" style={{ color: 'var(--text-muted)' }}>{user?.email}</p>
-              </motion.div>
+              </div>
             )}
-          </AnimatePresence>
-
-          <AnimatePresence>
-            {!collapsed && (
-              <motion.button initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-                onClick={logout}
-                className="p-1.5 rounded-lg transition-colors hover:bg-red-500/10 flex-shrink-0"
-                style={{ color: 'var(--text-muted)' }} title="Logout">
-                <LogOut className="w-3.5 h-3.5" />
-              </motion.button>
-            )}
-          </AnimatePresence>
+            <button onClick={logout} aria-label="Sign out" title="Sign out"
+              className="p-1.5 rounded-lg transition-colors hover:bg-red-500/10 hover:text-red-400 flex-shrink-0"
+              style={{ color: 'var(--text-muted)' }}>
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
-      </div>
+      </aside>
 
       <SettingsModal />
-    </motion.aside>
+    </>
+  );
+}
+
+function Logo() {
+  return (
+    <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0"
+      style={{ background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)', boxShadow: '0 0 16px rgba(99,102,241,0.3)' }}>
+      <Sparkles className="w-4 h-4 text-white" />
+    </div>
+  );
+}
+
+function FooterButton({ collapsed, onClick, icon, label }: {
+  collapsed: boolean; onClick: () => void; icon: React.ReactNode; label: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={collapsed ? label : undefined}
+      aria-label={collapsed ? label : undefined}
+      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition-colors hover:bg-[var(--bg-hover)] ${
+        collapsed ? 'justify-center px-0' : ''
+      }`}
+      style={{ color: 'var(--text-secondary)' }}
+    >
+      <span className="flex-shrink-0">{icon}</span>
+      {!collapsed && <span>{label}</span>}
+    </button>
   );
 }
 

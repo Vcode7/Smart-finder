@@ -1,0 +1,11 @@
+# Smart Finder service settings, read by smartfinder-ctl and the services.
+# Change them with smartfinder-ctl set-port / set-user / set-repo.
+
+# Account the services run as (needs access to the folders you index)
+RUN_USER=
+# Web app address: 0.0.0.0 = reachable from other devices on the network
+FRONTEND_HOST=0.0.0.0
+FRONTEND_PORT=3000
+# Where smartfinder-ctl setup / update-code get the code
+GIT_REPO_URL=https://github.com/Vcode7/Smart-finder.git
+GIT_BRANCH=main

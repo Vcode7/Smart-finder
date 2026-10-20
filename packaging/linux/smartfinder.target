@@ -1,0 +1,6 @@
+[Unit]
+Description=Smart Finder (backend and web app)
+Wants=smartfinder-backend.service smartfinder-frontend.service
+
+[Install]
+WantedBy=multi-user.target
