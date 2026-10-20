@@ -42,8 +42,8 @@ chardet==7.4.3
 colorlog==6.12.0
 imagesize==2.0.0
 # paddlex imports modelscope at load time (its model downloader); without it PaddleOCR cannot start
-modelscope==1.40.2
-modelscope-hub==0.4.6
+modelscope==1.38.1
+modelscope-hub==0.1.7
 pandas==2.2.2
 prettytable==3.18.0
 py-cpuinfo==9.0.0

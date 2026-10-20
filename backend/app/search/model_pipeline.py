@@ -1290,6 +1290,24 @@ _CJK = re.compile(r"[\u3040-\u30FF\u3400-\u9FFF\uF900-\uFAFF]")
 _ocr_lang: Optional[str] = None
 
 
+def _alias_opencv_for_paddlex() -> None:
+    """paddlex checks that a package named opencv-contrib-python is installed. This project
+    ships opencv-python-headless (the same cv2 module; a second cv2 would clash with it)."""
+    from paddlex.utils import deps
+    if getattr(deps.get_dep_version, "_opencv_aliased", False):
+        return
+    original = deps.get_dep_version
+
+    def get_dep_version(dep):
+        version = original(dep)
+        if version is None and dep == "opencv-contrib-python":
+            version = original("opencv-python-headless")
+        return version
+
+    get_dep_version._opencv_aliased = True
+    deps.get_dep_version = get_dep_version
+
+
 def _load_paddle_ocr():
     import onnxruntime as ort
     if hasattr(ort, "preload_dlls"):
@@ -1298,7 +1316,8 @@ def _load_paddle_ocr():
         except Exception:
             pass
     from paddleocr import PaddleOCR
-    gpu = "CUDAExecutionProvider" in ort.get_available_providers()
+    _alias_opencv_for_paddlex()
+    gpu ="CUDAExecutionProvider" in ort.get_available_providers()
     # medium on a GPU (~0.5 s a page); on the CPU small reads as well, 4x faster
     tier = settings.OCR_PADDLE_MODEL.strip().lower() or ("medium" if gpu else "small")
     kwargs: Dict[str, Any] = {}
