@@ -78,6 +78,24 @@ Backend-only changes just restart the backend; web app changes rebuild it (~1 mi
 | `sudo smartfinder-ctl config` | edit `/etc/smartfinder/backend.env` (Groq key, models, OCR) |
 | `sudo smartfinder-ctl set-user <user>` / `set-repo <url> [branch]` / `models` | |
 
+### Indexing a large folder from the command line
+
+For a folder that takes hours or days, index it in the foreground inside `tmux` instead of through the web app:
+
+```bash
+tmux new -s index
+sudo smartfinder-ctl add-folder /data/archive --name "Archive" \
+     --admin-email ops@example.com --admin-name "Ops"     # asks for the password
+# detach: Ctrl-b d   ·   come back: tmux attach -t index
+```
+
+It stops the backend, adds the folder as a library (indexed in place; its index goes in `/data/archive/.smartfind`), indexes everything, including transcription, picture descriptions, sounds and people, prints progress every minute, and starts the backend again. The library is then on the Libraries page and searchable. The web app shows the backend as unavailable while this runs.
+
+- **`-i` / `--include`** indexes only the given file types, and **`-e` / `--exclude`** skips them. The types are `docs` (PDF, Word, PowerPoint, Excel, text, …), `image`, `video` and `audio`. Separate several with commas (`-i docs,image`). For example, `add-folder /data/archive -e video` skips all videos, and `-i docs` indexes documents only. The choice is saved with the library, so the backend sticks to it for new files too; it appears as `kind:video` etc. under the library's exclusions, where removing it brings those files back. Files of a skipped type that were already indexed are removed from the index; the files themselves are never touched. Running again without `-i`/`-e` keeps the saved choice.
+- **Ctrl-C** stops it and keeps what is done. Run the same command again to continue where it stopped.
+- **`--admin-email`** creates an administrator account who can sign in with that email and password (administrators see every library). For an existing account it makes it an administrator and, if you give one, sets the new password. Instead of being asked for the password, you can pass `--admin-password` or set `SMARTFINDER_ADMIN_PASSWORD`. `--admin-email` alone (no folder) only creates the account.
+- The account must be the one Smart Finder runs as. `add-folder` handles this. The plain Python command is `cd /opt/smartfinder/app/backend && sudo -u <user> /opt/smartfinder/venv/bin/python scripts/index_folder.py /data/archive ...`. It refuses to run while the backend is up. On Windows it is `venv\Scripts\python.exe scripts\index_folder.py D:\Archive`.
+
 Files: code in `/opt/smartfinder/app` (git checkout), settings in `/etc/smartfinder`, database, uploads and models in `/var/lib/smartfinder`. `sudo apt remove smartfinder` removes the program and its environments; `sudo apt purge smartfinder` also deletes settings, the index database, uploads and models. The `.smartfind` folders inside your own folders are never touched.
 
 ## Libraries

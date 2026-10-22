@@ -478,6 +478,27 @@ cmd_files() {
     as_user "$VENV/bin/python" "$APP/backend/scripts/index_stats.py" "$@"
 }
 
+cmd_add_folder() {  # index a folder in the foreground (run it in tmux); the backend is stopped meanwhile
+    need_root add-folder
+    load_conf; require_user
+    [ -x "$VENV/bin/python" ] || die "Smart Finder is not set up yet: sudo smartfinder-ctl setup"
+    local was_active=0 rc=0
+    if svc_active backend; then
+        was_active=1
+        say "Stopping the backend while indexing (the web app shows it as unavailable until then)"
+        systemctl stop smartfinder-backend.service || die "could not stop the backend"
+    fi
+    # Ctrl-C stops the indexer (it saves its place); this script still restarts the backend
+    trap 'true' INT
+    (cd "$APP/backend" && as_user "$VENV/bin/python" scripts/index_folder.py "$@") || rc=$?
+    trap - INT
+    if [ "$was_active" = 1 ]; then
+        say "Starting the backend"
+        cmd_service start backend
+    fi
+    return $rc
+}
+
 services_for() {
     case "${1:-all}" in
         all) echo "smartfinder-backend.service smartfinder-frontend.service" ;;
@@ -647,6 +668,11 @@ Running
   start|stop|restart [backend|frontend|all]
   logs [backend|frontend] [-f]
   files [--json]                    indexed files per library
+  add-folder <path> [--name N] [-i|-e docs,image,video,audio]
+             [--admin-email E --admin-name N --admin-password P]
+                                    add a folder and index it now, in the foreground (use
+                                    tmux); stops the backend meanwhile. -i indexes only,
+                                    -e skips those file types. Ctrl-C and re-run to continue
 
 Settings
   port                              show the ports
@@ -669,6 +695,7 @@ main() {
         start|stop|restart) cmd_service "$cmd" "$@" ;;
         logs)           cmd_logs "$@" ;;
         files|index)    cmd_files "$@" ;;
+        add-folder)     cmd_add_folder "$@" ;;
         port|ports)     cmd_port ;;
         set-port)       cmd_set_port "$@" ;;
         set-user)       cmd_set_user "$@" ;;

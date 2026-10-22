@@ -127,6 +127,33 @@ def test_reconcile_scan(manager, tmp_path):
     assert lib.db.scalar("SELECT COUNT(*) FROM sources WHERE rel_path = 'a.txt'") == 0
 
 
+def test_excluded_kinds_stay_out_and_come_back(manager, tmp_path):
+    from app.library.scanner import scan_library
+    from app.library.sources import add_or_update_source, excluded_kinds, set_excluded_kinds
+
+    root = tmp_path / "lib"
+    _write(root / "notes.txt", "alpha")
+    _write(root / "sub" / "clip.MP4", "video bytes")
+    _write(root / "photo.jpg", "jpeg bytes")
+    lib = manager.attach(str(root))
+    assert scan_library(lib).new == 3
+
+    set_excluded_kinds(lib, ["video", "image"])
+    assert sorted(excluded_kinds(lib)) == ["image", "video"]
+    r = scan_library(lib)
+    assert r.removed == 2
+    assert {row["rel_path"] for row in lib.db.all("SELECT rel_path FROM sources")} == {"notes.txt"}
+    assert (root / "sub" / "clip.MP4").exists()
+    assert add_or_update_source(lib, "new.mov", 5, time.time()) is None   # e.g. from the watcher
+
+    # Replacing the choice brings the others back
+    set_excluded_kinds(lib, ["document"])
+    assert excluded_kinds(lib) == ["document"]
+    r = scan_library(lib)
+    assert r.new == 2 and r.removed == 1
+    assert {row["rel_path"] for row in lib.db.all("SELECT rel_path FROM sources")} == {"sub/clip.MP4", "photo.jpg"}
+
+
 def test_detach_with_index_deletion_keeps_user_files(manager, tmp_path):
     folder = tmp_path / "keepme"
     f = _write(folder / "doc.txt")

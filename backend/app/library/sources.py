@@ -22,6 +22,10 @@ PRIORITY_UPLOAD = 100
 PRIORITY_CHANGED = 50
 PRIORITY_SCAN = 0
 
+# Exclusion patterns of this form keep a whole file kind out ("kind:video")
+KIND_EXCLUSION_PREFIX = "kind:"
+FILE_KINDS = ("document", "image", "video", "audio")
+
 DERIVED_TABLES = ("chunks", "sections", "transcript_segments", "visual_items", "faces", "audio_segments", "source_logs")
 
 
@@ -156,9 +160,27 @@ def exclusion_patterns(lib: Library) -> List[str]:
 def is_excluded(lib: Library, rel_path: str, patterns: Optional[Iterable[str]] = None) -> bool:
     pats = list(patterns) if patterns is not None else exclusion_patterns(lib)
     for p in pats:
+        if p.startswith(KIND_EXCLUSION_PREFIX):
+            if file_kind(rel_path) == p[len(KIND_EXCLUSION_PREFIX):]:
+                return True
+            continue
         if rel_path == p or rel_path.startswith(p.rstrip("/") + "/") or fnmatch.fnmatch(rel_path, p):
             return True
     return False
+
+
+def excluded_kinds(lib: Library) -> List[str]:
+    return [p[len(KIND_EXCLUSION_PREFIX):] for p in exclusion_patterns(lib) if p.startswith(KIND_EXCLUSION_PREFIX)]
+
+
+def set_excluded_kinds(lib: Library, kinds: Iterable[str]) -> None:
+    """Keep whole file kinds out of a library ('kind:video'). Already indexed files of those
+    kinds are forgotten by the next scan, as if they had been deleted."""
+    assert lib.db is not None
+    with lib.db.write() as c:
+        c.execute("DELETE FROM exclusions WHERE pattern LIKE ?", (KIND_EXCLUSION_PREFIX + "%",))
+        c.executemany("INSERT OR IGNORE INTO exclusions (pattern) VALUES (?)",
+                      [(KIND_EXCLUSION_PREFIX + k,) for k in sorted(set(kinds))])
 
 
 def exclude_path(lib: Library, rel_path: str) -> int:
