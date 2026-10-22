@@ -266,5 +266,15 @@ MIGRATIONS: List[str] = [
         value TEXT NOT NULL,
         updated_at TEXT DEFAULT (datetime('now'))
     )""",
+
+    # Libraries an admin has shared with a (non-admin) user. Users can only query these.
+    """CREATE TABLE IF NOT EXISTS library_access (
+        user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        library_id  TEXT NOT NULL,
+        granted_by  TEXT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (user_id, library_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_library_access_library ON library_access(library_id)",
 ]
 

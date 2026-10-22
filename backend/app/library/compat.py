@@ -71,13 +71,17 @@ def legacy_row(lib: Library, src: Dict[str, Any], usernames: Optional[Dict[str, 
 
 
 def list_rows(manager: LibraryManager, admin: bool, status: Optional[str], q: Optional[str],
-              limit: int) -> Tuple[List[Dict[str, Any]], int]:
-    """Newest-first rows from every online library (at most `limit` per library) and the total."""
+              limit: int, allowed: Optional[set] = None) -> Tuple[List[Dict[str, Any]], int]:
+    """Newest-first rows from every online library (at most `limit` per library) and the total.
+
+    `allowed` restricts the listing to those library ids (None = every library)."""
     from app.database.session import db_all
     rows: List[Tuple[Library, Dict[str, Any]]] = []
     total = 0
     reverse = {"uploaded": "queued", "completed": "indexed"}
     for lib in manager.online():
+        if allowed is not None and lib.id not in allowed:
+            continue
         assert lib.db is not None
         where, params = ["status NOT IN ('missing', 'excluded')"], []
         if not admin:

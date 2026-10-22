@@ -438,8 +438,11 @@ class SearchEngine:
     def manager(self) -> LibraryManager:
         return self._manager or get_library_manager()
 
-    def _libraries(self, plan: QueryPlan) -> List[Library]:
+    def _libraries(self, plan: QueryPlan, allowed: Optional[Set[str]] = None) -> List[Library]:
         libs = [lib for lib in self.manager.online() if lib.db is not None]
+        if allowed is not None:
+            # Applied before the in:<library> filter, so a query can never widen access
+            libs = [lib for lib in libs if lib.id in allowed]
         wanted = {w.lower() for w in plan.filters.libraries}
         if wanted:
             libs = [lib for lib in libs if lib.id.lower() in wanted or lib.name.lower() in wanted]
@@ -458,17 +461,19 @@ class SearchEngine:
             w["face"] = 2.2          # "photos of Rahul": the face is the point of the query
         return w
 
-    def search(self, plan: QueryPlan, limit: int = 20) -> EngineResult:
+    def search(self, plan: QueryPlan, limit: int = 20,
+               allowed_libraries: Optional[Set[str]] = None) -> EngineResult:
+        """`allowed_libraries` limits the search to those library ids (None = every library)."""
         from app.search import model_pipeline as mp
         from app.search.activity import search_activity
         try:
             with search_activity():
-                return self._search(plan, limit)
+                return self._search(plan, limit, allowed_libraries)
         finally:
             mp.trim_vram()
 
-    def _search(self, plan: QueryPlan, limit: int) -> EngineResult:
-        libs = self._libraries(plan)
+    def _search(self, plan: QueryPlan, limit: int, allowed: Optional[Set[str]] = None) -> EngineResult:
+        libs = self._libraries(plan, allowed)
         trace: Dict[str, Any] = {**plan.trace, "libraries": [lib.name for lib in libs]}
         if not libs:
             return EngineResult([], [], [], [], trace)

@@ -10,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.database.session import db_get, db_all, db_run, get_db_context
 from app.api.deps import require_auth
+from app.core.access import can_access_library, can_access_source
 from app.schemas.chat import ChatCreate, ChatUpdate, MessageCreate
 from app.search.constants import tokenize
 
@@ -95,11 +96,13 @@ def _expand_library_context(source_id: str, start: Any, question: str) -> Option
     return _pick_passages(rows, question) if rows else ""
 
 
-def _source_location(ref_id: str, meta: Dict[str, Any]) -> Optional[str]:
+def _source_location(ref_id: str, meta: Dict[str, Any], user: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """'<library> › <folder>' of a local item (folder names often say the event or place)."""
     from app.library.manager import get_library_manager
     source_id = str(meta.get("sourceId") or ref_id or "").removeprefix("src-")
     found = get_library_manager().find_source(source_id) if source_id else None
+    if found and user is not None and not can_access_library(user, found[0].id):
+        return None
     if found:
         lib, src = found
         library, rel = lib.name, src["rel_path"]
@@ -114,14 +117,18 @@ def _source_location(ref_id: str, meta: Dict[str, Any]) -> Optional[str]:
     return f"{library} › {folder}" if library else folder
 
 
-def _expand_local_context(ref_id: str, meta: Dict[str, Any], question: str) -> str:
+def _expand_local_context(ref_id: str, meta: Dict[str, Any], question: str,
+                          user: Optional[Dict[str, Any]] = None) -> str:
     """
     Fuller text for a local knowledge-base item: the source's passages that best match
     the question (documents/images) or the transcript window around the matched time
-    (audio/video). Returns "" for internet items or unknown sources.
+    (audio/video). Returns "" for internet items, unknown sources, or sources that
+    are not shared with `user`.
     """
     source_id = str(meta.get("sourceId") or ref_id or "").removeprefix("src-")
     if not source_id:
+        return ""
+    if user is not None and not can_access_source(user, source_id):
         return ""
     start = meta.get("startTime", meta.get("timestamp"))
     library_text = _expand_library_context(source_id, start, question)
@@ -377,11 +384,11 @@ async def send_message(chat_id: str, req: MessageCreate, user: Dict[str, Any] = 
             raw_snip = (cr.get("snippet") or "").strip()
             if not raw_snip and m.get("extractedSnippet"):
                 raw_snip = str(m.get("extractedSnippet")).strip()
-            expanded = "" if is_user_att else _expand_local_context(cr.get("context_ref_id") or "", m, msg_text)
+            expanded = "" if is_user_att else _expand_local_context(cr.get("context_ref_id") or "", m, msg_text, user)
             body = expanded or raw_snip
             limit = 1500 if is_user_att else CONTEXT_ITEM_CHARS
             body = (body[:limit] + "...") if len(body) > limit else body
-            location = None if is_user_att or url else _source_location(cr.get("context_ref_id") or "", m)
+            location = None if is_user_att or url else _source_location(cr.get("context_ref_id") or "", m, user)
             has_local = has_local or location is not None
 
             prefix = "USER ATTACHED FILE" if is_user_att else cr["context_type"].upper()

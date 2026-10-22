@@ -18,6 +18,17 @@ Setup creates the Python environment, installs the web app, writes `backend\.env
 
 **Choose a strong admin password** in `backend\.env` (`ADMIN_PASSWORD`) before the first start, or change it afterwards under Settings → Account. Anyone on your network who can open the web app can try to sign in.
 
+## Accounts and sharing
+
+There are two kinds of account:
+
+- **Admin** – uploads and manages data, and creates accounts. The first admin comes from `ADMIN_EMAIL` / `ADMIN_PASSWORD` in `backend\.env`.
+- **User** – can only search and read the libraries an admin has shared with them. Users cannot upload, delete or see server paths.
+
+Admins open **Users** in the sidebar to create user or admin accounts, reset passwords, and tick the libraries each user may search. A new user sees nothing until a library is shared with them. People and chat context follow the same rule. The old pre-library index belongs to no library, so only admins can search it.
+
+To let someone create an admin account from the sign-in page, set `ADMIN_SETUP_CODE` in `backend\.env` (`setup.bat` generates one on a fresh install and prints it once). They enter it on **Create an admin account**. Leave it empty to turn that off.
+
 ## Running
 
 ```bat

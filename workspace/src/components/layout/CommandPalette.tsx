@@ -6,7 +6,7 @@ import { Command } from 'cmdk';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useRouter } from 'next/navigation';
 import {
-  Search, Plus, Moon, Sun, Settings, MessageSquare, Database, Library, Users, FolderCog,
+  Search, Plus, Moon, Sun, Settings, MessageSquare, Database, Library, Users, FolderCog, UserCog,
 } from 'lucide-react';
 import { useUIStore } from '@/store/ui';
 import { useChatStore } from '@/store/chat';
@@ -35,7 +35,10 @@ export function CommandPalette() {
     { path: '/knowledge', label: 'Knowledge Base', icon: Database, keywords: ['documents', 'files'] },
     { path: '/libraries', label: 'Libraries & Uploads', icon: Library, keywords: ['folders', 'indexing', 'upload'] },
     { path: '/people', label: 'People', icon: Users, keywords: ['faces', 'names'] },
-    ...(user.role === 'admin' ? [{ path: '/admin', label: 'Repository', icon: FolderCog, keywords: ['scrape', 'internet', 'inventory'] }] : []),
+    ...(user.role === 'admin' ? [
+      { path: '/admin', label: 'Repository', icon: FolderCog, keywords: ['scrape', 'internet', 'inventory'] },
+      { path: '/admin/users', label: 'Users', icon: UserCog, keywords: ['accounts', 'admin', 'share', 'access'] },
+    ] : []),
   ];
 
   return (

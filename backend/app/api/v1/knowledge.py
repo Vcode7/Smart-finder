@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.files import sanitize_filename, is_within
 from app.database.session import db_get, db_all, db_run, get_db_context
 from app.api.deps import require_auth, require_admin
+from app.core.access import can_access_library, is_admin as user_is_admin, visible_library_ids
 from app.processing.queue import enqueue_source_processing, is_source_queued
 from app.processing.purge import delete_source as purge_and_delete_source, purge_derived_data, is_internet_source
 from app.schemas.knowledge import ImportInternetRequest, ScrapeSearchRequest, CheckConflictsRequest, CheckConflictsResponse, ConflictItem
@@ -31,9 +32,16 @@ def _wake_indexer() -> None:
     get_pipeline().wake()
 
 
-async def _library_source(source_id: str):
-    """(library, source row) when the id belongs to a folder library, else None."""
-    return await run_in_threadpool(compat.find, source_id.removeprefix("src-"))
+async def _library_source(source_id: str, user: Optional[Dict[str, Any]] = None):
+    """(library, source row) when the id belongs to a folder library, else None.
+
+    With `user` given, a non-admin only gets sources of libraries shared with them; anything
+    else (including legacy-index rows, which belong to no library) is a 404."""
+    found = await run_in_threadpool(compat.find, source_id.removeprefix("src-"))
+    if user is not None and not user_is_admin(user):
+        if found is None or not can_access_library(user, found[0].id):
+            raise HTTPException(status_code=404, detail="Source not found")
+    return found
 
 # Columns returned by the list endpoint. metadata_json is slimmed (logs removed) below.
 _LIST_COLUMNS = (
@@ -107,7 +115,7 @@ async def list_sources(
     where = ["ks.id NOT IN (SELECT source_id FROM legacy_migrated)"]   # listed from their library instead
     params: List[Any] = []
     if not is_admin:
-        where.append("ks.processing_status = 'completed'")
+        where.append("0 = 1")   # the legacy index belongs to no library, so it is admin-only
     elif status_filter:
         where.append("ks.processing_status = ?")
         params.append(status_filter)
@@ -131,7 +139,8 @@ async def list_sources(
 
     # Folder libraries (newest first, merged with the legacy index)
     lib_rows, lib_total = await run_in_threadpool(
-        compat.list_rows, get_library_manager(), is_admin, status_filter, q, limit + offset)
+        compat.list_rows, get_library_manager(), is_admin, status_filter, q, limit + offset,
+        visible_library_ids(user))
     merged = sorted(rows + lib_rows, key=lambda r: r.get("upload_date") or "", reverse=True)[offset:offset + limit]
     total = (total_row["n"] if total_row else len(rows)) + lib_total
     return {"sources": merged, "count": len(merged), "total": total}
@@ -153,7 +162,7 @@ async def supported_types(user: Dict[str, Any] = Depends(require_auth)):
 @router.post("/check-conflicts", response_model=CheckConflictsResponse)
 async def check_conflicts(
     req: CheckConflictsRequest,
-    user: Dict[str, Any] = Depends(require_auth)
+    user: Dict[str, Any] = Depends(require_admin)
 ):
     """
     Checks whether files with the given names already exist in the repository.
@@ -195,7 +204,7 @@ async def check_conflicts(
 @router.post("/upload")
 async def upload_source(
     request: Request,
-    user: Dict[str, Any] = Depends(require_auth)
+    user: Dict[str, Any] = Depends(require_admin)
 ):
     # No size or file-count limit: each file is streamed to disk in 1 MB blocks.
     form = await request.form(max_files=float("inf"), max_fields=float("inf"))
@@ -344,7 +353,7 @@ async def reset_knowledge(user: Dict[str, Any] = Depends(require_admin)):
 
 
 @router.post("/scrape-search")
-async def scrape_search(req: ScrapeSearchRequest, user: Dict[str, Any] = Depends(require_auth)):
+async def scrape_search(req: ScrapeSearchRequest, user: Dict[str, Any] = Depends(require_admin)):
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
@@ -510,7 +519,7 @@ async def scrape_search(req: ScrapeSearchRequest, user: Dict[str, Any] = Depends
 
 
 @router.post("/import-internet")
-async def import_internet(req: ImportInternetRequest, user: Dict[str, Any] = Depends(require_auth)):
+async def import_internet(req: ImportInternetRequest, user: Dict[str, Any] = Depends(require_admin)):
     if not req.sources:
         raise HTTPException(status_code=400, detail="No sources provided for import")
 
@@ -608,7 +617,7 @@ def _get_source_or_404(source_id: str, columns: str = "*") -> Dict[str, Any]:
 
 @router.get("/{source_id}")
 async def get_source_detail(source_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    found = await _library_source(source_id)
+    found = await _library_source(source_id, user)
     if found:
         return await run_in_threadpool(compat.detail, *found)
     source_id = source_id.removeprefix("src-")
@@ -673,7 +682,7 @@ async def get_source_detail(source_id: str, user: Dict[str, Any] = Depends(requi
 
 @router.get("/{source_id}/logs")
 async def get_source_logs(source_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    found = await _library_source(source_id)
+    found = await _library_source(source_id, user)
     if found:
         lib, src = found
         log = await run_in_threadpool(lib.db.one, "SELECT info_json FROM source_logs WHERE source_id = ?", (src["id"],))
@@ -716,7 +725,7 @@ async def reprocess_source(source_id: str, user: Dict[str, Any] = Depends(requir
 
 @router.api_route("/{source_id}/file", methods=["GET", "HEAD"])
 async def stream_source_file(source_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    found = await _library_source(source_id)
+    found = await _library_source(source_id, user)
     if found:
         lib, lsrc = found
         url = compat.internet_url(lsrc)
@@ -758,7 +767,7 @@ async def stream_source_file(source_id: str, user: Dict[str, Any] = Depends(requ
 
 @router.get("/{source_id}/frames/{frame_id}")
 async def get_video_frame(source_id: str, frame_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    found = await _library_source(source_id)
+    found = await _library_source(source_id, user)
     if found:
         path = await run_in_threadpool(compat.frame, found[0], found[1], frame_id)
         if path is None:
@@ -775,7 +784,7 @@ async def get_video_frame(source_id: str, frame_id: str, user: Dict[str, Any] = 
 
 @router.get("/{source_id}/faces/{face_id}")
 async def get_face_crop(source_id: str, face_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    found = await _library_source(source_id)
+    found = await _library_source(source_id, user)
     path = await run_in_threadpool(compat.face_crop, found[0], found[1], face_id) if found else None
     if path is None:
         raise HTTPException(status_code=404, detail="Face not found")
@@ -797,7 +806,7 @@ def _render_pdf_thumbnail(pdf_path: str, thumb_path: Path) -> bool:
 
 @router.get("/{source_id}/thumbnail")
 async def get_source_thumbnail(source_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    found = await _library_source(source_id)
+    found = await _library_source(source_id, user)
     if found:
         lib, lsrc = found
         path = await run_in_threadpool(compat.thumbnail, lib, lsrc)

@@ -20,12 +20,16 @@ export default function LoginPage() {
   const { theme, setTheme } = useUIStore();
   const router = useRouter();
   const [allowSignup, setAllowSignup] = useState(false);
+  const [allowAdminSignup, setAllowAdminSignup] = useState(false);
 
   useEffect(() => {
     fetch('/api/auth/config')
       .then((res) => (res.ok ? res.json() : null))
-      .then((cfg) => setAllowSignup(Boolean(cfg?.allowSignup)))
-      .catch(() => setAllowSignup(false));
+      .then((cfg) => {
+        setAllowSignup(Boolean(cfg?.allowSignup));
+        setAllowAdminSignup(Boolean(cfg?.allowAdminSignup));
+      })
+      .catch(() => { setAllowSignup(false); setAllowAdminSignup(false); });
   }, []);
 
   const handleSubmit = async (e: FormEvent) => {
@@ -227,6 +231,18 @@ export default function LoginPage() {
                 className="font-semibold transition-colors hover:underline"
                 style={{ color: 'var(--accent)' }}>
                 Create one free
+              </Link>
+            </p>
+          )}
+
+          {/* Admin sign-up (only when the server has an admin setup code) */}
+          {allowAdminSignup && (
+            <p className="text-center text-sm mt-4" style={{ color: 'var(--text-secondary)' }}>
+              Setting up this server?{' '}
+              <Link href="/auth/admin-signup"
+                className="font-semibold transition-colors hover:underline"
+                style={{ color: 'var(--accent)' }}>
+                Create an admin account
               </Link>
             </p>
           )}

@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # Open self-registration is off by default: the frontend is reachable from the
     # local network, and every account can read the whole knowledge base.
     ALLOW_SIGNUP: bool = False
+    # Secret code that lets someone create an administrator account from the sign-in page.
+    # Empty (or the .env.example placeholder) disables public admin sign-up; admins can
+    # always create further accounts from the Users page.
+    ADMIN_SETUP_CODE: str = ""
     LOGIN_MAX_FAILURES: int = 10
     LOGIN_LOCKOUT_MINUTES: int = 15
 
@@ -91,6 +95,11 @@ class Settings(BaseSettings):
 
     def get_cors_origins(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def admin_signup_enabled(self) -> bool:
+        code = self.ADMIN_SETUP_CODE.strip()
+        return bool(code) and code != "choose-a-setup-code"
 
     def insecure_defaults(self) -> List[str]:
         """Names of security-sensitive settings still using their built-in defaults."""

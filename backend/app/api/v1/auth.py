@@ -1,3 +1,4 @@
+import secrets
 import time
 import uuid
 import threading
@@ -129,6 +130,50 @@ async def signup(data: UserSignup, response: Response):
     }
 
 
+class AdminSignup(UserSignup):
+    setupCode: str
+
+
+@router.post("/signup-admin", status_code=status.HTTP_201_CREATED, response_model=AuthResponse)
+async def signup_admin(data: AdminSignup, response: Response):
+    """Create an administrator account from the sign-in page, guarded by ADMIN_SETUP_CODE."""
+    if not settings.admin_signup_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin sign-up is disabled on this server. Set ADMIN_SETUP_CODE in backend/.env to enable it."
+        )
+
+    email = data.email.lower()
+    # The setup code is a shared secret, so wrong guesses count against the same
+    # per-email lockout as sign-in attempts.
+    remaining = _lockout_remaining(email)
+    if remaining:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed attempts. Try again in {max(1, remaining // 60)} minute(s)."
+        )
+    if not secrets.compare_digest(data.setupCode.strip().encode(), settings.ADMIN_SETUP_CODE.strip().encode()):
+        _record_failure(email)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin setup code")
+    _clear_failures(email)
+
+    if len(data.password) < 8:
+        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+    if db_get("SELECT id FROM users WHERE email = ?", (email,)):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User with this email already exists")
+
+    user_id = str(uuid.uuid4())
+    username = data.username.strip()
+    db_run(
+        "INSERT INTO users (id, email, username, password_hash, role) VALUES (?, ?, ?, ?, 'admin')",
+        (user_id, email, username, hash_password(data.password)),
+    )
+    _set_auth_cookie(response, sign_token({
+        "userId": user_id, "email": email, "username": username, "role": "admin",
+    }))
+    return {"user": {"id": user_id, "email": email, "username": username, "role": "admin"}}
+
+
 class ChangePasswordRequest(BaseModel):
     currentPassword: str
     newPassword: str = Field(min_length=8)
@@ -167,7 +212,7 @@ async def me(user: dict = Depends(get_current_user)):
 @router.get("/config")
 async def auth_config():
     """Public flags the login/signup pages need before a user is signed in."""
-    return {"allowSignup": settings.ALLOW_SIGNUP}
+    return {"allowSignup": settings.ALLOW_SIGNUP, "allowAdminSignup": settings.admin_signup_enabled}
 
 @router.post("/logout")
 async def logout(response: Response):

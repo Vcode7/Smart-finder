@@ -55,7 +55,7 @@ def test_data_routes_require_login(client, method, path, body):
 def test_signup_is_disabled_by_default(client):
     res = client.post("/api/auth/signup", json={"email": "x@y.z", "username": "x", "password": "longpassword1"})
     assert res.status_code == 403
-    assert client.get("/api/auth/config").json() == {"allowSignup": False}
+    assert client.get("/api/auth/config").json() == {"allowSignup": False, "allowAdminSignup": False}
 
 
 def test_login_lockout_after_repeated_failures(client):

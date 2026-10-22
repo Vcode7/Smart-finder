@@ -24,6 +24,7 @@ PUBLIC_DEFAULT_SECRETS = {
     "change-me-to-a-long-random-string",
 }
 DEFAULT_ADMIN_PASSWORDS = {"", "Admin@123456", "choose-a-strong-password"}
+DEFAULT_SETUP_CODES = {"", "choose-a-setup-code"}
 
 
 def read_value(text: str, key: str) -> str:
@@ -71,6 +72,12 @@ def main() -> int:
             backend = set_value(backend, "ADMIN_PASSWORD", password)
             print(f"[configure_env] Admin password for {read_value(backend, 'ADMIN_EMAIL') or 'the admin account'}: "
                   f"{password}  (shown once; change it after signing in)")
+
+    if read_value(backend, "ADMIN_SETUP_CODE") in DEFAULT_SETUP_CODES and not db_file(backend).exists():
+        code = secrets.token_urlsafe(12)
+        backend = set_value(backend, "ADMIN_SETUP_CODE", code)
+        print(f"[configure_env] Admin setup code (lets you create an admin account from the sign-in page): "
+              f"{code}  (shown once; it is stored in backend/.env)")
 
     BACKEND_ENV.write_text(backend, encoding="utf-8")
     WORKSPACE_ENV.write_text(workspace, encoding="utf-8")

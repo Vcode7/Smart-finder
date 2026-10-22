@@ -8,7 +8,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import {
   Sparkles, Plus, MessageSquare, Trash2, Pencil, Check, X, LogOut, User, Shield,
   PanelLeftClose, PanelLeftOpen, Globe, Database, Layers, Search, Sun, Moon, Settings,
-  Library, Users, Menu, FolderCog,
+  Library, Users, Menu, FolderCog, UserCog,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth';
 import { useChatStore, type ChatSummary } from '@/store/chat';
@@ -136,7 +136,10 @@ export function Sidebar() {
     { path: '/knowledge', label: 'Knowledge Base', icon: Database },
     { path: '/libraries', label: 'Libraries & Uploads', icon: Library },
     { path: '/people', label: 'People', icon: Users },
-    ...(isAdmin ? [{ path: '/admin', label: 'Repository', icon: FolderCog }] : []),
+    ...(isAdmin ? [
+      { path: '/admin', label: 'Repository', icon: FolderCog },
+      { path: '/admin/users', label: 'Users', icon: UserCog },
+    ] : []),
   ];
 
   return (

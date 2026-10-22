@@ -3,12 +3,13 @@ People found in your photos and videos (faces grouped across every library).
 Naming, hiding, merging and correcting are admin-only.
 """
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_admin, require_auth
+from app.core.access import visible_library_ids
 from app.database.session import db_all, db_get, db_run
 from app.library.manager import LibraryError, get_library_manager
 from app.people import cluster
@@ -31,29 +32,43 @@ class AssignRequest(BaseModel):
     personId: Optional[str] = None      # None = "not this person"
 
 
-def _cover_url(cover: Optional[str]) -> Optional[str]:
+def _cover_url(cover: Optional[str], allowed: Optional[Set[str]] = None) -> Optional[str]:
     if not cover or cover.count(":") < 2:
         return None
-    _lib, source_id, face_id = cover.split(":", 2)
+    lib_id, source_id, face_id = cover.split(":", 2)
+    if allowed is not None and lib_id not in allowed:
+        return None
     return f"/api/knowledge/{source_id}/faces/{face_id}"
 
 
-def _person(row: Dict[str, Any]) -> Dict[str, Any]:
+def _person(row: Dict[str, Any], allowed: Optional[Set[str]] = None,
+            counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     return {
         "id": row["id"],
         "name": row["name"],
-        "faceCount": row["face_count"],
+        "faceCount": row["face_count"] if counts is None else counts.get(row["id"], 0),
         "hidden": bool(row["hidden"]),
-        "coverUrl": _cover_url(row["cover_face"]),
+        "coverUrl": _cover_url(row["cover_face"], allowed),
         "updatedAt": row["updated_at"],
     }
 
 
-def _media(person_id: str, offset: int, limit: int) -> Dict[str, Any]:
+def _visible_counts(allowed: Set[str]) -> Dict[str, int]:
+    """Faces per person inside the libraries shared with a non-admin user."""
+    counts: Dict[str, int] = {}
+    for lib in get_library_manager().online():
+        if lib.id not in allowed or lib.db is None:
+            continue
+        for r in lib.db.all("SELECT person_id, COUNT(*) AS n FROM faces WHERE person_id IS NOT NULL GROUP BY person_id"):
+            counts[r["person_id"]] = counts.get(r["person_id"], 0) + int(r["n"])
+    return counts
+
+
+def _media(person_id: str, offset: int, limit: int, allowed: Optional[Set[str]] = None) -> Dict[str, Any]:
     manager = get_library_manager()
     found: List[tuple] = []
     for lib in manager.online():
-        if lib.db is None:
+        if lib.db is None or (allowed is not None and lib.id not in allowed):
             continue
         for r in lib.db.all(
             "SELECT source_id, COUNT(*) AS n, MAX(quality) AS q FROM faces WHERE person_id = ? GROUP BY source_id",
@@ -86,9 +101,14 @@ def _media(person_id: str, offset: int, limit: int) -> Dict[str, Any]:
 @router.get("")
 async def list_people(includeHidden: bool = Query(False), user: Dict[str, Any] = Depends(require_auth)):
     def query():
+        allowed = visible_library_ids(user)
         where = "" if includeHidden else "WHERE hidden = 0"
         rows = db_all(f"SELECT * FROM persons {where} ORDER BY (name IS NULL), face_count DESC LIMIT 2000")
-        return {"people": [_person(r) for r in rows if r["face_count"] or r["name"]]}
+        if allowed is None:
+            return {"people": [_person(r) for r in rows if r["face_count"] or r["name"]]}
+        counts = _visible_counts(allowed)   # users only see people who appear in data shared with them
+        people = [_person(r, allowed, counts) for r in rows if counts.get(r["id"])]
+        return {"people": sorted(people, key=lambda p: (p["name"] is None, -p["faceCount"]))}
     return await asyncio.to_thread(query)
 
 
@@ -113,8 +133,15 @@ async def get_person(person_id: str, offset: int = Query(0, ge=0), limit: int = 
     row = await asyncio.to_thread(db_get, "SELECT * FROM persons WHERE id = ?", (person_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Person not found")
-    media = await asyncio.to_thread(_media, person_id, offset, limit)
-    return {"person": _person(row), "media": media}
+    allowed = visible_library_ids(user)
+    if allowed is None:
+        media = await asyncio.to_thread(_media, person_id, offset, limit)
+        return {"person": _person(row), "media": media}
+    counts = await asyncio.to_thread(_visible_counts, allowed)
+    if not counts.get(person_id):
+        raise HTTPException(status_code=404, detail="Person not found")
+    media = await asyncio.to_thread(_media, person_id, offset, limit, allowed)
+    return {"person": _person(row, allowed, counts), "media": media}
 
 
 @router.patch("/{person_id}")

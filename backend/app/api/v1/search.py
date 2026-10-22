@@ -13,6 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.database.session import db_get, db_all
 from app.api.deps import require_auth
+from app.core.access import can_access_library, is_admin, visible_library_ids
 from app.schemas.search import (
     SearchRequest, LocalSearchRequest, VideoSearchRequest,
     FetchMoreRequest, SynthesizeRequest
@@ -47,8 +48,10 @@ def _legacy_exists() -> bool:
 
 
 async def _legacy_results(query_text: str, file_buffer: Optional[bytes], file_name: Optional[str],
-                          mime_type: Optional[str], limit: int) -> Dict[str, List[Dict[str, Any]]]:
-    if not await run_in_threadpool(_legacy_exists):
+                          mime_type: Optional[str], limit: int,
+                          user: Optional[Dict[str, Any]] = None) -> Dict[str, List[Dict[str, Any]]]:
+    # The legacy index belongs to no library, so it cannot be shared: admin-only
+    if not is_admin(user) or not await run_in_threadpool(_legacy_exists):
         return {k: [] for k in _BUCKETS}
     try:
         if not file_buffer:
@@ -74,11 +77,12 @@ def _merge_buckets(primary: Dict[str, List[Dict[str, Any]]], legacy: Dict[str, L
 
 
 async def _local_search(query_text: str, file_buffer: Optional[bytes] = None, file_name: Optional[str] = None,
-                        mime_type: Optional[str] = None, limit: int = 20) -> Tuple[Dict[str, List[Dict[str, Any]]], QueryPlan, Dict[str, Any]]:
+                        mime_type: Optional[str] = None, limit: int = 20,
+                        user: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], QueryPlan, Dict[str, Any]]:
     files = [(file_buffer, file_name, mime_type)] if file_buffer else []
     plan = await run_in_threadpool(build_plan, query_text, files)
-    engine_res = await run_in_threadpool(get_engine().search, plan, limit)
-    legacy = await _legacy_results(query_text, file_buffer, file_name, mime_type, limit)
+    engine_res = await run_in_threadpool(get_engine().search, plan, limit, visible_library_ids(user))
+    legacy = await _legacy_results(query_text, file_buffer, file_name, mime_type, limit, user)
     return _merge_buckets(engine_res.as_dict(), legacy, limit), plan, engine_res.trace
 
 
@@ -189,7 +193,7 @@ async def unified_search(req: SearchRequest, user: Dict[str, Any] = Depends(requ
         "videos": [], "papers": [], "articles": [], "reports": [], "web": [], "providerStatuses": {}
     }
 
-    local_task = _local_search(topic, limit=10) if source in ("local", "both") else None
+    local_task = _local_search(topic, limit=10, user=user) if source in ("local", "both") else None
 
     if source in ("internet", "both"):
         v_res, p_res, n_res, w_res = await asyncio.gather(
@@ -235,7 +239,7 @@ async def local_search(req: LocalSearchRequest, user: Dict[str, Any] = Depends(r
         raise HTTPException(status_code=400, detail="Query is required")
 
     limit = req.limit or 10
-    res, _plan, _trace = await _local_search(query, limit=limit)
+    res, _plan, _trace = await _local_search(query, limit=limit, user=user)
     documents = res.get("documents", [])[:limit]
     videos = res.get("videos", [])[:limit]
     images = res.get("images", [])[:limit]
@@ -472,7 +476,7 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
     preview_url = _preview_data_url(file_buffer, mime_type)
 
     # 1. Local search: every folder library (plus the legacy index until it is migrated)
-    local_res, plan, engine_trace = await _local_search(query_text, file_buffer, file_name, mime_type, limit=20)
+    local_res, plan, engine_trace = await _local_search(query_text, file_buffer, file_name, mime_type, limit=20, user=user)
     signals = _compat_signals(plan)
     all_local_matches = sorted(
         [*local_res.get("videos", []), *local_res.get("documents", []),
@@ -668,9 +672,10 @@ def _similar_signals(source: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
     return signals, info
 
 
-async def _similar_in_libraries(lib, src: Dict[str, Any], relative_threshold: float) -> Dict[str, Any]:
+async def _similar_in_libraries(lib, src: Dict[str, Any], relative_threshold: float,
+                                allowed: Optional[set] = None) -> Dict[str, Any]:
     plan = await run_in_threadpool(plan_from_source, lib, src["id"])
-    res = await run_in_threadpool(get_engine().search, plan, 20)
+    res = await run_in_threadpool(get_engine().search, plan, 20, allowed)
     buckets = res.as_dict()
     all_matches = res.all()
     top_score = max((m["relevanceScore"] for m in all_matches), default=0.0)
@@ -722,7 +727,11 @@ async def find_similar_sources(request: Request, user: Dict[str, Any] = Depends(
     from app.library.manager import get_library_manager
     found = await run_in_threadpool(get_library_manager().find_source, source_id)
     if found:
-        return await _similar_in_libraries(found[0], found[1], relative_threshold)
+        if not can_access_library(user, found[0].id):
+            raise HTTPException(status_code=404, detail=f"Source with id '{raw_id}' not found")
+        return await _similar_in_libraries(found[0], found[1], relative_threshold, visible_library_ids(user))
+    if not is_admin(user):   # legacy-index sources belong to no library
+        raise HTTPException(status_code=404, detail=f"Source with id '{raw_id}' not found")
     source = db_get(
         "SELECT id, original_name, file_type, file_path, file_size, upload_date, tags_json, metadata_json FROM knowledge_sources WHERE id = ?",
         (source_id,)
@@ -801,7 +810,8 @@ async def multimodal_search(request: Request, user: Dict[str, Any] = Depends(req
     if not query_text.strip() and not file_buffer:
         raise HTTPException(status_code=400, detail="Please provide a text query or upload reference material.")
 
-    res, _plan, _trace = await _local_search(query_text, file_buffer, req["file_name"], req["mime_type"], limit=20)
+    res, _plan, _trace = await _local_search(query_text, file_buffer, req["file_name"], req["mime_type"],
+                                             limit=20, user=user)
     return res
 
 
@@ -826,6 +836,8 @@ async def face_search(request: Request, user: Dict[str, Any] = Depends(require_a
         elif body.get("imageBase64"):
             buf = _decode_base64_image(body["imageBase64"])
 
+    allowed = visible_library_ids(user)
+    admin = is_admin(user)
     matches: List[Dict[str, Any]] = []
     if buf:
         # Folder libraries: identity vectors from buffalo_l
@@ -838,7 +850,7 @@ async def face_search(request: Request, user: Dict[str, Any] = Depends(require_a
             plan = QueryPlan(images=[sig])
             finish_plan(plan)
             out = []
-            for item in get_engine().search(plan, 20).all():
+            for item in get_engine().search(plan, 20, allowed).all():
                 frame = item.get("primaryFrame") or (item.get("matchingFrames") or [None])[0]
                 out.append({
                     "sourceId": item["sourceId"], "title": item["title"], "category": item["category"],
@@ -850,11 +862,11 @@ async def face_search(request: Request, user: Dict[str, Any] = Depends(require_a
             return out
         matches.extend(await run_in_threadpool(_face_only))
         # Legacy index (buffalo_s vectors) until it is migrated
-        if await run_in_threadpool(_legacy_exists):
+        if admin and await run_in_threadpool(_legacy_exists):
             face_res = await detect_faces_in_image(buf, {"sourceId": "query", "useVision": False})
             query_embeddings = [f["embedding"] for f in face_res.get("faces", []) if f.get("embedding")]
 
-    for emb in query_embeddings:
+    for emb in (query_embeddings if admin else []):   # legacy-index face search
         matches.extend(await run_in_threadpool(search_face_embeddings, emb, 0.50, 10))
 
     seen = set()
@@ -874,12 +886,14 @@ async def video_search(req: VideoSearchRequest, user: Dict[str, Any] = Depends(r
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
     limit = req.limit or 10
+    allowed = visible_library_ids(user)
+    admin = is_admin(user)
 
     def _search() -> List[Dict[str, Any]]:
         video_results = []
         # Folder libraries: transcripts and frames through the search engine
         plan = build_plan(query + " kind:video")
-        for item in get_engine().search(plan, limit).videos:
+        for item in get_engine().search(plan, limit, allowed).videos:
             video_results.append({
                 "id": item["id"], "videoId": item["sourceId"], "sourceId": item["sourceId"],
                 "videoTitle": item["title"], "startTime": item.get("startTime") or 0,
@@ -888,7 +902,7 @@ async def video_search(req: VideoSearchRequest, user: Dict[str, Any] = Depends(r
                 "relevanceScore": item["relevanceScore"], "uploadDate": item.get("uploadDate"),
                 "matchingFrames": item.get("matchingFrames") or [], "libraryName": item.get("libraryName"),
             })
-        if not _legacy_exists() or len(video_results) >= limit:
+        if not admin or not _legacy_exists() or len(video_results) >= limit:
             return video_results[:limit]
         raw_results = search_transcripts(query, limit * 2)
         seen_videos = set()

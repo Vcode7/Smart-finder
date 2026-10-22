@@ -7,7 +7,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyToken, COOKIE_NAME } from '@/lib/auth/jwt';
 
-const PUBLIC_PATHS = ['/auth/login', '/auth/signup', '/_next', '/favicon.ico'];
+const PUBLIC_PATHS = ['/auth/login', '/auth/signup', '/auth/admin-signup', '/_next', '/favicon.ico'];
 
 export function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;

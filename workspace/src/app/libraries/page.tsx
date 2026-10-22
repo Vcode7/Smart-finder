@@ -20,13 +20,14 @@ interface LibrarySummary {
   id: string;
   name: string;
   kind: 'folder' | 'uploads' | 'linked';
-  path: string | null;
-  indexPath: string;
+  // Server paths, errors and scan details are sent to administrators only
+  path?: string | null;
+  indexPath?: string;
   online: boolean;
   watch: boolean;
   watching: boolean;
   paused: boolean;
-  error: string | null;
+  error?: string | null;
   counts?: Record<string, number>;
   total?: number;
   bytes?: number;
@@ -195,7 +196,9 @@ export default function LibrariesPage() {
               <div>
                 <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>Libraries</h1>
                 <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                  Folders indexed where they are: no copies, no size limits. Everything here is searched together.
+                  {isAdmin
+                    ? 'Folders indexed where they are: no copies, no size limits. Everything here is searched together.'
+                    : 'The libraries your administrator has shared with you. You can search them, but not change them.'}
                 </p>
               </div>
             </div>
@@ -254,14 +257,22 @@ export default function LibrariesPage() {
             </form>
           )}
 
-          <IndexingBanner status={indexing} isAdmin={isAdmin} onTogglePause={toggleAllPaused} />
-
-          <UploadPanel targets={uploadTargets} />
+          {isAdmin && (
+            <>
+              <IndexingBanner status={indexing} isAdmin={isAdmin} onTogglePause={toggleAllPaused} />
+              <UploadPanel targets={uploadTargets} />
+            </>
+          )}
 
           <section className="space-y-3" aria-label="Libraries">
             {loading ? (
               <div className="flex justify-center py-16">
                 <Loader2 className="w-7 h-7 animate-spin" style={{ color: 'var(--accent)' }} />
+              </div>
+            ) : !isAdmin && libraries.length === 0 ? (
+              <div className="rounded-2xl p-8 text-center text-sm"
+                style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
+                No data has been shared with you yet. Ask your administrator to share a library with you.
               </div>
             ) : (
               libraries.map((lib) => (

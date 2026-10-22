@@ -39,6 +39,7 @@ from app.api.v1.libraries import router as libraries_router
 from app.api.v1.uploads import router as uploads_router
 from app.api.v1.system import router as system_router
 from app.api.v1.people import router as people_router
+from app.api.v1.users import router as users_router
 from app.ingest.pipeline import get_pipeline
 from app.library.manager import get_library_manager
 from app.library.service import get_library_service
@@ -141,6 +142,7 @@ app.include_router(libraries_router, prefix="/api")
 app.include_router(uploads_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
 app.include_router(people_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 
 @app.get("/health")
 @app.get("/api/health")

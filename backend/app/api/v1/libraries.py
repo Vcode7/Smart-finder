@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_admin, require_auth
+from app.core.access import can_access_library, filter_libraries, is_admin
 from app.ingest.pipeline import get_pipeline
 from app.library.manager import Library, LibraryError, get_library_manager
 from app.library.paths import INDEX_DIRNAME
@@ -65,19 +66,39 @@ def _online(lib_id: str) -> Library:
 
 
 # ── collection ───────────────────────────────────────────────────────────────
+def _indexing_status(user: Dict[str, Any]) -> Dict[str, Any]:
+    status = get_pipeline().status()
+    if not is_admin(user):
+        # These name files that may be in libraries that are not shared with the user
+        status["current"] = None
+        status["lastError"] = None
+    return status
+
+
+def _guard(user: Dict[str, Any], lib_id: str) -> None:
+    """404 (not 403) for libraries that are not shared with a non-admin user."""
+    if not can_access_library(user, lib_id):
+        raise HTTPException(status_code=404, detail="Library not found")
+
+
 @router.get("")
 async def list_libraries(user: Dict[str, Any] = Depends(require_auth)):
     def build():
-        return {
-            "libraries": [_summary(lib) for lib in get_library_manager().all()],
-            "indexing": get_pipeline().status(),
-        }
+        admin = is_admin(user)
+        libs = []
+        for lib in filter_libraries(user, get_library_manager().all()):
+            summary = _summary(lib)
+            if not admin:
+                for key in ("path", "indexPath", "error", "scan"):
+                    summary.pop(key, None)   # server paths and scan internals are admin-only
+            libs.append(summary)
+        return {"libraries": libs, "indexing": _indexing_status(user)}
     return await asyncio.to_thread(build)
 
 
 @router.get("/status")
 async def indexing_status(user: Dict[str, Any] = Depends(require_auth)):
-    return await asyncio.to_thread(get_pipeline().status)
+    return await asyncio.to_thread(_indexing_status, user)
 
 
 @router.post("", status_code=201)
@@ -151,7 +172,12 @@ async def add_files(req: AddFilesRequest, user: Dict[str, Any] = Depends(require
 # ── single library ───────────────────────────────────────────────────────────
 @router.get("/{lib_id}")
 async def get_library(lib_id: str, user: Dict[str, Any] = Depends(require_auth)):
-    return await asyncio.to_thread(_summary, _get(lib_id))
+    _guard(user, lib_id)
+    summary = await asyncio.to_thread(_summary, _get(lib_id))
+    if not is_admin(user):
+        for key in ("path", "indexPath", "error", "scan"):
+            summary.pop(key, None)
+    return summary
 
 
 @router.patch("/{lib_id}")
@@ -216,6 +242,7 @@ async def list_sources(
     limit: int = Query(50, ge=1, le=500),
     user: Dict[str, Any] = Depends(require_auth),
 ):
+    _guard(user, lib_id)
     lib = _online(lib_id)
 
     def query() -> Dict[str, Any]:

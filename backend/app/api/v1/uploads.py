@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.requests import ClientDisconnect
 
-from app.api.deps import require_auth
+from app.api.deps import require_admin
 from app.ingest.pipeline import get_pipeline
 from app.library.manager import get_library_manager
 from app.library.uploads import (
@@ -39,7 +39,7 @@ def _error(e: UploadError) -> JSONResponse:
 
 
 @router.post("")
-async def start(req: StartUploadRequest, user: Dict[str, Any] = Depends(require_auth)):
+async def start(req: StartUploadRequest, user: Dict[str, Any] = Depends(require_admin)):
     try:
         return await asyncio.to_thread(
             start_upload, get_library_manager(), user, req.fileName, req.size, req.lastModified,
@@ -50,7 +50,7 @@ async def start(req: StartUploadRequest, user: Dict[str, Any] = Depends(require_
 
 
 @router.get("/{upload_id}")
-async def status(upload_id: str, user: Dict[str, Any] = Depends(require_auth)):
+async def status(upload_id: str, user: Dict[str, Any] = Depends(require_admin)):
     try:
         return await asyncio.to_thread(session_status, get_library_manager(), upload_id, user)
     except UploadError as e:
@@ -59,7 +59,7 @@ async def status(upload_id: str, user: Dict[str, Any] = Depends(require_auth)):
 
 @router.put("/{upload_id}")
 async def put_chunk(upload_id: str, request: Request, offset: int = Query(..., ge=0),
-                    user: Dict[str, Any] = Depends(require_auth)):
+                    user: Dict[str, Any] = Depends(require_admin)):
     try:
         received = await write_chunk(get_library_manager(), upload_id, offset, request.stream(), user)
         return {"received": received}
@@ -70,7 +70,7 @@ async def put_chunk(upload_id: str, request: Request, offset: int = Query(..., g
 
 
 @router.post("/{upload_id}/complete")
-async def complete(upload_id: str, user: Dict[str, Any] = Depends(require_auth)):
+async def complete(upload_id: str, user: Dict[str, Any] = Depends(require_admin)):
     try:
         result = await asyncio.to_thread(complete_upload, get_library_manager(), upload_id, user)
     except UploadError as e:
@@ -81,7 +81,7 @@ async def complete(upload_id: str, user: Dict[str, Any] = Depends(require_auth))
 
 
 @router.delete("/{upload_id}")
-async def abort(upload_id: str, user: Dict[str, Any] = Depends(require_auth)):
+async def abort(upload_id: str, user: Dict[str, Any] = Depends(require_admin)):
     try:
         await asyncio.to_thread(abort_upload, get_library_manager(), upload_id, user)
         return {"ok": True}
