@@ -23,6 +23,7 @@ Setup creates the Python environment, installs the web app, writes `backend\.env
 There are two kinds of account:
 
 - **Admin** – uploads and manages data, and creates accounts. The first admin comes from `ADMIN_EMAIL` / `ADMIN_PASSWORD` in `backend\.env`.
+- **Demo admin** – every install (Windows and Linux) also gets the admin **`a@g.com` / `123456`**, created at startup if missing. Turn it off by setting `DEMO_ADMIN_EMAIL=` (empty) in `backend\.env` (`/etc/smartfinder/backend.env` on Linux) and deleting the account under **Users**.
 - **User** – can only search and read the libraries an admin has shared with them. Users cannot upload, delete or see server paths.
 
 Admins open **Users** in the sidebar to create user or admin accounts, reset passwords, and tick the libraries each user may search. A new user sees nothing until a library is shared with them. People and chat context follow the same rule. The old pre-library index belongs to no library, so only admins can search it.

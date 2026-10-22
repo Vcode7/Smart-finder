@@ -268,6 +268,14 @@ print_urls() {
         done
     fi
     echo "  Sign in as:       $(conf_get "$BACKEND_ENV" ADMIN_EMAIL)"
+    local demo_email demo_password
+    demo_email=$(conf_get "$BACKEND_ENV" DEMO_ADMIN_EMAIL)
+    demo_password=$(conf_get "$BACKEND_ENV" DEMO_ADMIN_PASSWORD)
+    # Installs whose backend.env predates the demo admin get the built-in defaults
+    if ! grep -q '^DEMO_ADMIN_EMAIL=' "$BACKEND_ENV" 2>/dev/null; then
+        demo_email=a@g.com; demo_password=123456
+    fi
+    [ -n "$demo_email" ] && echo "  Demo admin:       $demo_email / ${demo_password:-123456}"
     echo
 }
 

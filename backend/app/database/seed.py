@@ -43,6 +43,21 @@ def seed_admin() -> None:
     )
     print(f"[DB] Admin account seeded: {admin_email}")
 
+def seed_demo_admin() -> None:
+    """Demo administrator with a known password; created once, never reset."""
+    email = settings.DEMO_ADMIN_EMAIL.strip().lower()
+    password = settings.DEMO_ADMIN_PASSWORD
+    if not email or not password:
+        return
+    if db_get("SELECT id FROM users WHERE email = ?", (email,)):
+        return
+
+    db_run(
+        "INSERT INTO users (id, email, username, password_hash, role) VALUES (?, ?, ?, ?, 'admin')",
+        (str(uuid.uuid4()), email, "Demo Admin", hash_password(password)),
+    )
+    print(f"[DB] Demo admin account seeded: {email}")
+
 def seed_demo_knowledge() -> None:
     seed_system_user()
     exists = db_get("SELECT id FROM knowledge_sources WHERE original_name LIKE '%SSC Chairman Gopal Krishna%'")
@@ -221,5 +236,6 @@ def seed_demo_knowledge() -> None:
 def seed_database() -> None:
     seed_system_user()
     seed_admin()
+    seed_demo_admin()
     if settings.SEED_DEMO_KNOWLEDGE:
         seed_demo_knowledge()

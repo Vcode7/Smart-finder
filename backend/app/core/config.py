@@ -8,6 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 # Built-in fallbacks. Running with these is only tolerated in development.
 DEFAULT_JWT_SECRET = "smart-find-super-secret-jwt-key-change-in-production"
 DEFAULT_ADMIN_PASSWORD = "Admin@123456"
+DEFAULT_DEMO_ADMIN_PASSWORD = "123456"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -51,6 +52,10 @@ class Settings(BaseSettings):
     JWT_SECRET: str = DEFAULT_JWT_SECRET
     ADMIN_EMAIL: str = "admin@smartfind.ai"
     ADMIN_PASSWORD: str = DEFAULT_ADMIN_PASSWORD
+    # Demo administrator created at startup when no account has this email (empty = off).
+    # Signs in with a known password, so turn it off on anything but a demo machine.
+    DEMO_ADMIN_EMAIL: str = "a@g.com"
+    DEMO_ADMIN_PASSWORD: str = DEFAULT_DEMO_ADMIN_PASSWORD
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRES_DAYS: int = 7
     COOKIE_NAME: str = "sf_auth"
@@ -108,6 +113,8 @@ class Settings(BaseSettings):
             issues.append("JWT_SECRET")
         if self.ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD:
             issues.append("ADMIN_PASSWORD")
+        if self.DEMO_ADMIN_EMAIL and self.DEMO_ADMIN_PASSWORD == DEFAULT_DEMO_ADMIN_PASSWORD:
+            issues.append("DEMO_ADMIN_PASSWORD")
         return issues
 
     @staticmethod

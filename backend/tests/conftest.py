@@ -117,6 +117,7 @@ def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg.settings, "LIBRARY_FALLBACK_DIR", str(tmp_path / "libraries"), raising=False)
     monkeypatch.setattr(cfg.settings, "ADMIN_EMAIL", TEST_ADMIN_EMAIL, raising=False)
     monkeypatch.setattr(cfg.settings, "ADMIN_PASSWORD", TEST_ADMIN_PASSWORD, raising=False)
+    monkeypatch.setattr(cfg.settings, "DEMO_ADMIN_EMAIL", "", raising=False)
 
     from app.database.session import run_migrations
     run_migrations()
