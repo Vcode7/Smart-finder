@@ -151,6 +151,9 @@ step_python() {
     fi
     say "Installing Python packages (first time: about 6 GB, includes CUDA torch)"
     uv pip install --python "$VENV/bin/python" -r "$req" || return 1
+    # A CPU-only torch would index everything at a crawl and fail to run on new GPUs: refuse it
+    "$VENV/bin/python" -c 'import sys, torch; sys.exit(0 if torch.version.cuda else 1)' \
+        || { warn "the installed torch has no CUDA support (torch.version.cuda is empty)"; return 1; }
     # shellcheck disable=SC2086
     uv pip install --python "$VENV/bin/python" --no-deps $PADDLE_PINS || return 1
     stamp_set python-deps "$key"

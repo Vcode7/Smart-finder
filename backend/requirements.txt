@@ -61,6 +61,9 @@ ujson==5.12.0
 numpy==2.5.4
 torch==2.6.0; sys_platform == "win32"
 torch==2.8.0; sys_platform == "linux"
+# transformers' video processor (loaded with Qwen3-VL-Embedding) imports torchvision; each release pairs with one torch
+torchvision==0.21.0; sys_platform == "win32"
+torchvision==0.23.0; sys_platform == "linux"
 transformers==4.57.6
 tokenizers==0.22.2
 sentence-transformers==3.0.1
