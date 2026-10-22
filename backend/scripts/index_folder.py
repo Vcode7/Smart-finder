@@ -228,6 +228,23 @@ def _open_library(path: str, name: Optional[str]):
     return manager, lib
 
 
+def retry_failed(lib) -> int:
+    """Files that failed in an earlier run (a crash, a full disk, no handles left) get another go."""
+    n = lib.db.execute("UPDATE sources SET status = 'queued', attempts = 0, error = NULL WHERE status = 'failed'")
+    n += lib.db.execute(
+        "UPDATE sources SET transcript = 'pending', error = NULL WHERE status = 'indexed' AND transcript = 'failed'")
+    n += lib.db.execute(
+        "UPDATE sources SET image_vectors = 'pending', error = NULL WHERE status = 'indexed' AND image_vectors = 'failed'")
+    return n
+
+
+def _open_files() -> str:
+    try:
+        return f" | {len(os.listdir('/proc/self/fd'))} open files"
+    except OSError:
+        return ""
+
+
 def _remaining(lib) -> dict:
     from app.ingest.pipeline import PASS_COLUMNS
     counts = {r["status"]: int(r["n"]) for r in lib.db.all("SELECT status, COUNT(*) AS n FROM sources GROUP BY status")}
@@ -246,12 +263,15 @@ def _progress_line(state: dict, pipeline, started: float) -> str:
     parts += [f"{name} {n}" for name, n in p.items() if n]
     cur = pipeline.current
     now = f" | {cur['stage']}: {cur['file']}" if cur else ""
-    return f"{', '.join(parts)} | {(time.time() - started) / 3600:.1f} h{now}"
+    return f"{', '.join(parts)} | {(time.time() - started) / 3600:.1f} h{_open_files()}{now}"
 
 
-async def index(manager, lib) -> None:
+async def index(manager, lib, retry: bool = True) -> None:
     from app.ingest.pipeline import IngestionPipeline
     from app.library.scanner import scan_library
+
+    if retry and (n := await asyncio.to_thread(retry_failed, lib)):
+        _say(f"Retrying {n} files that failed earlier (--skip-failed leaves them)")
 
     _say("Scanning the folder...")
     report = await asyncio.to_thread(scan_library, lib)
@@ -294,6 +314,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", help="folder to index (in place)")
     ap.add_argument("--name", help="library name shown in the app (default: the folder name)")
+    ap.add_argument("--skip-failed", action="store_true",
+                    help="do not retry files that failed in an earlier run (they are retried by default)")
     kinds = ap.add_mutually_exclusive_group()
     kinds.add_argument("-i", "--include", action="append", metavar="TYPE",
                        help="index only these file types: docs, image, video, audio")
@@ -330,7 +352,7 @@ def main() -> None:
     manager, lib = _open_library(args.path, args.name)
     try:
         apply_kind_filter(lib, include, exclude)
-        asyncio.run(index(manager, lib))
+        asyncio.run(index(manager, lib, retry=not args.skip_failed))
     except KeyboardInterrupt:
         _say("Interrupted. Run the same command again to continue where it stopped.")
     finally:
