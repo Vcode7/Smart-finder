@@ -154,6 +154,27 @@ def test_excluded_kinds_stay_out_and_come_back(manager, tmp_path):
     assert {row["rel_path"] for row in lib.db.all("SELECT rel_path FROM sources")} == {"sub/clip.MP4", "photo.jpg"}
 
 
+def test_connections_of_finished_threads_are_closed(manager, tmp_path):
+    import gc
+    import threading
+
+    lib = manager.attach(str(tmp_path / "lib")) if (tmp_path / "lib").exists() else None
+    if lib is None:
+        _write(tmp_path / "lib" / "a.txt")
+        lib = manager.attach(str(tmp_path / "lib"))
+    before = len(lib.db._all_conns)
+
+    def work():
+        lib.db.scalar("SELECT COUNT(*) FROM sources")
+
+    for _ in range(25):   # the indexer runs every file on a new thread
+        t = threading.Thread(target=work)
+        t.start()
+        t.join()
+    gc.collect()
+    assert len(lib.db._all_conns) <= before + 1
+
+
 def test_detach_with_index_deletion_keeps_user_files(manager, tmp_path):
     folder = tmp_path / "keepme"
     f = _write(folder / "doc.txt")

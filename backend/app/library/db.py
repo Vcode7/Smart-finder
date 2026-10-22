@@ -24,6 +24,19 @@ def _dict_factory(cursor: sqlite3.Cursor, row: tuple) -> Dict[str, Any]:
     return {col[0]: value for col, value in zip(cursor.description, row)}
 
 
+class _ConnHolder:
+    """Lives in a thread's local storage; when the thread ends, its connection is closed."""
+
+    def __init__(self, db: "LibraryDB", conn: sqlite3.Connection):
+        self.db, self.conn = db, conn
+
+    def __del__(self) -> None:
+        try:
+            self.db._release(self.conn)
+        except Exception:
+            pass
+
+
 class LibraryDB:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -52,11 +65,20 @@ class LibraryDB:
     def conn(self) -> sqlite3.Connection:
         if self._closed:
             raise RuntimeError(f"Library database is closed: {self.path}")
-        c = getattr(self._local, "conn", None)
-        if c is None:
-            c = self._connect()
-            self._local.conn = c
-        return c
+        holder = getattr(self._local, "holder", None)
+        if holder is None:
+            holder = self._local.holder = _ConnHolder(self, self._connect())
+        return holder.conn
+
+    def _release(self, c: sqlite3.Connection) -> None:
+        """Close the connection of a thread that has ended (indexing runs each file on a new thread)."""
+        with self._conns_lock:
+            if c in self._all_conns:
+                self._all_conns.remove(c)
+        try:
+            c.close()
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._closed = True

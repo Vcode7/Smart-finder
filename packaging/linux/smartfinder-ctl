@@ -483,6 +483,14 @@ cmd_add_folder() {  # index a folder in the foreground (run it in tmux); the bac
     load_conf; require_user
     [ -x "$VENV/bin/python" ] || die "Smart Finder is not set up yet: sudo smartfinder-ctl setup"
     local was_active=0 rc=0
+    # The indexer runs from the app folder: make a relative folder path absolute first
+    if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+        local dir; dir=$(realpath -m -- "$1")
+        [ -d "$dir" ] || die "folder not found: $1 (looked in $PWD)"
+        as_user test -r "$dir" -a -x "$dir" \
+            || die "$RUN_USER cannot read $dir; Smart Finder runs as that account (sudo smartfinder-ctl set-user <user>)"
+        set -- "$dir" "${@:2}"
+    fi
     if svc_active backend; then
         was_active=1
         say "Stopping the backend while indexing (the web app shows it as unavailable until then)"
@@ -490,6 +498,7 @@ cmd_add_folder() {  # index a folder in the foreground (run it in tmux); the bac
     fi
     # Ctrl-C stops the indexer (it saves its place); this script still restarts the backend
     trap 'true' INT
+    ulimit -n 65536 2>/dev/null || true   # same as the service; tmux shells allow only 1024
     (cd "$APP/backend" && as_user "$VENV/bin/python" scripts/index_folder.py "$@") || rc=$?
     trap - INT
     if [ "$was_active" = 1 ]; then

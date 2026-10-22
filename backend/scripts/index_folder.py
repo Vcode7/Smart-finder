@@ -76,6 +76,18 @@ def _ensure_cuda_libs() -> None:
         os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+def _raise_file_limit() -> None:
+    """A shell (tmux) allows 1024 open files; the backend service gets 65536."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except Exception:
+        pass   # Windows has no such limit
+
+
 def _say(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -295,6 +307,7 @@ def main() -> None:
         ap.error("give a folder to index, --admin-email, or both")
     include, exclude = _kinds(args.include, "-i"), _kinds(args.exclude, "-e")
 
+    _raise_file_limit()
     if args.path:
         _ensure_cuda_libs()
     for stream in (sys.stdout, sys.stderr):
