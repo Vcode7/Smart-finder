@@ -88,6 +88,29 @@ def _raise_file_limit() -> None:
         pass   # Windows has no such limit
 
 
+def check_gpu() -> None:
+    """Stop before indexing hours of files with models that cannot run: a PyTorch build that
+    lacks the GPU's architecture makes every model call fail, and the files still end up
+    'indexed' without meaning vectors."""
+    import torch
+    if not torch.cuda.is_available():
+        _say("No GPU found: indexing will run on the CPU, which is very slow.")
+        return
+    name = torch.cuda.get_device_name(0)
+    major, minor = torch.cuda.get_device_capability(0)
+    try:
+        (torch.ones(8, device="cuda") @ torch.ones(8, device="cuda")).item()
+        torch.nn.functional.softmax(torch.ones(4, 4, device="cuda"), dim=-1).sum().item()
+    except Exception as e:
+        archs = ", ".join(torch.cuda.get_arch_list()) or "none"
+        sys.exit(
+            f"The GPU '{name}' (compute capability {major}.{minor}) cannot run this PyTorch build "
+            f"(torch {torch.__version__}, built for: {archs}).\n  {str(e).splitlines()[0]}\n"
+            f"Install a PyTorch build that supports it (an RTX 50-series card needs the CUDA 12.8 build, "
+            f"torch 2.7 or newer), or set CUDA_VISIBLE_DEVICES= to run on the CPU (very slow). Nothing was indexed.")
+    _say(f"GPU: {name} (compute capability {major}.{minor}), torch {torch.__version__}")
+
+
 def _say(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -266,11 +289,20 @@ def _progress_line(state: dict, pipeline, started: float) -> str:
     return f"{', '.join(parts)} | {(time.time() - started) / 3600:.1f} h{_open_files()}{now}"
 
 
-async def index(manager, lib, retry: bool = True) -> None:
+def reindex_all(lib) -> int:
+    """Index every file again from scratch (each run first removes the file's old index rows)."""
+    return lib.db.execute(
+        "UPDATE sources SET status = 'queued', attempts = 0, error = NULL, transcript = NULL, captions = NULL, "
+        "sounds = NULL, image_vectors = NULL WHERE status IN ('indexed', 'failed')")
+
+
+async def index(manager, lib, retry: bool = True, reindex: bool = False) -> None:
     from app.ingest.pipeline import IngestionPipeline
     from app.library.scanner import scan_library
 
-    if retry and (n := await asyncio.to_thread(retry_failed, lib)):
+    if reindex:
+        _say(f"Indexing {await asyncio.to_thread(reindex_all, lib)} files again from scratch")
+    elif retry and (n := await asyncio.to_thread(retry_failed, lib)):
         _say(f"Retrying {n} files that failed earlier (--skip-failed leaves them)")
 
     _say("Scanning the folder...")
@@ -316,6 +348,8 @@ def main() -> None:
     ap.add_argument("--name", help="library name shown in the app (default: the folder name)")
     ap.add_argument("--skip-failed", action="store_true",
                     help="do not retry files that failed in an earlier run (they are retried by default)")
+    ap.add_argument("--reindex", action="store_true",
+                    help="index every file again from scratch (e.g. after fixing the GPU setup)")
     kinds = ap.add_mutually_exclusive_group()
     kinds.add_argument("-i", "--include", action="append", metavar="TYPE",
                        help="index only these file types: docs, image, video, audio")
@@ -349,10 +383,11 @@ def main() -> None:
     if not args.path:
         return
 
+    check_gpu()
     manager, lib = _open_library(args.path, args.name)
     try:
         apply_kind_filter(lib, include, exclude)
-        asyncio.run(index(manager, lib, retry=not args.skip_failed))
+        asyncio.run(index(manager, lib, retry=not args.skip_failed, reindex=args.reindex))
     except KeyboardInterrupt:
         _say("Interrupted. Run the same command again to continue where it stopped.")
     finally:
