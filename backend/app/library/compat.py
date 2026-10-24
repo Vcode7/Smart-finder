@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 from app.core.files import is_within, sanitize_filename, unique_path
+from app.core.config import settings
 from app.library.manager import Library, LibraryManager, get_library_manager
 from app.library.sources import (
     PRIORITY_CHANGED, PRIORITY_UPLOAD, add_or_update_source, exclude_path, file_kind, queue_source, remove_source,
@@ -157,7 +158,7 @@ def detail(lib: Library, src: Dict[str, Any]) -> Dict[str, Any]:
                  "ocr_text": v["ocr_text"] if v else None, "description": v["caption"] if v else None}
     faces = [
         {"id": f["id"], "timestamp": f["ts"], "page": f["page"], "quality": f["quality"],
-         "cropUrl": f"/api/knowledge/{sid}/faces/{f['id']}" if f["crop_path"] else None}
+         "cropUrl": f"{settings.base_path}/api/knowledge/{sid}/faces/{f['id']}" if f["crop_path"] else None}
         for f in lib.db.all("SELECT * FROM faces WHERE source_id = ? ORDER BY quality DESC LIMIT 60", (sid,))
     ]
     return {

@@ -4,6 +4,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { useChatStore } from '@/store/chat';
+import { withBase } from '@/lib/base-path';
 
 export interface AuthUser {
   id: string;
@@ -44,7 +45,7 @@ export const useAuthStore = create<AuthState>()(
         set({ user: null });
         useChatStore.getState().reset();
         // Full page load (not router.push): drops every in-memory store of the signed-out account
-        window.location.replace('/auth/login');
+        window.location.replace(withBase('/auth/login'));
       },
 
       fetchMe: async () => {

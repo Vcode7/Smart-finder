@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { useChatStore, ContextItem } from '@/store/chat';
 import { toast } from 'sonner';
+import { withBase } from '@/lib/base-path';
 
 export interface ProcessingLogEntry {
   timestamp: string;
@@ -655,7 +656,7 @@ export function DocumentMetadataModal({
                           ref={mediaRef as React.RefObject<HTMLVideoElement>}
                           controls
                           className="w-full h-full object-contain"
-                          src={`/api/knowledge/${source.id}/file`}
+                          src={withBase(`/api/knowledge/${source.id}/file`)}
                           onLoadedMetadata={handleLoadedMetadata}
                         />
                       </div>
@@ -676,7 +677,7 @@ export function DocumentMetadataModal({
                           ref={mediaRef as React.RefObject<HTMLAudioElement>}
                           controls
                           className="w-full max-w-md mt-2"
-                          src={`/api/knowledge/${source.id}/file`}
+                          src={withBase(`/api/knowledge/${source.id}/file`)}
                           onLoadedMetadata={handleLoadedMetadata}
                         />
                       </div>
@@ -685,7 +686,7 @@ export function DocumentMetadataModal({
                     {isImage && (
                       <div className="w-full max-h-[400px] flex items-center justify-center rounded-2xl overflow-hidden bg-black/30 border border-[var(--border)] p-2">
                         {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img src={`/api/knowledge/${source.id}/file`} alt={source.original_name} className="max-h-[380px] object-contain rounded-xl" />
+                        <img src={withBase(`/api/knowledge/${source.id}/file`)} alt={source.original_name} className="max-h-[380px] object-contain rounded-xl" />
                       </div>
                     )}
 
@@ -700,7 +701,7 @@ export function DocumentMetadataModal({
                           </div>
                         </div>
                         <a
-                          href={`/api/knowledge/${source.id}/file`}
+                          href={withBase(`/api/knowledge/${source.id}/file`)}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 transition-colors"
@@ -733,7 +734,7 @@ export function DocumentMetadataModal({
                           <div className="aspect-video w-full rounded-xl overflow-hidden bg-black/60 relative mb-2">
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
-                              src={`/api/knowledge/${source.id}/frames/${frame.id}`}
+                              src={withBase(`/api/knowledge/${source.id}/frames/${frame.id}`)}
                               alt={`Scene ${frame.scene_id}`}
                               className="w-full h-full object-cover group-hover:opacity-90 transition-opacity"
                             />

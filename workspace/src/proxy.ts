@@ -11,6 +11,8 @@ const PUBLIC_PATHS = ['/auth/login', '/auth/signup', '/auth/admin-signup', '/_ne
 
 export function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
+  // nextUrl keeps the basePath; new URL(path, req.url) would drop it
+  const to = (path: string) => { const u = req.nextUrl.clone(); u.pathname = path; u.search = ''; return u; };
 
   if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
     return NextResponse.next();
@@ -23,25 +25,26 @@ export function proxy(req: NextRequest) {
 
   const token = req.cookies.get(COOKIE_NAME)?.value;
   if (!token) {
-    return NextResponse.redirect(new URL('/auth/login', req.url));
+    return NextResponse.redirect(to('/auth/login'));
   }
 
   const payload = verifyToken(token);
   if (!payload) {
-    const res = NextResponse.redirect(new URL('/auth/login', req.url));
+    const res = NextResponse.redirect(to('/auth/login'));
     res.cookies.delete(COOKIE_NAME);
     return res;
   }
 
   if (pathname.startsWith('/admin') && payload.role !== 'admin') {
-    return NextResponse.redirect(new URL('/', req.url));
+    return NextResponse.redirect(to('/'));
   }
 
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: ['/((?!api/|_next/static|_next/image|favicon.ico).*)'],
+  // '/' listed on its own: under a basePath the pattern below does not match the bare root
+  matcher: ['/', '/((?!api/|_next/static|_next/image|favicon.ico).*)'],
 };
 
 export default proxy;

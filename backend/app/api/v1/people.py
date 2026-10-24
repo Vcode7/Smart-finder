@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_admin, require_auth
+from app.core.config import settings
 from app.core.access import visible_library_ids
 from app.database.session import db_all, db_get, db_run
 from app.library.manager import LibraryError, get_library_manager
@@ -38,7 +39,7 @@ def _cover_url(cover: Optional[str], allowed: Optional[Set[str]] = None) -> Opti
     lib_id, source_id, face_id = cover.split(":", 2)
     if allowed is not None and lib_id not in allowed:
         return None
-    return f"/api/knowledge/{source_id}/faces/{face_id}"
+    return f"{settings.base_path}/api/knowledge/{source_id}/faces/{face_id}"
 
 
 def _person(row: Dict[str, Any], allowed: Optional[Set[str]] = None,
@@ -91,8 +92,8 @@ def _media(person_id: str, offset: int, limit: int, allowed: Optional[Set[str]] 
             "sourceId": src["id"], "libraryId": lib.id, "libraryName": lib.name, "title": src["name"],
             "kind": src["kind"], "relPath": src["rel_path"], "faces": r["n"], "timestamps": times,
             "page": best["page"] if best else None,
-            "thumbnail": f"/api/knowledge/{src['id']}/thumbnail",
-            "faceCrop": f"/api/knowledge/{src['id']}/faces/{best['id']}" if best and best["crop_path"] else None,
+            "thumbnail": f"{settings.base_path}/api/knowledge/{src['id']}/thumbnail",
+            "faceCrop": f"{settings.base_path}/api/knowledge/{src['id']}/faces/{best['id']}" if best and best["crop_path"] else None,
             "faceId": best["id"] if best else None,
         })
     return {"total": len(found), "offset": offset, "limit": limit, "items": items}

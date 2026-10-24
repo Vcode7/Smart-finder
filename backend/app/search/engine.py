@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from app.core.config import settings
 from app.library.manager import Library, LibraryManager, get_library_manager
 from app.search.constants import STOPWORDS
 from app.search.folders import match_folders, scope_members
@@ -974,7 +975,7 @@ class SearchEngine:
                 "timestamp": v.get("ts"),
                 "page": v.get("page"),
                 "kind": v.get("kind"),
-                "framePath": f"/api/knowledge/{sid}/frames/{vid}",
+                "framePath": f"{settings.base_path}/api/knowledge/{sid}/frames/{vid}",
                 "similarity": round(sim, 2),
                 "isFaceMatch": is_face,
                 "faceSimilarity": round(face_scores[vid], 4) if vid in face_scores else None,
@@ -1022,7 +1023,7 @@ class SearchEngine:
 
         is_face_match = any(fr["isFaceMatch"] for fr in frames) or (
             f.best.get("face") is not None and f.best["face"].score >= FACE_MATCH)
-        thumb = f"/api/knowledge/{sid}/thumbnail" if (meta.get("thumbnail") or kind != "image") else f"/api/knowledge/{sid}/file"
+        thumb = f"{settings.base_path}/api/knowledge/{sid}/thumbnail" if (meta.get("thumbnail") or kind != "image") else f"{settings.base_path}/api/knowledge/{sid}/file"
         return {
             "id": f"src-{sid}",
             "sourceId": sid,

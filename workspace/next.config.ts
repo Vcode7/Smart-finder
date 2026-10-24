@@ -8,7 +8,14 @@ const lanHosts = Object.values(os.networkInterfaces())
   .filter((ni): ni is os.NetworkInterfaceInfo => Boolean(ni) && ni!.family === 'IPv4' && !ni!.internal)
   .map((ni) => ni.address);
 
+// Serve the app under a path prefix (e.g. /smartfinder behind a reverse proxy); empty = root.
+// Read at build time. Next prefixes pages, <Link>, router and /_next itself; the app adds it
+// to fetch() (src/instrumentation-client.ts) and to <img>/<a> URLs (src/lib/base-path.ts).
+const basePath = process.env.NEXT_BASE_PATH || '';
+
 const nextConfig: NextConfig = {
+  basePath,
+  env: { NEXT_PUBLIC_BASE_PATH: basePath },
   allowedDevOrigins: [
     ...lanHosts,
     '0fa5-2409-40f2-2173-7fc2-b005-6255-ac33-2762.ngrok-free.app',

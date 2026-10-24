@@ -52,7 +52,7 @@ conf_set() {  # conf_set FILE KEY VALUE
 
 load_conf() {
     RUN_USER=$(conf_get "$CONF" RUN_USER)
-    FRONTEND_HOST=$(conf_get "$CONF" FRONTEND_HOST); FRONTEND_HOST=${FRONTEND_HOST:-0.0.0.0}
+    FRONTEND_HOST=$(conf_get "$CONF" FRONTEND_HOST); FRONTEND_HOST=${FRONTEND_HOST:-127.0.0.1}
     FRONTEND_PORT=$(conf_get "$CONF" FRONTEND_PORT); FRONTEND_PORT=${FRONTEND_PORT:-3000}
     GIT_REPO_URL=$(conf_get "$CONF" GIT_REPO_URL)
     GIT_BRANCH=$(conf_get "$CONF" GIT_BRANCH); GIT_BRANCH=${GIT_BRANCH:-main}
@@ -211,7 +211,8 @@ workspace_hash() {
 
 step_build() {
     local key was_running=0
-    key="$(workspace_hash) backend:$BACKEND_PORT"
+    # NEXT_BASE_PATH is built in, but .env is left out of workspace_hash
+    key="$(workspace_hash) backend:$BACKEND_PORT base:$(conf_get "$WORKSPACE_ENV" NEXT_BASE_PATH)"
     if [ -f "$APP/workspace/.next/BUILD_ID" ] && stamp_ok frontend-build "$key"; then return 0; fi
     step_node || return 1
     if svc_active frontend; then was_running=1; systemctl stop smartfinder-frontend.service; fi
@@ -263,11 +264,12 @@ start_logging() {  # copy everything this command prints into a log file
 
 print_urls() {
     echo
-    echo "  Web app:          http://localhost:$FRONTEND_PORT"
+    local base; base=$(conf_get "$WORKSPACE_ENV" NEXT_BASE_PATH)
+    echo "  Web app:          http://localhost:$FRONTEND_PORT$base"
     if [ "$FRONTEND_HOST" = "0.0.0.0" ]; then
         local ip
         for ip in $(hostname -I 2>/dev/null); do
-            [[ "$ip" == *:* ]] || echo "  On your network:  http://$ip:$FRONTEND_PORT"
+            [[ "$ip" == *:* ]] || echo "  On your network:  http://$ip:$FRONTEND_PORT$base"
         done
     fi
     echo "  Sign in as:       $(conf_get "$BACKEND_ENV" ADMIN_EMAIL)"

@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 # Decoupled from output limit so results ranked 10-50 are not silently dropped.
 _FAISS_RECALL_K = 50
 from app.database.session import db_all
+from app.core.config import settings
 from app.search.model_pipeline import (
     get_text_query_embedding,
     get_multimodal_text_embedding,
@@ -249,9 +250,9 @@ def resolve_parent_files(source_signals: Dict[str, Dict[str, Any]]) -> Dict[str,
             })
         matching_frames.sort(key=lambda x: x["similarity"], reverse=True)
 
-        thumbnail_url = f"/api/knowledge/{src['id']}/file"
+        thumbnail_url = f"{settings.base_path}/api/knowledge/{src['id']}/file"
         if category in ("document", "video", "audio"):
-            thumbnail_url = f"/api/knowledge/{src['id']}/thumbnail"
+            thumbnail_url = f"{settings.base_path}/api/knowledge/{src['id']}/thumbnail"
 
         complete_file_item = {
             "id": f"src-{src['id']}",

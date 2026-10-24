@@ -20,6 +20,7 @@ import DiscoveryTrace from '@/components/search/DiscoveryTrace';
 import { useChatStore, ContextItem } from '@/store/chat';
 import { toast } from 'sonner';
 import type { LocalCategorizedItem, InternetCategorizedItem } from '@/types/research';
+import { withBase } from '@/lib/base-path';
 
 const SUGGESTED_QUERIES = [
   'SSC Chairman Gopal Krishna',
@@ -1285,7 +1286,7 @@ export default function SmartSearchPage() {
                                       <div className="aspect-video w-full rounded-xl overflow-hidden relative" style={{ background: 'var(--bg-active)' }}>
                                         {/* eslint-disable-next-line @next/next/no-img-element */}
                                         <img
-                                          src={vid.primaryFrame?.id ? `/api/knowledge/${cleanId}/frames/${vid.primaryFrame.id}` : vid.thumbnail}
+                                          src={vid.primaryFrame?.id ? withBase(`/api/knowledge/${cleanId}/frames/${vid.primaryFrame.id}`) : vid.thumbnail}
                                           alt={vid.title}
                                           loading="lazy"
                                           className="w-full h-full object-cover"
@@ -1470,7 +1471,7 @@ export default function SmartSearchPage() {
                                               <span>Similar</span>
                                             </button>
                                             <a
-                                              href={`/api/knowledge/${cleanId}/file`}
+                                              href={withBase(`/api/knowledge/${cleanId}/file`)}
                                               target="_blank"
                                               rel="noopener noreferrer"
                                               onClick={(e) => e.stopPropagation()}

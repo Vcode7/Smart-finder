@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     PORT: int = 8000
     ENVIRONMENT: str = "development"
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001"
+    # Path prefix the web app is served under (equal to NEXT_BASE_PATH in the web app's .env;
+    # empty = root). Prefixes the /api/knowledge/... image addresses the backend hands out.
+    PUBLIC_BASE_PATH: str = ""
 
     # Storage paths
     DB_PATH: str = "data/smartfind.db"
@@ -97,6 +100,10 @@ class Settings(BaseSettings):
     SERP_API_KEY: str = ""
     NEWS_API_KEY: str = ""
     SEMANTIC_SCHOLAR_API_KEY: str = ""
+
+    @property
+    def base_path(self) -> str:
+        return self.PUBLIC_BASE_PATH.strip().rstrip("/")
 
     def get_cors_origins(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]

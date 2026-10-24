@@ -3,8 +3,9 @@
 
 # Account the services run as (needs access to the folders you index)
 RUN_USER=
-# Web app address: 0.0.0.0 = reachable from other devices on the network
-FRONTEND_HOST=0.0.0.0
+# Web app address: 127.0.0.1 = this machine only (put a reverse proxy in front for other
+# devices); 0.0.0.0 = reachable from other devices on the network
+FRONTEND_HOST=127.0.0.1
 FRONTEND_PORT=3000
 # Where smartfinder-ctl setup / update-code get the code
 GIT_REPO_URL=https://github.com/Vcode7/Smart-finder.git
