@@ -217,6 +217,11 @@ class LLMRouter:
         installed_names = [m["name"] for m in status.get("models", [])]
         selected = self.get_selected_model()
 
+        if selected and selected not in installed_names and ":" not in selected:
+            # "qwen3.5" means "qwen3.5:latest" to Ollama
+            if f"{selected}:latest" in installed_names:
+                selected = f"{selected}:latest"
+
         if not selected or selected not in installed_names:
             # Selected model is missing from Ollama
             return False, "groq", settings.GROQ_MODEL
@@ -237,6 +242,7 @@ class LLMRouter:
         timeout = float(caller_timeout if caller_timeout is not None else settings.OLLAMA_TIMEOUT)
         if caller_timeout is not None:
             kwargs["timeout"] = float(caller_timeout)  # honoured by the Groq fallback
+        ollama_error: Optional[Exception] = None
 
         if ready:
             endpoint = self.get_endpoint()
@@ -249,6 +255,7 @@ class LLMRouter:
                 else:
                     return self._call_ollama_sync(endpoint, ollama_payload, model, timeout)
             except Exception as e:
+                ollama_error = e
                 try:
                     print(
                         f"[LLMRouter] [WARN] Ollama execution error ({type(e).__name__}: {e}) -> "
@@ -259,6 +266,7 @@ class LLMRouter:
                     pass
 
         # Fallback to Groq
+        self._require_groq_key(model, ollama_error)
         return self._call_groq_sync(kwargs)
 
     async def execute_async_chat_completion(self, **kwargs) -> Any:
@@ -270,6 +278,7 @@ class LLMRouter:
         timeout = float(caller_timeout if caller_timeout is not None else settings.OLLAMA_TIMEOUT)
         if caller_timeout is not None:
             kwargs["timeout"] = float(caller_timeout)  # honoured by the Groq fallback
+        ollama_error: Optional[Exception] = None
 
         if ready:
             endpoint = self.get_endpoint()
@@ -281,6 +290,7 @@ class LLMRouter:
                 else:
                     return await self._call_ollama_async(endpoint, ollama_payload, model, timeout)
             except Exception as e:
+                ollama_error = e
                 try:
                     print(
                         f"[LLMRouter] [WARN] Ollama async call error ({type(e).__name__}: {e}) -> "
@@ -291,6 +301,7 @@ class LLMRouter:
                     pass
 
         # Fallback to Groq
+        self._require_groq_key(model, ollama_error)
         return await self._call_groq_async(kwargs)
 
     # ─── Structured JSON Request Execution ───────────────────────────────────
@@ -438,6 +449,26 @@ class LLMRouter:
                 yield chunk
 
     # ─── Internal Groq Fallback Helpers ──────────────────────────────────────
+
+    def _require_groq_key(
+        self, model: Optional[str], ollama_error: Optional[Exception]
+    ) -> None:
+        """Raise an error that says why Ollama was skipped when Groq cannot take over."""
+        if settings.get_groq_api_keys():
+            return
+        if ollama_error is not None:
+            why = f"Ollama model '{model}' failed ({type(ollama_error).__name__}: {ollama_error})"
+        else:
+            status = self.get_ollama_status()
+            if not status.get("connected"):
+                why = f"Ollama is unreachable at {self.get_endpoint()} ({status.get('error')})"
+            else:
+                installed = ", ".join(m["name"] for m in status.get("models", [])) or "none"
+                why = (
+                    f"Ollama model '{self.get_selected_model() or '(none selected)'}' is not installed "
+                    f"(installed: {installed})"
+                )
+        raise RuntimeError(f"{why}, and no GROQ_API_KEY is configured as a fallback.")
 
     def _call_groq_sync(self, kwargs: Dict[str, Any]) -> Any:
         from app.ai.groq_client import get_groq_key_manager

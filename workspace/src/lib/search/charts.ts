@@ -134,9 +134,13 @@ export function byTopic(files: DashboardFile[]): Bucket[] {
       else map.set(key, { key, label: t.trim(), count: 1 });
     }
   }
-  return [...map.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const sorted = [...map.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  // Across many files a topic only one file has is noise (OCR slips, one-off words), not a theme
+  const shared = sorted.filter((b) => b.count >= 2);
+  return files.length >= MIN_FILES_FOR_SHARED_TOPICS && shared.length > 0 ? shared : sorted;
 }
 
+const MIN_FILES_FOR_SHARED_TOPICS = 10;
 const MAX_FILLED_BUCKETS = 240;
 
 /** Files per period, in time order; empty years and months between the first and last are kept. */

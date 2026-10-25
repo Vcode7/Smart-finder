@@ -23,6 +23,7 @@ from app.library.manager import Library
 from app.search.constants import STOPWORDS
 
 MAX_TOPICS = 6
+DERIVE_VERSION = "#t2"      # bump when derive_topics changes, so cached index-derived topics are redone
 MAX_EVENTS = 3
 
 _WORD = re.compile(r"[^\W\d_][\w'-]*", re.UNICODE)        # starts with a letter (Latin or Devanagari)
@@ -43,6 +44,18 @@ _GENERIC = {
     "page", "pages", "chapter", "contents", "index", "abstract", "introduction", "copy", "final", "draft",
 }
 _PAGE_HEADING = re.compile(r"^(page\s*\d+|p\.?\s*\d+|\d+)$", re.IGNORECASE)
+# Camera folders and file stems: "110EOSR6", "100MSDCF", "IMG_0042", "DSC01234", "P1000123"
+_CAMERA_CODE = re.compile(r"^(?:\d{2,3}[A-Za-z]{2,}[A-Za-z0-9_]*|(?:img|dsc|dscn|dscf|pxl|mvi|vid|p)[\s_-]?\d{3,}.*)$",
+                          re.IGNORECASE)
+# What image captions say about every photo; never a topic on their own
+_CAPTION_FILLER = {
+    "wearing", "sitting", "standing", "large", "small", "people", "person", "group", "side", "background", "front",
+    "room", "screen", "looking", "giving", "holding", "their", "they", "them", "there", "three", "four", "five",
+    "white", "black", "left", "right", "smiling", "text", "hands", "hand", "table", "chairs", "chair", "woman",
+    "women", "man", "men", "while", "behind", "several", "microphone", "microphones", "suit", "suits", "stage",
+    "shows", "showing", "reads", "wooden", "portrait", "podium", "audience", "uniform", "clapping", "decorated",
+    "projector", "banner", "image", "photo", "picture", "wall", "floor", "blue", "red", "green", "dark",
+}
 
 
 _LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
@@ -50,13 +63,18 @@ _LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
 
 def _clean_phrase(text: str, limit: int = 60) -> str:
     text = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n-_:;,.|#*"))
-    return _LEADING_ARTICLE.sub("", text)[:limit].rstrip()
+    text = _LEADING_ARTICLE.sub("", text)
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
+    return text.rstrip()
 
 
 def _is_generic(phrase: str) -> bool:
     low = phrase.lower().strip()
-    return (not low or low in _GENERIC or bool(_PAGE_HEADING.match(low))
-            or len(low) < 3 or not re.search(r"[^\W\d_]", low))
+    words = low.split()
+    return (not low or low in _GENERIC or bool(_PAGE_HEADING.match(low)) or bool(_CAMERA_CODE.match(low))
+            or len(low) < 3 or not re.search(r"[^\W\d_]", low)
+            or all(w in _CAPTION_FILLER or w in STOPWORDS for w in words))
 
 
 def _name_tokens(name: str) -> str:
@@ -77,9 +95,14 @@ def _dedupe(items: Iterable[str], limit: int) -> List[str]:
 
 
 def derive_topics(name: str, folder: str, headings: List[str], texts: List[str],
-                  people: List[str]) -> Tuple[List[str], List[str]]:
-    """(topics, events) from the pieces of a file's indexed text."""
-    body = "\n".join(t for t in texts if t)[:20000]
+                  people: List[str], captions: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
+    """
+    (topics, events) from the pieces of a file's indexed text. `captions` (image captions and OCR)
+    can name things ("Union Public Service Commission") but their single words are only filler
+    ("Sitting", "Stage"), so they feed the named phrases and events, never the word counts.
+    """
+    prose = "\n".join(t for t in texts if t)[:20000]
+    body = (prose + "\n" + "\n".join(c for c in (captions or []) if c))[:24000]
     folder = (folder or "").replace("\\", "/")
 
     events: List[str] = []
@@ -100,8 +123,9 @@ def derive_topics(name: str, folder: str, headings: List[str], texts: List[str],
         if not _is_generic(phrase):
             named[phrase] += 1
     words = Counter(
-        w.lower() for w in _WORD.findall(body)
-        if len(w) >= 4 and w.lower() not in STOPWORDS and w.lower() not in _GENERIC and not w.isupper()
+        w.lower() for w in _WORD.findall(prose)
+        if len(w) >= 4 and w.lower() not in STOPWORDS and w.lower() not in _GENERIC
+        and w.lower() not in _CAPTION_FILLER and not w.isupper()
     )
 
     # The title chunk's heading is the file's own path or name: not a topic
@@ -176,7 +200,9 @@ def get_insights(lib: Library, source_id: str) -> Dict[str, Any]:
         return {"topics": [], "events": [], "summary": None, "origin": "index"}
     fp = _fingerprint(src)
     cached = lib.db.one("SELECT * FROM source_insights WHERE source_id = ?", (source_id,))
-    if cached and cached.get("fingerprint") == fp:
+    # Index-derived topics also carry the version of the derivation, so improving it refreshes old rows
+    want = fp if cached and cached.get("origin") == "llm" else fp + DERIVE_VERSION
+    if cached and cached.get("fingerprint") == want:
         return _row_to_insight(cached)
 
     chunks = _sample_chunks(lib, source_id, 6000)
@@ -185,17 +211,18 @@ def get_insights(lib: Library, source_id: str) -> Dict[str, Any]:
         "SELECT title FROM sections WHERE source_id = ? AND title IS NOT NULL ORDER BY ord LIMIT 8", (source_id,))]
     visual = lib.db.all("SELECT caption, ocr_text FROM visual_items WHERE source_id = ? ORDER BY id LIMIT 6",
                         (source_id,))
-    texts = [c["text"] for c in chunks] + [v["caption"] for v in visual if v["caption"]] \
-        + [v["ocr_text"] for v in visual if v["ocr_text"]]
+    texts = [c["text"] for c in chunks]
+    captions = [v["caption"] for v in visual if v["caption"]] + [v["ocr_text"] for v in visual if v["ocr_text"]]
     topics, events = derive_topics(src["name"], src.get("folder") or "", list(dict.fromkeys(headings)), texts,
-                                   _people(lib, source_id))
+                                   _people(lib, source_id), captions)
     try:
         lib.db.execute(
             "INSERT INTO source_insights (source_id, fingerprint, topics_json, events_json, origin) "
             "VALUES (?, ?, ?, ?, 'index') ON CONFLICT(source_id) DO UPDATE SET fingerprint = excluded.fingerprint, "
             "topics_json = excluded.topics_json, events_json = excluded.events_json, summary = NULL, "
             "origin = 'index', model = NULL, updated_at = datetime('now')",
-            (source_id, fp, json.dumps(topics, ensure_ascii=False), json.dumps(events, ensure_ascii=False)))
+            (source_id, fp + DERIVE_VERSION, json.dumps(topics, ensure_ascii=False),
+             json.dumps(events, ensure_ascii=False)))
     except Exception as e:     # a read-only library still gets topics, just not cached
         print(f"[Insights] not cached for {source_id}: {e}")
     return {"topics": topics, "events": events, "summary": None, "origin": "index"}

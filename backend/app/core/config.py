@@ -75,7 +75,8 @@ class Settings(BaseSettings):
     # Ollama Local LLM
     OLLAMA_ENDPOINT: str = "http://localhost:11434"
     OLLAMA_MODEL: str = ""
-    OLLAMA_TIMEOUT: float = 12.0
+    # Seconds to wait on Ollama (the first request also loads the model into memory)
+    OLLAMA_TIMEOUT: float = 120.0
 
     # Groq AI
     GROQ_API_KEY: str = ""
