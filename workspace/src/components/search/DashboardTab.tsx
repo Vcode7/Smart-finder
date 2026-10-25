@@ -13,6 +13,10 @@ import {
   dateLabel, filterExcept, folderKey, formatBytes, type Filters,
 } from '@/lib/search/charts';
 import {
+  cameraBuckets, durationBins, formatDuration, ofKind, orientationBins, pageBins, peopleBuckets, resolutionBins,
+  sizeBins, totalPages, totalRuntime, transcriptBins, videoQualityBins, withLocation,
+} from '@/lib/search/typeStats';
+import {
   DASHBOARD_CHARTS, DEFAULT_DASHBOARD_THRESHOLD, useSearchViewStore, type ChartId, type DateField, type DateGrain,
 } from '@/store/searchView';
 import type { AsyncData, DashboardData } from '@/types/insights';
@@ -20,7 +24,7 @@ import { withBase } from '@/lib/base-path';
 
 const PRESETS = [10, 20, 30, 50, 75];
 const DATE_FIELDS: { id: DateField; label: string }[] = [
-  { id: 'modifiedAt', label: 'Modified' }, { id: 'takenAt', label: 'Taken' }, { id: 'indexedAt', label: 'Indexed' },
+  { id: 'best', label: 'Best date' }, { id: 'modifiedAt', label: 'Modified' }, { id: 'takenAt', label: 'Taken' }, { id: 'indexedAt', label: 'Indexed' },
 ];
 const DATE_GRAINS: { id: DateGrain; label: string }[] = [{ id: 'year', label: 'Year' }, { id: 'month', label: 'Month' }, { id: 'day', label: 'Day' }];
 const FILE_LIST_SIZE = 20;
@@ -82,6 +86,24 @@ export default function DashboardTab({ state, onRetry }: Props) {
   const totalBytes = useMemo(() => shown.reduce((s, f) => s + (f.fileSize || 0), 0), [shown]);
   const folderCount = useMemo(() => new Set(shown.map(folderKey)).size, [shown]);
   const typeCount = useMemo(() => new Set(shown.map((f) => (f.fileType || '').toLowerCase())).size, [shown]);
+
+  // Per-kind analytics over the files that pass every filter
+  const kinds = useMemo(() => {
+    const docs = ofKind(shown, 'document');
+    const images = ofKind(shown, 'image');
+    const videos = ofKind(shown, 'video');
+    const audio = ofKind(shown, 'audio');
+    return {
+      docs, images, videos, audio,
+      sizes: sizeBins(shown), people: peopleBuckets(shown),
+      pages: pageBins(docs), pageTotal: totalPages(docs),
+      resolution: resolutionBins(images), orientation: orientationBins(images),
+      cameras: cameraBuckets(images), located: withLocation(images),
+      videoLength: durationBins(videos), videoQuality: videoQualityBins(videos), videoRuntime: totalRuntime(videos),
+      videoSpeech: transcriptBins(videos),
+      audioLength: durationBins(audio), audioRuntime: totalRuntime(audio), audioSpeech: transcriptBins(audio),
+    };
+  }, [shown]);
 
   // Labels of the active filters, for the chips
   const chips: { key: keyof Filters; label: string }[] = [];
@@ -289,6 +311,71 @@ export default function DashboardTab({ state, onRetry }: Props) {
         </div>
       )}
 
+      {/* Charts that only make sense for one kind of file */}
+      {files.length > 0 && visible('kinds') && shown.length > 0 && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card title="File sizes" sub={`${formatBytes(totalBytes)} in total`}>
+              <BarList buckets={kinds.sizes} total={shown.length} limit={5} />
+            </Card>
+            {kinds.people.length > 0 && (
+              <Card title="People" sub="Recognised in these files">
+                <BarList buckets={kinds.people} total={shown.length} limit={8} />
+              </Card>
+            )}
+          </div>
+
+          {kinds.docs.length > 0 && (
+            <KindSection title="Documents" sub={`${kinds.docs.length} files${kinds.pageTotal ? ` · ${kinds.pageTotal.toLocaleString()} pages` : ''}`} color={CATEGORY_COLOR.document}>
+              <Card title="Length" sub="Pages per document">
+                <BarList buckets={kinds.pages} total={kinds.docs.length} limit={5} colorOf={() => CATEGORY_COLOR.document} />
+              </Card>
+            </KindSection>
+          )}
+
+          {kinds.images.length > 0 && (
+            <KindSection title="Images" sub={`${kinds.images.length} files${kinds.located ? ` · ${kinds.located} with a location` : ''}`} color={CATEGORY_COLOR.image}>
+              <Card title="Resolution" sub="Megapixels">
+                <BarList buckets={kinds.resolution} total={kinds.images.length} limit={5} colorOf={() => CATEGORY_COLOR.image} />
+              </Card>
+              <Card title="Orientation" sub="Landscape, portrait or square">
+                <BarList buckets={kinds.orientation} total={kinds.images.length} limit={3} colorOf={() => CATEGORY_COLOR.image} />
+              </Card>
+              {kinds.cameras.length > 0 && (
+                <Card title="Cameras" sub="From the photo's metadata">
+                  <BarList buckets={kinds.cameras} total={kinds.images.length} limit={6} colorOf={() => CATEGORY_COLOR.image} />
+                </Card>
+              )}
+            </KindSection>
+          )}
+
+          {kinds.videos.length > 0 && (
+            <KindSection title="Videos" sub={`${kinds.videos.length} files${kinds.videoRuntime ? ` · ${formatDuration(kinds.videoRuntime)} total` : ''}`} color={CATEGORY_COLOR.video}>
+              <Card title="Length" sub="Duration of each video">
+                <BarList buckets={kinds.videoLength} total={kinds.videos.length} limit={5} colorOf={() => CATEGORY_COLOR.video} />
+              </Card>
+              <Card title="Quality" sub="By frame size">
+                <BarList buckets={kinds.videoQuality} total={kinds.videos.length} limit={4} colorOf={() => CATEGORY_COLOR.video} />
+              </Card>
+              <Card title="Speech" sub="Spoken words searchable as text">
+                <BarList buckets={kinds.videoSpeech} total={kinds.videos.length} limit={4} colorOf={() => CATEGORY_COLOR.video} />
+              </Card>
+            </KindSection>
+          )}
+
+          {kinds.audio.length > 0 && (
+            <KindSection title="Audio" sub={`${kinds.audio.length} files${kinds.audioRuntime ? ` · ${formatDuration(kinds.audioRuntime)} total` : ''}`} color={CATEGORY_COLOR.audio}>
+              <Card title="Length" sub="Duration of each recording">
+                <BarList buckets={kinds.audioLength} total={kinds.audio.length} limit={5} colorOf={() => CATEGORY_COLOR.audio} />
+              </Card>
+              <Card title="Speech" sub="Spoken words searchable as text">
+                <BarList buckets={kinds.audioSpeech} total={kinds.audio.length} limit={4} colorOf={() => CATEGORY_COLOR.audio} />
+              </Card>
+            </KindSection>
+          )}
+        </div>
+      )}
+
       {/* The files behind the charts */}
       {files.length > 0 && (
         <Card title={`Matching files (${shown.length})`} sub="Best first">
@@ -324,6 +411,19 @@ export default function DashboardTab({ state, onRetry }: Props) {
           )}
         </Card>
       )}
+    </div>
+  );
+}
+
+function KindSection({ title, sub, color, children }: { title: string; sub: string; color: string; children: ReactNode }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline gap-2">
+        <span className="w-2 h-2 rounded-full flex-shrink-0 self-center" style={{ background: color }} aria-hidden />
+        <h3 className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{title}</h3>
+        <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{sub}</span>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">{children}</div>
     </div>
   );
 }

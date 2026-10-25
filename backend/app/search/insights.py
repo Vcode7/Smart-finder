@@ -41,6 +41,7 @@ _EVENT_RE = re.compile(
 _GENERIC = {
     "documents", "document", "downloads", "download", "pictures", "picture", "photos", "photo", "images", "image",
     "desktop", "new folder", "untitled", "scan", "scans", "img", "dcim", "camera", "screenshots", "misc", "files",
+    "events", "event", "albums", "album", "backup", "backups", "gallery", "my pictures", "whatsapp images",
     "page", "pages", "chapter", "contents", "index", "abstract", "introduction", "copy", "final", "draft",
 }
 _PAGE_HEADING = re.compile(r"^(page\s*\d+|p\.?\s*\d+|\d+)$", re.IGNORECASE)
@@ -94,13 +95,47 @@ def _dedupe(items: Iterable[str], limit: int) -> List[str]:
     return out
 
 
+_DATE_SEGMENT = re.compile(r"^(?:(?:19|20)\d{2}|\d{1,2}|\d{4}[-_.]\d{1,2}(?:[-_.]\d{1,2})?|\d{1,2}[-_.]\d{1,2}[-_.](?:19|20)?\d{2})$")
+
+
+def _folder_topics(folder: str) -> List[str]:
+    """The folder names on a file's path that say something, deepest first ("Events/UPSC Centenary/110EOSR6" -> UPSC Centenary)."""
+    out: List[str] = []
+    for seg in reversed([s for s in (folder or "").replace("\\", "/").split("/") if s]):
+        phrase = _clean_phrase(re.sub(r"[_]+", " ", seg))
+        if _DATE_SEGMENT.match(phrase) or _is_generic(phrase):
+            continue
+        out.append(phrase)
+    return out
+
+
 def derive_topics(name: str, folder: str, headings: List[str], texts: List[str],
-                  people: List[str], captions: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
+                  people: List[str], captions: Optional[List[str]] = None,
+                  is_image: bool = False) -> Tuple[List[str], List[str]]:
     """
     (topics, events) from the pieces of a file's indexed text. `captions` (image captions and OCR)
     can name things ("Union Public Service Commission") but their single words are only filler
     ("Sitting", "Stage"), so they feed the named phrases and events, never the word counts.
+
+    An image says little about its occasion itself, and a model's description of it is not a topic.
+    So its topics are only the folder path it sits in, the people recognised in it and the names
+    printed in it (`captions` must then hold the OCR text alone).
     """
+    if is_image:
+        folders = _folder_topics(folder)
+        events = _dedupe([f for f in folders if any(w in f.lower() for w in _EVENT_WORDS)]
+                         + [p for p in (_clean_phrase(m.group(1)) for c in (captions or [])
+                                        for m in _EVENT_RE.finditer(c or ""))
+                            if p and p.lower() not in _EVENT_WORDS and not _is_generic(p)], MAX_EVENTS)
+        printed: Counter = Counter()
+        for c in captions or []:
+            for m in _NAMED.finditer(c or ""):
+                phrase = _clean_phrase(m.group(0))
+                if not _is_generic(phrase):
+                    printed[phrase] += 1
+        candidates = events + folders[:3] + list(people) + [p for p, _ in printed.most_common(4)]
+        return _dedupe(candidates, MAX_TOPICS), events
+
     prose = "\n".join(t for t in texts if t)[:20000]
     body = (prose + "\n" + "\n".join(c for c in (captions or []) if c))[:24000]
     folder = (folder or "").replace("\\", "/")
@@ -212,9 +247,12 @@ def get_insights(lib: Library, source_id: str) -> Dict[str, Any]:
     visual = lib.db.all("SELECT caption, ocr_text FROM visual_items WHERE source_id = ? ORDER BY id LIMIT 6",
                         (source_id,))
     texts = [c["text"] for c in chunks]
-    captions = [v["caption"] for v in visual if v["caption"]] + [v["ocr_text"] for v in visual if v["ocr_text"]]
-    topics, events = derive_topics(src["name"], src.get("folder") or "", list(dict.fromkeys(headings)), texts,
-                                   _people(lib, source_id), captions)
+    is_image = src.get("kind") == "image"
+    ocr = [v["ocr_text"] for v in visual if v["ocr_text"]]
+    # An image's description is not what it is about: its OCR text and folder are the only evidence
+    captions = ocr if is_image else [v["caption"] for v in visual if v["caption"]] + ocr
+    topics, events = derive_topics(src["name"], src.get("folder") or "", [] if is_image else list(dict.fromkeys(headings)),
+                                   [] if is_image else texts, _people(lib, source_id), captions, is_image)
     try:
         lib.db.execute(
             "INSERT INTO source_insights (source_id, fingerprint, topics_json, events_json, origin) "

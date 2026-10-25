@@ -8,14 +8,14 @@ import type { Bucket } from '@/lib/search/charts';
 interface Props {
   buckets: Bucket[];
   total: number;                          // files the percentages in the tooltip are of
-  activeKey: string | null;
-  onSelect: (key: string | null) => void;
+  activeKey?: string | null;
+  onSelect?: (key: string | null) => void;     // without it the bars are a plain, unclickable breakdown
   colorOf?: (key: string) => string;
   limit?: number;
   noun?: string;
 }
 
-export default function BarList({ buckets, total, activeKey, onSelect, colorOf, limit = 8, noun = 'files' }: Props) {
+export default function BarList({ buckets, total, activeKey = null, onSelect, colorOf, limit = 8, noun = 'files' }: Props) {
   const [all, setAll] = useState(false);
   if (buckets.length === 0) {
     return <p className="text-xs py-6 text-center" style={{ color: 'var(--text-muted)' }}>Nothing to show for the current filters.</p>;
@@ -34,12 +34,11 @@ export default function BarList({ buckets, total, activeKey, onSelect, colorOf, 
         const active = activeKey === b.key;
         const dim = activeKey !== null && !active;
         const pct = total ? Math.round((b.count / total) * 100) : 0;
+        const Row = (onSelect ? 'button' : 'div') as 'button';
         return (
-          <button
+          <Row
             key={b.key}
-            type="button"
-            aria-pressed={active}
-            onClick={() => onSelect(active ? null : b.key)}
+            {...(onSelect ? { type: 'button' as const, 'aria-pressed': active, onClick: () => onSelect(active ? null : b.key) } : {})}
             className="group relative w-full grid grid-cols-[minmax(0,9rem)_1fr_auto] sm:grid-cols-[minmax(0,12rem)_1fr_auto] items-center gap-2 px-1.5 py-1 rounded-lg text-left transition-colors hover:bg-[var(--bg-hover)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
             style={{ background: active ? 'var(--accent-muted)' : undefined }}
           >
@@ -58,7 +57,7 @@ export default function BarList({ buckets, total, activeKey, onSelect, colorOf, 
             >
               {b.label} · {b.count} {noun} · {pct}%
             </span>
-          </button>
+          </Row>
         );
       })}
       {buckets.length > limit && (

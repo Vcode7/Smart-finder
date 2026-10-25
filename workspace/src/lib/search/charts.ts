@@ -42,11 +42,19 @@ export function formatBytes(bytes: number): string {
 export const folderKey = (f: DashboardFile) => `${f.libraryId ?? ''}:${f.folder ?? ''}`;
 const topicKey = (t: string) => t.trim().toLowerCase();
 
-export function dateOf(f: DashboardFile, field: DateField): Date | null {
-  const raw = f[field];
+function parseDate(raw: string | null | undefined): Date | null {
   if (!raw) return null;
   const d = new Date(raw);
   return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * 'best' adapts per file: when it was taken (EXIF) if the file says so, otherwise when it was
+ * modified, otherwise when it was indexed. Copying a file resets its modified date but not its EXIF.
+ */
+export function dateOf(f: DashboardFile, field: DateField): Date | null {
+  if (field === 'best') return parseDate(f.takenAt) ?? parseDate(f.modifiedAt) ?? parseDate(f.indexedAt);
+  return parseDate(f[field]);
 }
 
 export function dateKey(d: Date, grain: DateGrain): string {

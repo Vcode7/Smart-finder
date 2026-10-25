@@ -13,10 +13,12 @@ export const DASHBOARD_CHARTS = [
   { id: 'scores', label: 'Relevance' },
   { id: 'libraries', label: 'Libraries' },
   { id: 'topics', label: 'Topics' },
+  { id: 'kinds', label: 'By file type' },
 ] as const;
 
 export type ChartId = (typeof DASHBOARD_CHARTS)[number]['id'];
-export type DateField = 'modifiedAt' | 'takenAt' | 'indexedAt';
+/** 'best' = the earliest date the file really has: taken (EXIF) if present, else modified, else indexed. */
+export type DateField = 'best' | 'modifiedAt' | 'takenAt' | 'indexedAt';
 export type DateGrain = 'year' | 'month' | 'day';
 
 interface SearchViewState {
@@ -37,7 +39,7 @@ export const useSearchViewStore = create<SearchViewState>()(
     (set) => ({
       dashboardThreshold: DEFAULT_DASHBOARD_THRESHOLD,
       visibleCharts: DASHBOARD_CHARTS.map((c) => c.id),
-      dateField: 'modifiedAt',
+      dateField: 'best',
       dateGrain: 'month',
       setDashboardThreshold: (pct) =>
         set({ dashboardThreshold: Math.min(100, Math.max(1, Math.round(pct) || DEFAULT_DASHBOARD_THRESHOLD)) }),
@@ -50,6 +52,19 @@ export const useSearchViewStore = create<SearchViewState>()(
       setDateField: (dateField) => set({ dateField }),
       setDateGrain: (dateGrain) => set({ dateGrain }),
     }),
-    { name: 'sf-search-view', version: 1 }
+    {
+      name: 'sf-search-view',
+      version: 2,
+      // v1 defaulted to the modified date; the adaptive "best" date replaces it
+      migrate: (persisted) => {
+        const s = (persisted ?? {}) as Partial<SearchViewState>;
+        // the per-file-type section is new, so a saved chart choice should not hide it
+        const charts = (s.visibleCharts ?? []).includes('kinds') ? s.visibleCharts : [...(s.visibleCharts ?? []), 'kinds'];
+        return {
+          ...s, visibleCharts: charts,
+          dateField: s.dateField && s.dateField !== 'modifiedAt' ? s.dateField : 'best',
+        } as SearchViewState;
+      },
+    }
   )
 );

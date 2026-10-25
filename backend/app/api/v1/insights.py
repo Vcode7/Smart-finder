@@ -32,6 +32,7 @@ DASHBOARD_THRESHOLD = 0.30
 SUMMARY_THRESHOLD = 0.05
 DASHBOARD_TOPIC_FILES = 300     # files whose topics the dashboard derives on a first visit
 TOPIC_IDS_MAX = 200
+ATTRIBUTE_BATCH = 500           # ids per SQL IN (...) when reading file attributes
 
 
 class FileRef(BaseModel):
@@ -98,11 +99,66 @@ async def search_topics(req: TopicsRequest, user: Dict[str, Any] = Depends(requi
     return {"topics": await run_in_threadpool(_topics_for, refs)}
 
 
+def _attributes(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    {sourceId: what the index knows about the file itself}: pages, duration, size in pixels,
+    camera, whether it has a location or a transcript, and the people recognised in it. These
+    feed the per-file-type charts; a file the index cannot read simply has none of them.
+    """
+    from json import loads
+    from app.database.session import db_all
+    manager = get_library_manager()
+    by_lib: Dict[str, List[str]] = {}
+    for r in rows:
+        by_lib.setdefault(r.get("libraryId") or "", []).append(r["sourceId"])
+
+    out: Dict[str, Dict[str, Any]] = {}
+    person_names: Dict[Any, str] = {}
+    for lib_id, ids in by_lib.items():
+        lib = manager.get(lib_id)
+        if lib is None or lib.db is None:
+            continue
+        for i in range(0, len(ids), ATTRIBUTE_BATCH):
+            batch = ids[i:i + ATTRIBUTE_BATCH]
+            marks = ",".join("?" * len(batch))
+            try:
+                for s in lib.db.all(
+                        "SELECT id, page_count, duration, width, height, gps_lat, transcript, meta_json "
+                        f"FROM sources WHERE id IN ({marks})", tuple(batch)):
+                    try:
+                        camera = (loads(s.get("meta_json") or "{}") or {}).get("camera")
+                    except Exception:
+                        camera = None
+                    out[s["id"]] = {
+                        "pages": s.get("page_count"), "duration": s.get("duration"),
+                        "width": s.get("width"), "height": s.get("height"),
+                        "hasLocation": s.get("gps_lat") is not None, "camera": camera,
+                        "transcript": s.get("transcript"), "people": [],
+                    }
+                faces = lib.db.all(
+                    f"SELECT DISTINCT source_id, person_id FROM faces WHERE person_id IS NOT NULL AND source_id IN ({marks})",
+                    tuple(batch))
+                wanted = {f["person_id"] for f in faces} - set(person_names)
+                if wanted:
+                    ids_list = list(wanted)
+                    for p in db_all("SELECT id, name FROM persons WHERE hidden = 0 AND name IS NOT NULL AND name != '' "
+                                    f"AND id IN ({','.join('?' * len(ids_list))})", tuple(ids_list)):
+                        person_names[p["id"]] = p["name"]
+                for f in faces:
+                    name = person_names.get(f["person_id"])
+                    if name and f["source_id"] in out:
+                        out[f["source_id"]]["people"].append(name)
+            except Exception as e:      # a library that cannot be read only loses its extra charts
+                print(f"[Insights] attributes failed for library {lib_id}: {e}")
+    return out
+
+
 def _dashboard(session: SearchSession, relative: float) -> Dict[str, Any]:
     kept = cut_rows(session.rows, relative, COMPOSITE_MIN_SCORE)
     top = max((r.get("relevanceScore") or 0.0 for r in session.rows), default=0.0)
     derived = _topics_for([{"libraryId": r.get("libraryId"), "sourceId": r["sourceId"]}
                            for r in kept[:DASHBOARD_TOPIC_FILES]])
+    attrs = _attributes(kept)
     keys = ("id", "sourceId", "libraryId", "libraryName", "category", "title", "fileType", "fileSize", "relPath",
             "folder", "relevanceScore", "modifiedAt", "takenAt", "indexedAt")
     files = []
@@ -111,6 +167,7 @@ def _dashboard(session: SearchSession, relative: float) -> Dict[str, Any]:
         t = derived.get(r["sourceId"])
         row["topics"] = t["topics"] if t else []
         row["events"] = t["events"] if t else []
+        row.update(attrs.get(r["sourceId"]) or {})
         files.append(row)
     return {
         "query": session.query,

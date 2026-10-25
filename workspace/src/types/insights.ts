@@ -23,6 +23,15 @@ export interface DashboardFile {
   indexedAt?: string | null;
   topics: string[];
   events: string[];
+  // What the index knows about the file itself; only the kinds it applies to have them
+  pages?: number | null;
+  duration?: number | null;         // seconds
+  width?: number | null;
+  height?: number | null;
+  camera?: string | null;
+  hasLocation?: boolean;
+  transcript?: string | null;       // pending | running | done | failed
+  people?: string[];
 }
 
 export interface DashboardData {
