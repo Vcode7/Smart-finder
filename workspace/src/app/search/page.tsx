@@ -17,6 +17,11 @@ import Sidebar from '@/components/layout/Sidebar';
 import DocumentMetadataModal from '@/components/modals/DocumentMetadataModal';
 import MarkdownMessage from '@/components/chat/MarkdownMessage';
 import DiscoveryTrace from '@/components/search/DiscoveryTrace';
+import ResultTabs, { panelId, tabId, type ResultTabId, type ResultTabInfo } from '@/components/search/ResultTabs';
+import DashboardTab from '@/components/search/DashboardTab';
+import SummaryTab from '@/components/search/SummaryTab';
+import TopicChips from '@/components/search/TopicChips';
+import { useSearchInsights } from '@/hooks/useSearchInsights';
 import { useChatStore, ContextItem } from '@/store/chat';
 import { toast } from 'sonner';
 import type { LocalCategorizedItem, InternetCategorizedItem } from '@/types/research';
@@ -204,6 +209,40 @@ export default function SmartSearchPage() {
   );
   const thresholdInfo = hasSearched ? localThresholdInfo : null;
 
+  // Result views. The Dashboard and Summary are built by the backend from the same search
+  // (searchId), in the background, after the results above are already on screen.
+  const [activeTab, setActiveTab] = useState<ResultTabId>('top');
+  const [searchId, setSearchId] = useState<string | null>(null);
+  const insightFiles = useMemo(
+    () => [...rawLocalData.documents, ...rawLocalData.videos, ...rawLocalData.images, ...rawLocalData.audio]
+      .map((i) => ({ libraryId: i.libraryId, sourceId: i.sourceId })),
+    [rawLocalData]
+  );
+  const insights = useSearchInsights(searchId, query, insightFiles);
+  const topicProps = (sourceId: string) => ({
+    topics: insights.topicsBySource[sourceId]?.topics,
+    events: insights.topicsBySource[sourceId]?.events,
+  });
+  const summaryJob = insights.summary.data;
+  const resultTabs: ResultTabInfo[] = [
+    { id: 'top', status: 'ready', badge: localData.total + (internetSearched ? internetData.total : 0) },
+    {
+      id: 'dashboard',
+      // A threshold change refreshes in place: the tab only spins while it has nothing to show
+      status: insights.dashboard.status === 'loading' && insights.dashboard.data ? 'ready' : insights.dashboard.status,
+      badge: insights.dashboard.data?.totals.kept,
+    },
+    {
+      id: 'summary',
+      status: insights.summary.status === 'ready' && summaryJob && (summaryJob.status === 'queued' || summaryJob.status === 'running')
+        ? 'loading'
+        : insights.summary.status === 'ready' && summaryJob && (summaryJob.status === 'error' || summaryJob.status === 'cancelled')
+        ? 'error'
+        : insights.summary.status,
+      badge: summaryJob?.docs.length,
+    },
+  ];
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Voice / sound queries recorded in the browser
   const [recording, setRecording] = useState(false);
@@ -331,6 +370,8 @@ export default function SmartSearchPage() {
     setSearching(true);
     setHasSearched(true);
     setSynthesisResult(null);
+    setSearchId(null);          // stops the previous search's dashboard and summary work
+    setActiveTab('top');
 
     try {
       let res: Response;
@@ -391,6 +432,7 @@ export default function SmartSearchPage() {
       setRawLocalData(rawLocal);
       setVisualOnlySearch(visualOnly);
       setDiscoveryTrace(data.discoveryTrace || null);
+      setSearchId(data.searchId || null);
 
       if (!enableInternetSources) {
         setDomainFilter('local');
@@ -428,6 +470,8 @@ export default function SmartSearchPage() {
     setSearching(true);
     setHasSearched(true);
     setSynthesisResult(null);
+    setSearchId(null);
+    setActiveTab('top');
     const displayTitle = sourceTitle || 'Selected Source';
     setQuery(`Similar to: "${displayTitle}"`);
     setInspectSourceId(null);
@@ -463,6 +507,7 @@ export default function SmartSearchPage() {
       setInternetData({ web: [], news: [], papers: [], videos: [], images: [], total: 0 });
       setInternetSearched(false);
       setDiscoveryTrace(data.discoveryTrace || null);
+      setSearchId(data.searchId || null);
       setDomainFilter('local');
 
       // Pre-select top similar items
@@ -1102,6 +1147,11 @@ export default function SmartSearchPage() {
                 />
               )}
 
+              {/* Result views: Top Results (the ranked files below) | Dashboard | Summary.
+                  The last two load in the background and never hold up the results. */}
+              <ResultTabs active={activeTab} onChange={setActiveTab} tabs={resultTabs} />
+
+              <div role="tabpanel" id={panelId('top')} aria-labelledby={tabId('top')} hidden={activeTab !== 'top'} className="space-y-6">
               {/* Primary View Filters & Batch Select Bar */}
               <div
                 className="p-4 rounded-3xl flex flex-wrap items-center justify-between gap-4"
@@ -1382,6 +1432,7 @@ export default function SmartSearchPage() {
                                         <p className="text-xs leading-relaxed line-clamp-3 select-text mt-1" style={{ color: 'var(--text-secondary)' }}>
                                           {vid.snippet}
                                         </p>
+                                        <TopicChips {...topicProps(vid.sourceId)} />
                                       </div>
                                     </div>
                                   </motion.div>
@@ -1493,6 +1544,7 @@ export default function SmartSearchPage() {
                                         <p className="text-xs leading-relaxed line-clamp-3 select-text" style={{ color: 'var(--text-secondary)' }}>
                                           {doc.snippet}
                                         </p>
+                                        <TopicChips {...topicProps(doc.sourceId)} />
                                       </div>
                                     </div>
                                   </motion.div>
@@ -1598,6 +1650,7 @@ export default function SmartSearchPage() {
                                         <p className="text-xs leading-relaxed line-clamp-3 select-text" style={{ color: 'var(--text-secondary)' }}>
                                           {aud.snippet}
                                         </p>
+                                        <TopicChips {...topicProps(aud.sourceId)} />
                                       </div>
                                     </div>
                                   </motion.div>
@@ -1719,6 +1772,7 @@ export default function SmartSearchPage() {
                                       <p className="text-xs leading-relaxed line-clamp-3 select-text" style={{ color: 'var(--text-secondary)' }}>
                                         {img.snippet}
                                       </p>
+                                      <TopicChips {...topicProps(img.sourceId)} />
                                     </div>
                                   </motion.div>
                                 );
@@ -2168,6 +2222,15 @@ export default function SmartSearchPage() {
                   </div>
                 </div>
               )}
+              </div>
+
+              <div role="tabpanel" id={panelId('dashboard')} aria-labelledby={tabId('dashboard')} hidden={activeTab !== 'dashboard'}>
+                <DashboardTab state={insights.dashboard} onRetry={insights.retryDashboard} />
+              </div>
+
+              <div role="tabpanel" id={panelId('summary')} aria-labelledby={tabId('summary')} hidden={activeTab !== 'summary'}>
+                <SummaryTab state={insights.summary} onRetry={insights.retrySummary} />
+              </div>
             </div>
           )}
         </div>

@@ -32,6 +32,7 @@ from app.database.cleanup import purge_probe_documents, purge_orphan_fts_rows, p
 from app.api.v1.auth import router as auth_router
 from app.api.v1.knowledge import router as knowledge_router
 from app.api.v1.search import router as search_router
+from app.api.v1.insights import router as insights_router
 from app.api.v1.ai import router as ai_router
 from app.api.v1.chats import router as chats_router
 from app.api.v1.settings import router as settings_router
@@ -135,6 +136,7 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(search_router, prefix="/api")
+app.include_router(insights_router, prefix="/api")
 app.include_router(ai_router, prefix="/api")
 app.include_router(chats_router, prefix="/api")
 app.include_router(settings_router, prefix="/api")

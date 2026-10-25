@@ -57,6 +57,7 @@ VISUAL_EVIDENCE = 12        # matching frames / images kept per file
 VISUAL_RETRIEVERS = ("clip_text", "clip_image", "compose", "face", "dupe", "folder_clip")
 TEXT_RETRIEVERS = ("dense", "bm25", "extra", "transcript", "folder_dense", "folder_bm25")
 TIED_RETRIEVERS = ("folder", "filter")   # equal scores share a rank (every file of a folder alike)
+OVERVIEW_MAX = 1000         # ranked files kept in EngineResult.overview
 BROWSE_MAX = 5000           # files listed for a query of filters only
 FOLDER_BOOST = 0.35         # share of the remaining headroom a folder match adds
 FOLDER_FLOOR = 0.4          # × folder score: the rest of a named folder, below real matches
@@ -158,6 +159,9 @@ class EngineResult:
     images: List[Dict[str, Any]]
     audio: List[Dict[str, Any]]
     trace: Dict[str, Any]
+    # Light row for every ranked file (not just the capped buckets): dashboards and summaries
+    # reuse this instead of searching again
+    overview: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"documents": self.documents, "videos": self.videos, "images": self.images, "audio": self.audio}
@@ -853,6 +857,7 @@ class SearchEngine:
                     f"AND source_id IN ({_in_clause(part)})", part):
                     photo_hash[(lib_id, r["source_id"])] = int(r["phash"])
         selected: List[Tuple[FileMatch, Dict[str, Any], str]] = []
+        overview: List[Dict[str, Any]] = []
         similar: Dict[Tuple[str, str], List[str]] = {}
         kept_photos: List[Tuple[Tuple[str, str], int]] = []
         counts = {k: 0 for k in buckets}
@@ -867,6 +872,8 @@ class SearchEngine:
                 if twin is not None:
                     similar.setdefault(twin, []).append(src["id"])
                     continue
+            if len(overview) < OVERVIEW_MAX:
+                overview.append(self._overview_row(f, src, kind))
             if counts[kind] >= limit:
                 continue
             counts[kind] += 1
@@ -882,7 +889,35 @@ class SearchEngine:
                 item["similarPhotos"] = similar[f.key]
             buckets[kind].append(item)
         trace["returned"] = {k: len(v) for k, v in buckets.items()}
-        return EngineResult(buckets["document"], buckets["video"], buckets["image"], buckets["audio"], trace)
+        return EngineResult(buckets["document"], buckets["video"], buckets["image"], buckets["audio"], trace,
+                            overview)
+
+    @staticmethod
+    def _iso(ts: Any) -> Optional[str]:
+        """A file's mtime (epoch seconds) as an ISO date, None when unknown."""
+        from datetime import datetime, timezone
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat() if ts else None
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    def _overview_row(self, f: FileMatch, src: Dict[str, Any], kind: str) -> Dict[str, Any]:
+        return {
+            "id": f"src-{src['id']}",
+            "sourceId": src["id"],
+            "libraryId": f.lib.id,
+            "libraryName": f.lib.name,
+            "category": kind,
+            "title": src["name"],
+            "fileType": src["ext"],
+            "fileSize": src["size"],
+            "relPath": src["rel_path"],
+            "folder": src.get("folder") or "",
+            "relevanceScore": round(f.relevance, 4),
+            "modifiedAt": self._iso(src.get("mtime")),
+            "takenAt": src.get("taken_at") or None,
+            "indexedAt": src.get("indexed_at") or src.get("added_at") or None,
+        }
 
     @staticmethod
     def _spoken_at(lib: Library, source_id: str, t: float) -> str:
@@ -1033,6 +1068,9 @@ class SearchEngine:
             "fileType": src["ext"],
             "fileSize": src["size"],
             "uploadDate": src.get("added_at") or "",
+            "modifiedAt": self._iso(src.get("mtime")),
+            "takenAt": src.get("taken_at") or None,
+            "indexedAt": src.get("indexed_at") or src.get("added_at") or None,
             "relevanceScore": round(f.relevance, 4),
             "snippet": snippet,
             "pageCount": src.get("page_count"),

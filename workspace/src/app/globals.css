@@ -268,3 +268,18 @@ select:focus-visible {
   -webkit-text-fill-color: transparent;
   background-size: 200% auto;
 }
+
+/* === Chart colours (search Dashboard) ===
+   The validated categorical order, stepped for each surface; --viz-1 doubles as the
+   one-hue colour of single-series charts. Entities keep their slot (document is always
+   --viz-1), so filtering never repaints the survivors. */
+:root {
+  --viz-1: #3987e5; --viz-2: #d95926; --viz-3: #199e70; --viz-4: #c98500;
+  --viz-5: #d55181; --viz-6: #008300; --viz-7: #9085e9; --viz-8: #e66767;
+  --viz-grid: rgba(255, 255, 255, 0.08);
+}
+.light {
+  --viz-1: #2a78d6; --viz-2: #eb6834; --viz-3: #1baf7a; --viz-4: #eda100;
+  --viz-5: #e87ba4; --viz-6: #008300; --viz-7: #6250d6; --viz-8: #e34948;
+  --viz-grid: rgba(0, 0, 0, 0.08);
+}

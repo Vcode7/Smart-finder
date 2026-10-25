@@ -231,7 +231,23 @@ ALTER TABLE sources ADD COLUMN folder TEXT GENERATED ALWAYS AS (
 CREATE INDEX IF NOT EXISTS idx_sources_folder ON sources(folder);
 """
 
+# v5: what a file is about, cached per source (topics from the indexed text, or from the
+# LLM when the file was summarised). `fingerprint` ties the row to the file's content, so a
+# changed file is re-derived; an 'llm' row is never replaced by an 'index' one.
+SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS source_insights (
+    source_id    TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+    fingerprint  TEXT,
+    topics_json  TEXT NOT NULL DEFAULT '[]',
+    events_json  TEXT NOT NULL DEFAULT '[]',
+    summary      TEXT,
+    origin       TEXT NOT NULL DEFAULT 'index',     -- index | llm
+    model        TEXT,
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
 # MIGRATIONS[i] upgrades a database at user_version i to i + 1.
-MIGRATIONS: List[str] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4]
+MIGRATIONS: List[str] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5]
 
 SCHEMA_VERSION = len(MIGRATIONS)

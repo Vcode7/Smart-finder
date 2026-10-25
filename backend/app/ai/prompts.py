@@ -222,3 +222,44 @@ Rules:
 
 Sources:
 {contexts}"""
+
+
+# ── Search summary tab: one summary per file, then one over all of them ──────────────
+DOC_SUMMARY_SYSTEM_PROMPT = (
+    "You summarise files for a search results page. Use only the text you are given; never invent facts. "
+    "Return ONLY one valid JSON object, no markdown, no code fences, no <think> tags."
+)
+
+DOC_SUMMARY_TEMPLATE = """The user searched for: "{query}"
+
+File: {title} ({kind}, {ext})
+Folder: {folder}
+
+Return a JSON object with this shape:
+{{"summary": "<what the file is and says>", "topics": ["<subject>", "<subject>"], "events": ["<event name>"]}}
+
+Rules:
+- summary: plain text, at most 90 words. Say what the file is and what it says. Write in the language of the file's text.
+- topics: up to 5 short noun phrases naming the specific subjects, people, places or organisations (no generic words like "document" or "information").
+- events: up to 2 specific events or occasions named in the text, or [] if there are none.
+
+File text:
+{context}"""
+
+OVERALL_SUMMARY_SYSTEM_PROMPT = (
+    "You combine per-file summaries into one clear overview for a person searching their own files. "
+    "Use only the summaries you are given; never invent facts. "
+    "Return ONLY one valid JSON object, no code fences, no <think> tags."
+)
+
+OVERALL_SUMMARY_TEMPLATE = """The user searched for: "{query}"
+
+Below are summaries of the {count} most relevant items, numbered.
+
+Return a JSON object {{"overview": "<the overall summary>"}} whose value is the overall summary written in Markdown (use \\n for line breaks), at most 220 words:
+1. Two or three sentences answering what these files show about the search.
+2. Three to five bullet points with the main findings, themes, people, places or events.
+3. One short line starting "Differences:" only if the items disagree or cover clearly separate topics.
+Cite items like [1] or [2][3]. Do not add a title.
+
+{summaries}"""

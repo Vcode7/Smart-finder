@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "qwen/qwen3.8-27b"
     GROQ_FAST_MODEL: str = "qwen/qwen3.8-27b"
 
+    # Search summary tab: the top results are summarised one by one, then together
+    SUMMARY_MAX_DOCS: int = 8               # files summarised per search
+    SUMMARY_DOC_INPUT_TOKENS: int = 1500    # index text sent per file
+    SUMMARY_OVERALL_INPUT_TOKENS: int = 3000  # per-file summaries sent per overall call
+    SUMMARY_CONCURRENCY: int = 2
+
     def get_groq_api_keys(self) -> List[Dict[str, str]]:
         """Return configured Groq API keys in prioritized sequence (primary -> fallback 1..3)."""
         candidates = [

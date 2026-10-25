@@ -29,8 +29,9 @@ from app.search.face_detector import detect_faces_in_image, search_face_embeddin
 from app.search.query_understanding import understand_multimodal_query, generate_enhanced_internet_query, detect_file_category
 from app.search.multimodal_retrieval import search_by_multimodal_signals, search_by_text
 from app.search.constants import COMPOSITE_MIN_SCORE, IMAGE_EXTENSIONS
-from app.search.engine import fts_terms, get_engine, plan_from_source
+from app.search.engine import EngineResult, fts_terms, get_engine, plan_from_source
 from app.search.plan import QueryPlan, build_plan
+from app.search.session import create_session
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -78,12 +79,41 @@ def _merge_buckets(primary: Dict[str, List[Dict[str, Any]]], legacy: Dict[str, L
 
 async def _local_search(query_text: str, file_buffer: Optional[bytes] = None, file_name: Optional[str] = None,
                         mime_type: Optional[str] = None, limit: int = 20,
-                        user: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], QueryPlan, Dict[str, Any]]:
+                        user: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], QueryPlan, EngineResult]:
     files = [(file_buffer, file_name, mime_type)] if file_buffer else []
     plan = await run_in_threadpool(build_plan, query_text, files)
     engine_res = await run_in_threadpool(get_engine().search, plan, limit, visible_library_ids(user))
     legacy = await _legacy_results(query_text, file_buffer, file_name, mime_type, limit, user)
-    return _merge_buckets(engine_res.as_dict(), legacy, limit), plan, engine_res.trace
+    return _merge_buckets(engine_res.as_dict(), legacy, limit), plan, engine_res
+
+
+def _remember_search(user: Optional[Dict[str, Any]], query: str, engine_res: EngineResult,
+                     shown: Dict[str, List[Dict[str, Any]]]) -> Optional[str]:
+    """
+    Keeps this search's ranked files for the dashboard and summary tabs (see search/session.py).
+    `shown` is what the page received: its snippets ride along, and results from the legacy
+    index (which the engine does not know) are added as light rows.
+    """
+    if not user or not user.get("id"):
+        return None
+    items = {i["id"]: i for k in _BUCKETS for i in shown.get(k, []) if i.get("id")}
+    rows = []
+    for r in engine_res.overview:
+        row = dict(r)
+        row["snippet"] = (items.get(r["id"]) or {}).get("snippet")
+        rows.append(row)
+    seen = {r["id"] for r in rows}
+    for item_id, i in items.items():
+        if item_id not in seen:
+            rows.append({
+                "id": item_id, "sourceId": i.get("sourceId"), "libraryId": i.get("libraryId"),
+                "libraryName": i.get("libraryName"), "category": i.get("category"), "title": i.get("title"),
+                "fileType": i.get("fileType"), "fileSize": i.get("fileSize"), "relPath": i.get("relPath"),
+                "folder": i.get("folder") or "", "relevanceScore": i.get("relevanceScore", 0.0),
+                "modifiedAt": i.get("modifiedAt"), "takenAt": i.get("takenAt"),
+                "indexedAt": i.get("indexedAt") or i.get("uploadDate"), "snippet": i.get("snippet"),
+            })
+    return create_session(str(user["id"]), query, rows)
 
 
 def _compat_signals(plan: QueryPlan) -> Dict[str, Any]:
@@ -476,7 +506,9 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
     preview_url = _preview_data_url(file_buffer, mime_type)
 
     # 1. Local search: every folder library (plus the legacy index until it is migrated)
-    local_res, plan, engine_trace = await _local_search(query_text, file_buffer, file_name, mime_type, limit=20, user=user)
+    local_res, plan, engine_res = await _local_search(query_text, file_buffer, file_name, mime_type, limit=20, user=user)
+    engine_trace = engine_res.trace
+    search_id = _remember_search(user, query_text, engine_res, local_res)
     signals = _compat_signals(plan)
     all_local_matches = sorted(
         [*local_res.get("videos", []), *local_res.get("documents", []),
@@ -561,6 +593,7 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
     }
 
     return {
+        "searchId": search_id,
         "query": query_text or target_internet_query,
         "queryImagePreview": preview_url,
         "discoveryTrace": discovery_trace,
@@ -673,7 +706,7 @@ def _similar_signals(source: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
 
 
 async def _similar_in_libraries(lib, src: Dict[str, Any], relative_threshold: float,
-                                allowed: Optional[set] = None) -> Dict[str, Any]:
+                                allowed: Optional[set] = None, user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     plan = await run_in_threadpool(plan_from_source, lib, src["id"])
     res = await run_in_threadpool(get_engine().search, plan, 20, allowed)
     buckets = res.as_dict()
@@ -685,6 +718,7 @@ async def _similar_in_libraries(lib, src: Dict[str, Any], relative_threshold: fl
     total = len(final_matches)
     title = src["name"]
     return {
+        "searchId": _remember_search(user, f"Similar to: {title}", res, buckets),
         "query": f"Similar to: {title}",
         "sourceId": src["id"],
         "sourceTitle": title,
@@ -729,7 +763,7 @@ async def find_similar_sources(request: Request, user: Dict[str, Any] = Depends(
     if found:
         if not can_access_library(user, found[0].id):
             raise HTTPException(status_code=404, detail=f"Source with id '{raw_id}' not found")
-        return await _similar_in_libraries(found[0], found[1], relative_threshold, visible_library_ids(user))
+        return await _similar_in_libraries(found[0], found[1], relative_threshold, visible_library_ids(user), user)
     if not is_admin(user):   # legacy-index sources belong to no library
         raise HTTPException(status_code=404, detail=f"Source with id '{raw_id}' not found")
     source = db_get(

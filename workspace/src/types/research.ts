@@ -356,6 +356,9 @@ export interface CrossSourceItem {
   fileType: string;
   fileSize: number;
   uploadDate: string;
+  modifiedAt?: string | null;     // file modified time (uploadDate is when it was indexed)
+  takenAt?: string | null;        // EXIF capture time
+  indexedAt?: string | null;
   snippet: string;
   relevanceScore: number;
   pageNum?: number;
@@ -371,6 +374,9 @@ export interface LocalCategorizedItem {
   fileType: string;
   fileSize: number;
   uploadDate: string;
+  modifiedAt?: string | null;     // file modified time (uploadDate is when it was indexed)
+  takenAt?: string | null;        // EXIF capture time
+  indexedAt?: string | null;
   relevanceScore: number;
   snippet: string;
   fullContext?: string;
