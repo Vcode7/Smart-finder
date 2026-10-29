@@ -156,16 +156,18 @@ def _attributes(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 def _dashboard(session: SearchSession, relative: float) -> Dict[str, Any]:
     kept = cut_rows(session.rows, relative, COMPOSITE_MIN_SCORE)
     top = max((r.get("relevanceScore") or 0.0 for r in session.rows), default=0.0)
+    in_library = [r for r in kept if r.get("libraryId")]      # catalog records have no index to read
     derived = _topics_for([{"libraryId": r.get("libraryId"), "sourceId": r["sourceId"]}
-                           for r in kept[:DASHBOARD_TOPIC_FILES]])
-    attrs = _attributes(kept)
+                           for r in in_library[:DASHBOARD_TOPIC_FILES]])
+    attrs = _attributes(in_library)
     keys = ("id", "sourceId", "libraryId", "libraryName", "category", "title", "fileType", "fileSize", "relPath",
-            "folder", "relevanceScore", "modifiedAt", "takenAt", "indexedAt")
+            "folder", "relevanceScore", "modifiedAt", "takenAt", "indexedAt", "year", "recordUrl")
     files = []
     for r in kept:
         row = {k: r.get(k) for k in keys}
+        row["source"] = r.get("origin") or "local"      # local | koha | dspace
         t = derived.get(r["sourceId"])
-        row["topics"] = t["topics"] if t else []
+        row["topics"] = t["topics"] if t else (r.get("subjects") or [])[:6]
         row["events"] = t["events"] if t else []
         row.update(attrs.get(r["sourceId"]) or {})
         files.append(row)

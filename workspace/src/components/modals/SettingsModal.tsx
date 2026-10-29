@@ -26,6 +26,7 @@ import { useUIStore } from '@/store/ui';
 import { useAuthStore } from '@/store/auth';
 import { toast } from 'sonner';
 import { apiErrorMessage, readJson } from '@/lib/utils/api';
+import CatalogSettingsSection from '@/components/modals/CatalogSettingsSection';
 
 interface OllamaModel {
   name: string;
@@ -307,6 +308,8 @@ export function SettingsModal() {
           {/* ─── Body ───────────────────────────────────────────── */}
           <div className="flex-1 overflow-y-auto p-6 space-y-6">
             <AccountSection />
+
+            {isAdmin && <CatalogSettingsSection />}
 
             {/* Section: Ollama Configuration */}
             <div

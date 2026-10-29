@@ -176,6 +176,17 @@ MIGRATIONS: List[str] = [
         added_at        TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
 
+    # --- Smart Finder search history (typed searches, per user) ---
+    """CREATE TABLE IF NOT EXISTS search_history (
+        id           TEXT PRIMARY KEY,
+        user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        query        TEXT NOT NULL,
+        internet     INTEGER NOT NULL DEFAULT 0,
+        result_count INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    )""",
+
     # --- Perceptual Hashes (pHash + dHash) ---
     """CREATE TABLE IF NOT EXISTS image_perceptual_hashes (
         id          TEXT PRIMARY KEY,
@@ -202,6 +213,9 @@ MIGRATIONS: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_iph_source ON image_perceptual_hashes(source_id)",
     "CREATE INDEX IF NOT EXISTS idx_iph_phash ON image_perceptual_hashes(phash)",
     "CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_search_history_user ON search_history(user_id, updated_at)",
+    # Library sources a search used ("local,koha,dspace"); '' for searches from before sources existed
+    "ALTER TABLE search_history ADD COLUMN sources TEXT NOT NULL DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS idx_messages_chat ON chat_messages(chat_id)",
     "CREATE INDEX IF NOT EXISTS idx_context_chat ON chat_context(chat_id)",
     # --- Repair tracking columns (added for audit remediation) ---

@@ -9,8 +9,8 @@ import BarList from '@/components/search/charts/BarList';
 import ColumnChart from '@/components/search/charts/ColumnChart';
 import TopicChips from '@/components/search/TopicChips';
 import {
-  CATEGORY_COLOR, NO_FILTERS, byCategory, byDate, byExtension, byFolder, byLibrary, byScore, byTopic,
-  dateLabel, filterExcept, folderKey, formatBytes, type Filters,
+  CATEGORY_COLOR, NO_FILTERS, SOURCE_COLOR, SOURCE_LABEL, byCategory, byDate, byExtension, byFolder, byLibrary, byScore,
+  bySource, byTopic, dateLabel, filterExcept, folderKey, formatBytes, isLocalFile, sourceOf, type Filters,
 } from '@/lib/search/charts';
 import {
   cameraBuckets, durationBins, formatDuration, ofKind, orientationBins, pageBins, peopleBuckets, resolutionBins,
@@ -70,21 +70,24 @@ export default function DashboardTab({ state, onRetry }: Props) {
       libraries: byLibrary(filterExcept(files, filters, 'library', dateField, dateGrain)),
       scores: byScore(filterExcept(files, filters, 'score', dateField, dateGrain)),
       topics: byTopic(filterExcept(files, filters, 'topic', dateField, dateGrain)),
+      sources: bySource(filterExcept(files, filters, 'source', dateField, dateGrain)),
       dates: dated.buckets,
       undated: dated.undated,
       counts: {
         category: filterExcept(files, filters, 'category', dateField, dateGrain).length,
         ext: filterExcept(files, filters, 'ext', dateField, dateGrain).length,
-        folder: filterExcept(files, filters, 'folder', dateField, dateGrain).length,
-        library: filterExcept(files, filters, 'library', dateField, dateGrain).length,
+        folder: filterExcept(files, filters, 'folder', dateField, dateGrain).filter(isLocalFile).length,
+        library: filterExcept(files, filters, 'library', dateField, dateGrain).filter(isLocalFile).length,
         topic: filterExcept(files, filters, 'topic', dateField, dateGrain).length,
+        source: filterExcept(files, filters, 'source', dateField, dateGrain).length,
       },
     };
   }, [files, filters, dateField, dateGrain]);
 
   const shown = view.all;
+  const shownFiles = useMemo(() => shown.filter(isLocalFile), [shown]);
   const totalBytes = useMemo(() => shown.reduce((s, f) => s + (f.fileSize || 0), 0), [shown]);
-  const folderCount = useMemo(() => new Set(shown.map(folderKey)).size, [shown]);
+  const folderCount = useMemo(() => new Set(shownFiles.map(folderKey)).size, [shownFiles]);
   const typeCount = useMemo(() => new Set(shown.map((f) => (f.fileType || '').toLowerCase())).size, [shown]);
 
   // Per-kind analytics over the files that pass every filter
@@ -95,7 +98,7 @@ export default function DashboardTab({ state, onRetry }: Props) {
     const audio = ofKind(shown, 'audio');
     return {
       docs, images, videos, audio,
-      sizes: sizeBins(shown), people: peopleBuckets(shown),
+      sizes: sizeBins(shownFiles), people: peopleBuckets(shownFiles),
       pages: pageBins(docs), pageTotal: totalPages(docs),
       resolution: resolutionBins(images), orientation: orientationBins(images),
       cameras: cameraBuckets(images), located: withLocation(images),
@@ -103,7 +106,7 @@ export default function DashboardTab({ state, onRetry }: Props) {
       videoSpeech: transcriptBins(videos),
       audioLength: durationBins(audio), audioRuntime: totalRuntime(audio), audioSpeech: transcriptBins(audio),
     };
-  }, [shown]);
+  }, [shown, shownFiles]);
 
   // Labels of the active filters, for the chips
   const chips: { key: keyof Filters; label: string }[] = [];
@@ -114,6 +117,7 @@ export default function DashboardTab({ state, onRetry }: Props) {
   if (filters.date) chips.push({ key: 'date', label: dateLabel(filters.date) });
   if (filters.score !== null) chips.push({ key: 'score', label: `${Math.round(filters.score * 100)}–${Math.round(filters.score * 100) + 5}% relevance` });
   if (filters.topic) chips.push({ key: 'topic', label: view.topics.find((b) => b.key === filters.topic)?.label ?? filters.topic });
+  if (filters.source) chips.push({ key: 'source', label: SOURCE_LABEL[filters.source] ?? filters.source });
 
   // ── states without data ────────────────────────────────────────────────────
   if (state.status === 'idle') {
@@ -291,6 +295,12 @@ export default function DashboardTab({ state, onRetry }: Props) {
               <ColumnChart buckets={view.scores} activeKey={filters.score === null ? null : String(filters.score)} onSelect={(k) => setFilter('score', k === null ? null : Number(k))} />
             </Card>
           )}
+          {visible('sources') && view.sources.some((b) => b.key !== 'local') && (
+            <Card title="Sources" sub="Local files and catalog records">
+              <BarList buckets={view.sources} total={view.counts.source} activeKey={filters.source} onSelect={(k) => setFilter('source', k)}
+                colorOf={(k) => SOURCE_COLOR[k] ?? 'var(--viz-1)'} />
+            </Card>
+          )}
           {visible('libraries') && view.libraries.length > 0 && (
             <Card title="Libraries" sub="Which library holds the files">
               <BarList buckets={view.libraries} total={view.counts.library} activeKey={filters.library} onSelect={(k) => setFilter('library', k)} />
@@ -389,10 +399,19 @@ export default function DashboardTab({ state, onRetry }: Props) {
                   <div className="min-w-0 flex-1 space-y-1">
                     <p className="text-xs font-semibold truncate" style={{ color: 'var(--text-primary)' }} title={f.relPath}>{f.title}</p>
                     <p className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>
-                      {f.libraryName ? `${f.libraryName} · ` : ''}{f.folder || '(top level)'} · {formatBytes(f.fileSize)}
+                      {isLocalFile(f)
+                        ? `${f.libraryName ? `${f.libraryName} · ` : ''}${f.folder || '(top level)'} · ${formatBytes(f.fileSize)}`
+                        : `${SOURCE_LABEL[sourceOf(f)]}${f.year ? ` · ${f.year}` : ''}`}
                     </p>
                     <TopicChips topics={f.topics} events={f.events} />
                   </div>
+                  {!isLocalFile(f) && f.recordUrl && (
+                    <a href={f.recordUrl} target="_blank" rel="noopener noreferrer"
+                      className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold flex-shrink-0"
+                      style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>
+                      Record <ExternalLink className="w-3 h-3" aria-hidden />
+                    </a>
+                  )}
                   {f.libraryId && (
                     <a href={withBase(`/api/knowledge/${f.sourceId}/file`)} target="_blank" rel="noopener noreferrer"
                       className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold flex-shrink-0"

@@ -11,6 +11,7 @@ export const DASHBOARD_CHARTS = [
   { id: 'folders', label: 'Folders' },
   { id: 'dates', label: 'Dates' },
   { id: 'scores', label: 'Relevance' },
+  { id: 'sources', label: 'Sources' },
   { id: 'libraries', label: 'Libraries' },
   { id: 'topics', label: 'Topics' },
   { id: 'kinds', label: 'By file type' },
@@ -54,15 +55,17 @@ export const useSearchViewStore = create<SearchViewState>()(
     }),
     {
       name: 'sf-search-view',
-      version: 2,
+      version: 3,
       // v1 defaulted to the modified date; the adaptive "best" date replaces it
-      migrate: (persisted) => {
+      migrate: (persisted, version) => {
         const s = (persisted ?? {}) as Partial<SearchViewState>;
-        // the per-file-type section is new, so a saved chart choice should not hide it
-        const charts = (s.visibleCharts ?? []).includes('kinds') ? s.visibleCharts : [...(s.visibleCharts ?? []), 'kinds'];
+        // charts added since the saved choice (per file type in v2, sources in v3) start visible
+        const added: ChartId[] = [...(version < 2 ? ['kinds' as const] : []), 'sources'];
+        const saved = s.visibleCharts ?? [];
+        const charts = DASHBOARD_CHARTS.map((c) => c.id).filter((c) => saved.includes(c) || added.includes(c));
         return {
           ...s, visibleCharts: charts,
-          dateField: s.dateField && s.dateField !== 'modifiedAt' ? s.dateField : 'best',
+          dateField: s.dateField && !(version < 2 && s.dateField === 'modifiedAt') ? s.dateField : 'best',
         } as SearchViewState;
       },
     }

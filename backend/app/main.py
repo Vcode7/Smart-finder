@@ -35,6 +35,8 @@ from app.api.v1.search import router as search_router
 from app.api.v1.insights import router as insights_router
 from app.api.v1.ai import router as ai_router
 from app.api.v1.chats import router as chats_router
+from app.api.v1.search_history import router as search_history_router
+from app.api.v1.catalogs import router as catalogs_router
 from app.api.v1.settings import router as settings_router
 from app.api.v1.libraries import router as libraries_router
 from app.api.v1.uploads import router as uploads_router
@@ -139,6 +141,8 @@ app.include_router(search_router, prefix="/api")
 app.include_router(insights_router, prefix="/api")
 app.include_router(ai_router, prefix="/api")
 app.include_router(chats_router, prefix="/api")
+app.include_router(search_history_router, prefix="/api")
+app.include_router(catalogs_router, prefix="/api")
 app.include_router(settings_router, prefix="/api")
 app.include_router(libraries_router, prefix="/api")
 app.include_router(uploads_router, prefix="/api")

@@ -15,6 +15,7 @@ python-multipart==0.0.32
 PyJWT==2.10.1
 bcrypt==5.0.0
 httpx==0.28.1
+defusedxml==0.7.1          # Koha RSS / MARCXML from catalog servers
 
 # LLM providers
 groq==1.7.0

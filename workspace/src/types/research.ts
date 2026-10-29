@@ -405,6 +405,61 @@ export interface LocalCategorizedItem {
   evidence?: string;
   rerankScore?: number | null;
   similarPhotos?: string[];
+  alsoIn?: AlsoInRef[];            // the same work in Koha or DSpace
+}
+
+// ── Library sources searched next to the local libraries (internet search is separate) ──
+export type SearchSourceId = 'local' | 'koha' | 'dspace';
+export type CatalogSourceId = Exclude<SearchSourceId, 'local'>;
+
+export interface AlsoInRef {
+  source: SearchSourceId;
+  id: string;
+  title: string;
+  recordUrl: string;
+}
+
+export interface CatalogFile {
+  name: string;
+  url: string;
+  mimeType?: string | null;
+  size?: number | null;
+  access: 'open' | 'restricted' | 'unknown';
+}
+
+export interface CatalogRecord {
+  id: string;                      // koha:<biblionumber> | dspace:<uuid>
+  category: 'record';
+  source: CatalogSourceId;
+  nativeId: string;
+  title: string;
+  recordUrl: string;               // the exact OPAC record or repository item page
+  authors: string[];
+  year?: string | null;
+  publisher?: string | null;
+  subjects: string[];
+  abstract?: string | null;
+  snippet?: string | null;
+  isbn: string[];
+  doi?: string | null;
+  handle?: string | null;
+  itemType?: string | null;
+  thumbnail?: string | null;
+  files: CatalogFile[];
+  filesDeferred: boolean;          // DSpace: files are listed when the card asks for them
+  relevanceScore: number;
+  matchedBy: string[];
+  alsoIn: AlsoInRef[];
+}
+
+export interface SourceStatus {
+  source: CatalogSourceId;
+  status: 'ok' | 'error' | 'timeout' | 'skipped';
+  count: number;
+  total?: number | null;
+  message?: string | null;
+  ms: number;
+  query?: string | null;
 }
 
 export interface InternetCategorizedItem {

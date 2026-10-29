@@ -32,6 +32,10 @@ export interface DashboardFile {
   hasLocation?: boolean;
   transcript?: string | null;       // pending | running | done | failed
   people?: string[];
+  // Where the row comes from; catalog records (category 'record') link to their origin instead of a file
+  source?: 'local' | 'koha' | 'dspace';
+  year?: string | null;
+  recordUrl?: string | null;
 }
 
 export interface DashboardData {

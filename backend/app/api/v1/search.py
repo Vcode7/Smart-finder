@@ -13,6 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.database.session import db_get, db_all
 from app.api.deps import require_auth
+from app.api.v1.search_history import record_search
 from app.core.access import can_access_library, is_admin, visible_library_ids
 from app.schemas.search import (
     SearchRequest, LocalSearchRequest, VideoSearchRequest,
@@ -30,8 +31,13 @@ from app.search.query_understanding import understand_multimodal_query, generate
 from app.search.multimodal_retrieval import search_by_multimodal_signals, search_by_text
 from app.search.constants import COMPOSITE_MIN_SCORE, IMAGE_EXTENSIONS
 from app.search.engine import EngineResult, fts_terms, get_engine, plan_from_source
-from app.search.plan import QueryPlan, build_plan
+from app.search.plan import Filters, QueryPlan, build_plan, parse_text
 from app.search.session import create_session
+from app.search.catalogs.rank import dedupe, rank_records
+from app.search.catalogs.registry import (
+    LABELS, SOURCES as CATALOG_SOURCES, catalog_query, is_image_upload, plan_for_catalogs, resolve_sources,
+    search_catalogs, skipped,
+)
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -87,12 +93,27 @@ async def _local_search(query_text: str, file_buffer: Optional[bytes] = None, fi
     return _merge_buckets(engine_res.as_dict(), legacy, limit), plan, engine_res
 
 
+def _catalog_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Session rows for catalog records: no library, so the dashboard and summary use their metadata."""
+    return [{
+        "id": r["id"], "sourceId": r["id"], "libraryId": None, "libraryName": LABELS.get(r["source"]),
+        "category": "record", "title": r.get("title"), "fileType": r.get("itemType") or r["source"],
+        "fileSize": None, "relPath": None, "folder": "", "relevanceScore": r.get("relevanceScore", 0.0),
+        "modifiedAt": None, "takenAt": None, "indexedAt": None, "year": r.get("year"),
+        "subjects": r.get("subjects") or [],
+        "origin": r["source"], "recordUrl": r.get("recordUrl"),
+        "snippet": "\n".join(p for p in (r.get("abstract"), r.get("snippet")) if p) or None,
+    } for r in records]
+
+
 def _remember_search(user: Optional[Dict[str, Any]], query: str, engine_res: EngineResult,
-                     shown: Dict[str, List[Dict[str, Any]]]) -> Optional[str]:
+                     shown: Dict[str, List[Dict[str, Any]]],
+                     catalog: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
     """
     Keeps this search's ranked files for the dashboard and summary tabs (see search/session.py).
     `shown` is what the page received: its snippets ride along, and results from the legacy
-    index (which the engine does not know) are added as light rows.
+    index (which the engine does not know) are added as light rows. Catalog records (Koha,
+    DSpace) are added as rows of their own.
     """
     if not user or not user.get("id"):
         return None
@@ -113,6 +134,7 @@ def _remember_search(user: Optional[Dict[str, Any]], query: str, engine_res: Eng
                 "modifiedAt": i.get("modifiedAt"), "takenAt": i.get("takenAt"),
                 "indexedAt": i.get("indexedAt") or i.get("uploadDate"), "snippet": i.get("snippet"),
             })
+    rows += _catalog_rows(catalog or [])
     return create_session(str(user["id"]), query, rows)
 
 
@@ -202,6 +224,20 @@ def _relative_threshold(raw: Any, default: float = 0.20) -> float:
         return max(0.0, min(1.0, val))
     except (ValueError, TypeError):
         return default
+
+
+def _catalog_filtered(records: List[Dict[str, Any]], filters: Filters) -> List[Dict[str, Any]]:
+    """The query's filters on catalog records: they count as documents and are dated by year."""
+    if filters.kinds and "document" not in filters.kinds:
+        return []
+    after = (filters.after or "")[:4]
+    out = []
+    for r in records:
+        year = r.get("year") or ""
+        if year and ((after and year < after) or (filters.before and f"{year}-01-01" >= filters.before)):
+            continue
+        out.append(r)
+    return out
 
 
 def _cutoff(items: List[Dict[str, Any]], relative_threshold: float, fallback: float) -> float:
@@ -499,16 +535,50 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
     enable_internet = str(fields.get("enableInternet") or fields.get("enableInternetSources") or "").lower() == "true" \
         or fields.get("enableInternet") is True or fields.get("enableInternetSources") is True
     relative_threshold = _relative_threshold(fields.get("relativeThreshold"))
+    # Library sources (local, Koha, DSpace): all available ones unless the request names some.
+    # Internet search stays separate, switched by enableInternet alone.
+    sources = await run_in_threadpool(resolve_sources, fields.get("sources"))
+    catalogs = [s for s in sources if s in CATALOG_SOURCES]
 
     if not query_text.strip() and not file_buffer:
         raise HTTPException(status_code=400, detail="Please provide a search query or upload reference material.")
+    if not sources and not enable_internet:
+        raise HTTPException(status_code=400, detail="Choose at least one source to search.")
 
     preview_url = _preview_data_url(file_buffer, mime_type)
 
+    # Typed words go to the catalogs at once, while the local search runs
+    catalog_task: Optional[asyncio.Task] = None
+    catalog_q, catalog_origin = "", None
+    typed = parse_text(query_text)[0] if query_text.strip() else ""
+    if catalogs and typed:
+        catalog_q, catalog_origin = typed, "typed"
+        catalog_task = asyncio.create_task(search_catalogs(typed, catalogs))
+
     # 1. Local search: every folder library (plus the legacy index until it is migrated)
-    local_res, plan, engine_res = await _local_search(query_text, file_buffer, file_name, mime_type, limit=20, user=user)
+    try:
+        if "local" in sources:
+            local_res, plan, engine_res = await _local_search(query_text, file_buffer, file_name, mime_type,
+                                                              limit=20, user=user)
+        else:
+            plan = await run_in_threadpool(plan_for_catalogs, query_text, file_buffer, file_name, mime_type)
+            local_res = {k: [] for k in _BUCKETS}
+            engine_res = EngineResult([], [], [], [], {"skipped": "local search switched off"})
+    except BaseException:
+        if catalog_task is not None:
+            catalog_task.cancel()
+        raise
     engine_trace = engine_res.trace
-    search_id = _remember_search(user, query_text, engine_res, local_res)
+
+    # An upload without words: the catalogs get its text (OCR for an image)
+    catalog_statuses: List[Any] = []
+    if catalogs and catalog_task is None:
+        image = file_buffer if file_buffer and is_image_upload(file_name, mime_type) else None
+        catalog_q, catalog_origin = await run_in_threadpool(catalog_query, plan, image)
+        if catalog_q:
+            catalog_task = asyncio.create_task(search_catalogs(catalog_q, catalogs, derived=True))
+        else:
+            catalog_statuses = skipped(catalogs, "No text was found in the upload to search the catalogs with.")
     signals = _compat_signals(plan)
     all_local_matches = sorted(
         [*local_res.get("videos", []), *local_res.get("documents", []),
@@ -552,11 +622,38 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
     )
     local_total = len(all_local_matches)
     internet_total = sum(len(v) for v in internet.values())
+
+    # 4. Catalogs: judged again on the local relevance scale, duplicates folded (a record of a
+    #    local file becomes a link on that file), then the same relative threshold
+    catalog_raw = 0
+    catalog_trace: Dict[str, Any] = {}
+    catalog_records: List[Dict[str, Any]] = []
+    if catalog_task is not None:
+        found, catalog_statuses = await catalog_task
+        catalog_raw = len(found)
+        rank_query = plan.text or plan.rerank_query or catalog_q
+        ranked, catalog_trace = await run_in_threadpool(rank_records, rank_query, found)
+        ranked, folded = dedupe(ranked, filtered_documents)
+        catalog_trace["duplicatesFolded"] = folded
+        catalog_records = _catalog_filtered([r.as_dict() for r in ranked], plan.filters)
+        catalog_min = _cutoff(catalog_records, relative_threshold, COMPOSITE_MIN_SCORE)
+        catalog_records = [r for r in catalog_records if r["relevanceScore"] >= catalog_min]
+    catalog_total = len(catalog_records)
+    by_source = {s: sum(1 for r in catalog_records if r["source"] == s) for s in catalogs}
+
     total_before = len(local_res.get("documents", [])) + len(local_res.get("videos", [])) + \
-        len(local_res.get("images", [])) + len(local_res.get("audio", [])) + internet_total
+        len(local_res.get("images", [])) + len(local_res.get("audio", [])) + internet_total + catalog_raw
+    total_after = local_total + internet_total + catalog_total
 
     print(f"[SmartSearch Threshold] top_local_score={top_local_score:.4f}, configured_threshold={relative_threshold:.4f}, "
-          f"min_score={min_score:.4f}, results_before={total_before}, results_after={local_total + internet_total}")
+          f"min_score={min_score:.4f}, results_before={total_before}, results_after={total_after}")
+
+    search_id = _remember_search(user, query_text, engine_res, local_res, catalog_records)
+    if query_text.strip():
+        try:
+            record_search(user["id"], query_text, enable_internet, total_after, sources)
+        except Exception as e:      # history is a convenience: never fail the search over it
+            print(f"[SmartSearch] could not record search history: {e}")
 
     top = all_local_matches[0] if all_local_matches else None
     discovery_trace = {
@@ -590,6 +687,9 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
         "discoveredEntities": enhanced.get("discoveredEntities"),
         "contextSummary": enhanced.get("contextSummary"),
         "lineage": enhanced.get("lineage"),
+        "catalogQuery": catalog_q or None,
+        "catalogQueryOrigin": catalog_origin,
+        "catalogs": catalog_trace or None,
     }
 
     return {
@@ -597,12 +697,14 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
         "query": query_text or target_internet_query,
         "queryImagePreview": preview_url,
         "discoveryTrace": discovery_trace,
+        "sources": sources,
+        "sourceStatuses": [s.as_dict() for s in catalog_statuses],
         "thresholdInfo": {
             "topScore": round(top_local_score, 4),
             "relativeThreshold": round(relative_threshold, 4),
             "minScore": round(min_score, 4),
             "resultsBefore": total_before,
-            "resultsAfter": local_total + internet_total,
+            "resultsAfter": total_after,
         },
         "internet": {**internet, "total": internet_total},
         "local": {
@@ -612,10 +714,16 @@ async def smart_search(request: Request, user: Dict[str, Any] = Depends(require_
             "images": filtered_images,
             "total": local_total,
         },
+        "catalog": {
+            "records": catalog_records,
+            "total": catalog_total,
+            "bySource": by_source,
+        },
         "stats": {
             "internetCount": internet_total,
             "localCount": local_total,
-            "total": internet_total + local_total,
+            "catalogCount": catalog_total,
+            "total": total_after,
         },
     }
 

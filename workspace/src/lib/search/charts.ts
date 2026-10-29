@@ -20,16 +20,23 @@ export interface Filters {
   date: string | null;         // bucket key at the current grain
   score: number | null;        // lower edge of a 5% relevance bin
   topic: string | null;        // lower-cased topic
+  source: string | null;       // local | koha | dspace
 }
 
-export const NO_FILTERS: Filters = { category: null, ext: null, folder: null, library: null, date: null, score: null, topic: null };
+export const NO_FILTERS: Filters = { category: null, ext: null, folder: null, library: null, date: null, score: null, topic: null, source: null };
 
-export const CATEGORY_LABEL: Record<string, string> = { document: 'Documents', image: 'Images', video: 'Videos', audio: 'Audio' };
-export const CATEGORY_ORDER = ['document', 'image', 'video', 'audio'];
+export const CATEGORY_LABEL: Record<string, string> = { document: 'Documents', image: 'Images', video: 'Videos', audio: 'Audio', record: 'Catalog records' };
+export const CATEGORY_ORDER = ['document', 'image', 'video', 'audio', 'record'];
 /** A kind keeps its colour whatever else is filtered out. */
 export const CATEGORY_COLOR: Record<string, string> = {
-  document: 'var(--viz-1)', image: 'var(--viz-2)', video: 'var(--viz-3)', audio: 'var(--viz-4)',
+  document: 'var(--viz-1)', image: 'var(--viz-2)', video: 'var(--viz-3)', audio: 'var(--viz-4)', record: 'var(--viz-7)',
 };
+
+export const SOURCE_LABEL: Record<string, string> = { local: 'Local Files', koha: 'Koha Catalog', dspace: 'DSpace Repository' };
+export const SOURCE_COLOR: Record<string, string> = { local: 'var(--viz-1)', koha: 'var(--viz-5)', dspace: 'var(--viz-3)' };
+export const sourceOf = (f: DashboardFile) => f.source ?? 'local';
+/** Rows for files in a local library; catalog records have no folder, size or library. */
+export const isLocalFile = (f: DashboardFile) => sourceOf(f) === 'local';
 
 export function formatBytes(bytes: number): string {
   if (!bytes) return '0 B';
@@ -53,6 +60,8 @@ function parseDate(raw: string | null | undefined): Date | null {
  * modified, otherwise when it was indexed. Copying a file resets its modified date but not its EXIF.
  */
 export function dateOf(f: DashboardFile, field: DateField): Date | null {
+  // A catalog record has only its publication year
+  if (!isLocalFile(f)) return field === 'best' && f.year ? parseDate(`${f.year}-01-01T00:00:00Z`) : null;
   if (field === 'best') return parseDate(f.takenAt) ?? parseDate(f.modifiedAt) ?? parseDate(f.indexedAt);
   return parseDate(f[field]);
 }
@@ -83,6 +92,7 @@ export function matches(f: DashboardFile, flt: Filters, field: DateField, grain:
   if (flt.library && (f.libraryId ?? '') !== flt.library) return false;
   if (flt.score !== null && Math.abs(scoreBin(f.relevanceScore) - flt.score) > 1e-9) return false;
   if (flt.topic && !f.topics.some((t) => topicKey(t) === flt.topic)) return false;
+  if (flt.source && sourceOf(f) !== flt.source) return false;
   if (flt.date) {
     const d = dateOf(f, field);
     if (!d || dateKey(d, grain) !== flt.date) return false;
@@ -120,10 +130,14 @@ export const byExtension = (files: DashboardFile[]): Bucket[] =>
   tally(files, (f) => (f.fileType || 'none').toLowerCase(), (k) => (k === 'none' ? 'no extension' : k.toUpperCase()));
 
 export const byLibrary = (files: DashboardFile[]): Bucket[] =>
-  tally(files, (f) => f.libraryId ?? '', (_k, f) => f.libraryName || 'Legacy index');
+  tally(files, (f) => (isLocalFile(f) ? f.libraryId ?? '' : null), (_k, f) => f.libraryName || 'Legacy index');
+
+export const bySource = (files: DashboardFile[]): Bucket[] =>
+  tally(files, sourceOf, (k) => SOURCE_LABEL[k] ?? k)
+    .sort((a, b) => Object.keys(SOURCE_LABEL).indexOf(a.key) - Object.keys(SOURCE_LABEL).indexOf(b.key));
 
 export function byFolder(files: DashboardFile[], withLibrary: boolean): Bucket[] {
-  return tally(files, folderKey, (_k, f) => {
+  return tally(files, (f) => (isLocalFile(f) ? folderKey(f) : null), (_k, f) => {
     const path = f.folder || '(top level)';
     return withLibrary && f.libraryName ? `${f.libraryName} › ${path}` : path;
   });

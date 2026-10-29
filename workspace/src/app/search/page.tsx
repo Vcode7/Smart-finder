@@ -11,7 +11,7 @@ import {
   X, ArrowRight, BookOpen, Newspaper, MessageSquare,
   Video as VideoIcon, Image as ImageIcon, Music, CheckSquare, Square,
   Layers, Play, UploadCloud, Mic,
-  UserCheck, Film, FileAudio, Folder
+  UserCheck, Film, FileAudio, Folder, Library
 } from 'lucide-react';
 import Sidebar from '@/components/layout/Sidebar';
 import DocumentMetadataModal from '@/components/modals/DocumentMetadataModal';
@@ -21,10 +21,16 @@ import ResultTabs, { panelId, tabId, type ResultTabId, type ResultTabInfo } from
 import DashboardTab from '@/components/search/DashboardTab';
 import SummaryTab from '@/components/search/SummaryTab';
 import TopicChips from '@/components/search/TopicChips';
+import CatalogResults, { CATALOG_META } from '@/components/search/CatalogResults';
+import SourceToggles from '@/components/search/SourceToggles';
 import { useSearchInsights } from '@/hooks/useSearchInsights';
 import { useChatStore, ContextItem } from '@/store/chat';
+import { useSearchHistoryStore } from '@/store/searchHistory';
+import { selectedSources, useSearchSourcesStore } from '@/store/searchSources';
 import { toast } from 'sonner';
-import type { LocalCategorizedItem, InternetCategorizedItem } from '@/types/research';
+import type {
+  LocalCategorizedItem, InternetCategorizedItem, CatalogRecord, CatalogSourceId, SearchSourceId, SourceStatus, AlsoInRef,
+} from '@/types/research';
 import { withBase } from '@/lib/base-path';
 
 const SUGGESTED_QUERIES = [
@@ -109,6 +115,25 @@ function applyRelativeThreshold(raw: LocalBuckets, thresholdPct: number, visualO
   };
 }
 
+/** The same relative threshold over catalog records (one scale for Koha and DSpace together). */
+function cutCatalog(records: CatalogRecord[], thresholdPct: number): CatalogRecord[] {
+  const rel = thresholdPct >= 100 ? 1 : thresholdPct / 100;
+  const sorted = [...records].sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0));
+  if (!sorted.length) return sorted;
+  const min = Math.max(COMPOSITE_MIN_SCORE, (sorted[0].relevanceScore || 0) - rel);
+  return sorted.filter((r) => (r.relevanceScore || 0) >= min);
+}
+
+/** A catalog record as the synthesis and chat endpoints take an internet source. */
+function catalogAsSource(r: CatalogRecord): InternetCategorizedItem {
+  return {
+    id: r.id, category: 'paper', title: r.title, url: r.recordUrl,
+    snippet: [r.abstract, r.snippet].filter(Boolean).join('\n') || r.title,
+    domain: CATALOG_META[r.source].label, publishedDate: r.year ?? undefined,
+    author: r.authors.slice(0, 3).join('; ') || undefined, relevanceScore: r.relevanceScore,
+  };
+}
+
 function formatDuration(seconds?: number): string {
   if (!seconds) return '—';
   const m = Math.floor(seconds / 60);
@@ -165,7 +190,7 @@ export default function SmartSearchPage() {
   const [discoveryTrace, setDiscoveryTrace] = useState<any | null>(null);
 
   // Active View Filter (Internet first by default)
-  const [domainFilter, setDomainFilter] = useState<'all' | 'internet' | 'local'>('all');
+  const [domainFilter, setDomainFilter] = useState<'all' | 'internet' | 'local' | CatalogSourceId>('all');
   // Whether the shown results include an internet search (Live Internet was on)
   const [internetSearched, setInternetSearched] = useState(false);
   const [localCategoryFilter, setLocalCategoryFilter] = useState<'all' | 'document' | 'video' | 'audio' | 'image'>('all');
@@ -186,9 +211,20 @@ export default function SmartSearchPage() {
   const [rawLocalData, setRawLocalData] = useState<LocalBuckets>(EMPTY_LOCAL);
   const [visualOnlySearch, setVisualOnlySearch] = useState(false);
 
+  // Library sources (Local, Koha, DSpace) chosen for the next search, and what the shown one used
+  const sourceChoice = useSearchSourcesStore();
+  const chosenSources = selectedSources(sourceChoice);
+  const [searchedSources, setSearchedSources] = useState<SearchSourceId[]>(['local']);
+  const localSearched = searchedSources.includes('local');
+  const catalogsSearched = searchedSources.filter((s): s is CatalogSourceId => s !== 'local');
+  // Koha and DSpace records: every candidate; the relative threshold is applied below, like local files
+  const [rawCatalog, setRawCatalog] = useState<CatalogRecord[]>([]);
+  const [sourceStatuses, setSourceStatuses] = useState<SourceStatus[]>([]);
+
   // Selections
   const [selectedLocalIds, setSelectedLocalIds] = useState<Set<string>>(new Set());
   const [selectedInternetIds, setSelectedInternetIds] = useState<Set<string>>(new Set());
+  const [selectedCatalogIds, setSelectedCatalogIds] = useState<Set<string>>(new Set());
 
   // Synthesis
   const [synthesizing, setSynthesizing] = useState(false);
@@ -207,7 +243,13 @@ export default function SmartSearchPage() {
     () => applyRelativeThreshold(rawLocalData, relativeThreshold, visualOnlySearch),
     [rawLocalData, relativeThreshold, visualOnlySearch]
   );
-  const thresholdInfo = hasSearched ? localThresholdInfo : null;
+  const catalogRecords = useMemo(() => cutCatalog(rawCatalog, relativeThreshold), [rawCatalog, relativeThreshold]);
+  // Without a local search the badge describes the catalog records' cut instead
+  const catalogTop = rawCatalog.reduce((m, r) => Math.max(m, r.relevanceScore || 0), 0);
+  const thresholdInfo = !hasSearched ? null
+    : localThresholdInfo.resultsBefore > 0 || !rawCatalog.length ? localThresholdInfo
+    : { ...localThresholdInfo, topScore: catalogTop, minScore: Math.max(COMPOSITE_MIN_SCORE, catalogTop - localThresholdInfo.relativeThreshold) };
+  const catalogCount = (s: CatalogSourceId) => catalogRecords.filter((r) => r.source === s).length;
 
   // Result views. The Dashboard and Summary are built by the backend from the same search
   // (searchId), in the background, after the results above are already on screen.
@@ -225,7 +267,7 @@ export default function SmartSearchPage() {
   });
   const summaryJob = insights.summary.data;
   const resultTabs: ResultTabInfo[] = [
-    { id: 'top', status: 'ready', badge: localData.total + (internetSearched ? internetData.total : 0) },
+    { id: 'top', status: 'ready', badge: localData.total + catalogRecords.length + (internetSearched ? internetData.total : 0) },
     {
       id: 'dashboard',
       // A threshold change refreshes in place: the tab only spins while it has nothing to show
@@ -297,6 +339,8 @@ export default function SmartSearchPage() {
     ...localData.audio,
     ...localData.images,
   ];
+  // Catalog records go to the AI as linked sources, as internet references do
+  const chosenCatalogItems = catalogRecords.filter((r) => selectedCatalogIds.has(r.id)).map(catalogAsSource);
 
   const handleFileSelect = (file: File) => {
     const mime = file.type.toLowerCase();
@@ -357,12 +401,21 @@ export default function SmartSearchPage() {
 
   const folderMatches: FolderMatchTrace[] = discoveryTrace?.engine?.folders || [];
 
-  const handleSearch = async (searchQuery?: string) => {
+  // `opts` is for re-running a saved search: its text already carries the filters it was run
+  // with, and whether the internet was on is part of what is repeated.
+  const handleSearch = async (searchQuery?: string,
+                              opts: { internet?: boolean; raw?: boolean; sources?: SearchSourceId[] } = {}) => {
+    const internetOn = opts.internet ?? enableInternetSources;
+    const sources = opts.sources ?? chosenSources;
     const q = (searchQuery !== undefined ? searchQuery : query).trim();
     const hasFile = Boolean(queryFile);
 
     if (!q && !hasFile) return;
     if (searching) return;
+    if (sources.length === 0 && !internetOn) {
+      toast.error('Turn on at least one source: Local Files, Koha, DSpace or Live Internet.');
+      return;
+    }
 
     if (searchQuery !== undefined) setQuery(searchQuery);
 
@@ -375,13 +428,14 @@ export default function SmartSearchPage() {
 
     try {
       let res: Response;
-      const sent = withFilters(q);
+      const sent = opts.raw ? q : withFilters(q);
 
       if (queryFile?.file) {
         const formData = new FormData();
         formData.append('file', queryFile.file);
         if (sent) formData.append('query', sent);
-        formData.append('enableInternet', enableInternetSources ? 'true' : 'false');
+        formData.append('enableInternet', internetOn ? 'true' : 'false');
+        formData.append('sources', sources.join(','));
         formData.append('relativeThreshold', '1');
 
         res = await fetch('/api/search/smart', {
@@ -390,7 +444,8 @@ export default function SmartSearchPage() {
         });
       } else {
         const payload: Record<string, unknown> = {
-          enableInternet: enableInternetSources,
+          enableInternet: internetOn,
+          sources,
           relativeThreshold: 1,
         };
         if (sent) payload.query = sent;
@@ -427,17 +482,30 @@ export default function SmartSearchPage() {
       };
       const visible = applyRelativeThreshold(rawLocal, relativeThreshold, visualOnly).local;
 
+      const searched: SearchSourceId[] = Array.isArray(data.sources) ? data.sources : sources;
+      const statuses: SourceStatus[] = data.sourceStatuses || [];
+      const records: CatalogRecord[] = data.catalog?.records || [];
+      const visibleRecords = cutCatalog(records, relativeThreshold);
+
       setInternetData(internet);
-      setInternetSearched(enableInternetSources);
+      setInternetSearched(internetOn);
       setRawLocalData(rawLocal);
       setVisualOnlySearch(visualOnly);
+      setSearchedSources(searched);
+      setRawCatalog(records);
+      setSourceStatuses(statuses);
       setDiscoveryTrace(data.discoveryTrace || null);
       setSearchId(data.searchId || null);
+      useSearchHistoryStore.getState().refresh();
 
-      if (!enableInternetSources) {
-        setDomainFilter('local');
-      } else {
-        setDomainFilter('all');
+      // One source searched: show it; several: all of them together
+      const searchedCount = searched.length + (internetOn ? 1 : 0);
+      setDomainFilter(searchedCount > 1 ? 'all' : internetOn ? 'internet' : (searched[0] ?? 'local'));
+
+      // A catalog that failed is reported, never fails the search
+      const failed = statuses.filter((s) => s.status === 'error' || s.status === 'timeout');
+      if (failed.length) {
+        toast.warning(failed.map((s) => `${CATALOG_META[s.source].short}: ${s.message || s.status}`).join(' · '));
       }
 
       // Pre-select top relevant items
@@ -451,18 +519,37 @@ export default function SmartSearchPage() {
       if (visible.documents.length > 0) preSelectedLocal.add(visible.documents[0].id);
       if (visible.videos.length > 0) preSelectedLocal.add(visible.videos[0].id);
       setSelectedLocalIds(preSelectedLocal);
+      setSelectedCatalogIds(new Set(visibleRecords.slice(0, 1).map((r) => r.id)));
 
-      if (enableInternetSources) {
-        toast.success(`Discovered ${internet.total} internet intelligence sources and ${visible.total} local matches`);
-      } else {
-        toast.success(`Discovered ${visible.total} local repository matches (Internet sources OFF)`);
-      }
+      const found = [
+        searched.includes('local') ? `${visible.total} local` : null,
+        ...searched.filter((s): s is CatalogSourceId => s !== 'local')
+          .map((s) => `${visibleRecords.filter((r) => r.source === s).length} ${CATALOG_META[s].short}`),
+        internetOn ? `${internet.total} internet` : null,
+      ].filter(Boolean);
+      toast.success(`Matches found: ${found.join(' · ')}`);
     } catch {
       toast.error('Search error. Please check connection.');
     } finally {
       setSearching(false);
     }
   };
+
+  // A search picked from the sidebar's history: show its settings, then run it again
+  const pendingSearch = useSearchHistoryStore((s) => s.pending);
+  useEffect(() => {
+    if (!pendingSearch || searching) return;
+    useSearchHistoryStore.getState().clearPending();
+    setQueryFile(null);
+    setEnableInternetSources(pendingSearch.internet);
+    // Searches saved before sources existed (no list) run with the current choice
+    const saved = (pendingSearch.sources ?? []) as SearchSourceId[];
+    if (saved.length) useSearchSourcesStore.getState().use(saved);
+    handleSearch(pendingSearch.query, {
+      internet: pendingSearch.internet, raw: true, sources: saved.length ? saved : undefined,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingSearch, searching]);
 
   const handleFindSimilar = async (sourceId: string, sourceTitle?: string) => {
     if (!sourceId || searching) return;
@@ -506,6 +593,11 @@ export default function SmartSearchPage() {
       setVisualOnlySearch(false);
       setInternetData({ web: [], news: [], papers: [], videos: [], images: [], total: 0 });
       setInternetSearched(false);
+      // "Similar" compares indexed files: only the local libraries take part
+      setSearchedSources(['local']);
+      setRawCatalog([]);
+      setSourceStatuses([]);
+      setSelectedCatalogIds(new Set());
       setDiscoveryTrace(data.discoveryTrace || null);
       setSearchId(data.searchId || null);
       setDomainFilter('local');
@@ -564,19 +656,35 @@ export default function SmartSearchPage() {
     }
   };
 
+  const toggleCatalogItem = (id: string) => {
+    setSelectedCatalogIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   const selectAllGlobal = () => {
     const allLocalSelected = selectedLocalIds.size === allLocalItems.length;
     const allInternetSelected = selectedInternetIds.size === allInternetItems.length;
-    if (allLocalSelected && allInternetSelected) {
+    const allCatalogSelected = selectedCatalogIds.size === catalogRecords.length;
+    if (allLocalSelected && allInternetSelected && allCatalogSelected) {
       setSelectedLocalIds(new Set());
       setSelectedInternetIds(new Set());
+      setSelectedCatalogIds(new Set());
     } else {
       setSelectedLocalIds(new Set(allLocalItems.map((d) => d.id)));
       setSelectedInternetIds(new Set(allInternetItems.map((s) => s.id)));
+      setSelectedCatalogIds(new Set(catalogRecords.map((r) => r.id)));
     }
   };
 
-  const totalSelected = selectedLocalIds.size + selectedInternetIds.size;
+  const selectAllCatalog = () => {
+    setSelectedCatalogIds(selectedCatalogIds.size === catalogRecords.length ? new Set() : new Set(catalogRecords.map((r) => r.id)));
+  };
+
+  const totalSelected = selectedLocalIds.size + selectedInternetIds.size + chosenCatalogItems.length;
 
   const handleSynthesize = async () => {
     if (totalSelected === 0 || synthesizing) return;
@@ -594,7 +702,7 @@ export default function SmartSearchPage() {
         body: JSON.stringify({
           query: query || (queryFile?.name ? `Search for: ${queryFile.name}` : 'Multimodal Analysis'),
           selectedLocalDocs: chosenLocal,
-          selectedInternetSources: chosenInternet,
+          selectedInternetSources: [...chosenInternet, ...chosenCatalogItems],
         }),
       });
 
@@ -631,7 +739,7 @@ export default function SmartSearchPage() {
   // ═══════════════════════════════════════════════════════════════
   const handleSendToAIChat = async () => {
     const chosenLocal = allLocalItems.filter((d) => selectedLocalIds.has(d.id));
-    const chosenInternet = allInternetItems.filter((s) => selectedInternetIds.has(s.id));
+    const chosenInternet = [...allInternetItems.filter((s) => selectedInternetIds.has(s.id)), ...chosenCatalogItems];
     const allChosen = [...chosenInternet, ...chosenLocal];
 
     if (allChosen.length === 0) {
@@ -678,7 +786,7 @@ export default function SmartSearchPage() {
 
     let newChatId: string;
     try {
-      newChatId = (await store.createChat(chatTitle, internetSearched ? 'both' : 'local')).id;
+      newChatId = (await store.createChat(chatTitle, internetSearched || chosenCatalogItems.length ? 'both' : 'local')).id;
     } catch {
       toast.error('Failed to create new chat session');
       setStartingChat(false);
@@ -760,6 +868,9 @@ export default function SmartSearchPage() {
           <div className="max-w-3xl mx-auto space-y-3">
             {/* Search Configuration: Internet Sources Toggle + Relative Similarity Threshold */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {/* Library sources searched together: Local Files, Koha, DSpace (internet is the switch below) */}
+              <SourceToggles disabled={searching} />
+
               {/* Option 1: Live Internet Toggle */}
               <div className="flex items-center justify-between px-4 py-3 rounded-2xl shadow-sm transition-all"
                 style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}>
@@ -779,7 +890,7 @@ export default function SmartSearchPage() {
                       </span>
                     </div>
                     <p className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>
-                      {enableInternetSources ? 'Web, papers, news included' : 'Local repository only'}
+                      {enableInternetSources ? 'Web, papers, news included' : 'Internet not searched'}
                     </p>
                   </div>
                 </div>
@@ -790,7 +901,7 @@ export default function SmartSearchPage() {
                   onClick={() => {
                     const next = !enableInternetSources;
                     setEnableInternetSources(next);
-                    toast.info(next ? 'Live internet sources enabled' : 'Switched to local repository only');
+                    toast.info(next ? 'Live internet sources enabled' : 'Live internet sources disabled');
                   }}
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors flex-shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
                     enableInternetSources ? 'bg-emerald-500' : 'bg-zinc-700'
@@ -924,9 +1035,10 @@ export default function SmartSearchPage() {
                   placeholder={
                     queryFile
                       ? `Searching by ${queryFile.type}: "${queryFile.name}" (Optional extra keywords)...`
-                      : enableInternetSources
-                      ? 'Upload reference material or search local repository + live internet...'
-                      : 'Upload reference material or search local repository (Internet disabled)...'
+                      : `Upload reference material or search ${[
+                          ...sourceChoice.sources.filter((s) => chosenSources.includes(s.id)).map((s) => s.label),
+                          ...(enableInternetSources ? ['live internet'] : []),
+                        ].join(' + ') || 'nothing (turn a source on)'}...`
                   }
                   disabled={searching}
                   className="flex-1 bg-transparent px-2 py-2 text-sm outline-none placeholder:text-muted-foreground/50"
@@ -991,7 +1103,8 @@ export default function SmartSearchPage() {
 
                 <button
                   type="submit"
-                  disabled={(!query.trim() && !queryFile) || searching}
+                  disabled={(!query.trim() && !queryFile) || searching || (chosenSources.length === 0 && !enableInternetSources)}
+                  title={chosenSources.length === 0 && !enableInternetSources ? 'Turn on at least one source to search' : undefined}
                   className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-md"
                   style={{
                     background: 'linear-gradient(135deg, #06b6d4 0%, #6366f1 100%)',
@@ -1160,19 +1273,23 @@ export default function SmartSearchPage() {
                 {/* Domain Selector (Internet first, Local second) */}
                 <div className="flex items-center gap-1.5 p-1 rounded-2xl overflow-x-auto max-w-full" style={{ background: 'var(--bg-base)' }}>
                   {[
-                    { id: 'all', label: 'All Sources', count: internetData.total + localData.total, icon: Layers },
-                    { id: 'local', label: 'Your Files', count: localData.total, icon: Database },
-                    { id: 'internet', label: 'Internet', count: internetData.total, icon: Globe },
-                  ].filter((tab) => tab.id !== 'internet' || internetSearched).map((tab) => {
+                    { id: 'all', label: 'All Sources', count: (internetSearched ? internetData.total : 0) + localData.total + catalogRecords.length, icon: Layers, shown: true },
+                    { id: 'local', label: 'Your Files', count: localData.total, icon: Database, shown: localSearched },
+                    ...catalogsSearched.map((s) => ({ id: s, label: CATALOG_META[s].short, count: catalogCount(s), icon: Library, shown: true })),
+                    { id: 'internet', label: 'Internet', count: internetData.total, icon: Globe, shown: internetSearched },
+                  ].filter((tab) => tab.shown).map((tab) => {
                     const isActive = domainFilter === tab.id;
                     const Icon = tab.icon;
+                    const activeBg = tab.id === 'internet' ? '#06b6d4' : tab.id === 'local' ? 'var(--accent)'
+                      : tab.id === 'koha' || tab.id === 'dspace' ? CATALOG_META[tab.id].color : 'linear-gradient(135deg, #06b6d4, #6366f1)';
                     return (
                       <button
                         key={tab.id}
                         onClick={() => setDomainFilter(tab.id as typeof domainFilter)}
-                        className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all"
+                        aria-pressed={isActive}
+                        className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex-shrink-0"
                         style={{
-                          background: isActive ? (tab.id === 'internet' ? '#06b6d4' : tab.id === 'local' ? 'var(--accent)' : 'linear-gradient(135deg, #06b6d4, #6366f1)') : 'transparent',
+                          background: isActive ? activeBg : 'transparent',
                           color: isActive ? '#fff' : 'var(--text-secondary)',
                         }}
                       >
@@ -1217,14 +1334,22 @@ export default function SmartSearchPage() {
                     <Globe className="w-3.5 h-3.5 text-cyan-400" />
                     <span>Internet ({selectedInternetIds.size})</span>
                   </button>}
-                  <button
+                  {localSearched && <button
                     onClick={selectAllLocal}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-medium transition-colors hover:bg-[var(--bg-hover)]"
                     style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
                   >
                     <Database className="w-3.5 h-3.5 text-indigo-400" />
                     <span>Local ({selectedLocalIds.size})</span>
-                  </button>
+                  </button>}
+                  {catalogsSearched.length > 0 && <button
+                    onClick={selectAllCatalog}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-medium transition-colors hover:bg-[var(--bg-hover)]"
+                    style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
+                  >
+                    <Library className="w-3.5 h-3.5" style={{ color: 'var(--viz-5)' }} />
+                    <span>Catalogs ({chosenCatalogItems.length})</span>
+                  </button>}
                 </div>
               </div>
 
@@ -1233,7 +1358,7 @@ export default function SmartSearchPage() {
                 {/* ═══════════════════════════════════════════════════════════════
                     1. LOCAL KNOWLEDGE SOURCES (SHOWN FIRST)
                    ═══════════════════════════════════════════════════════════════ */}
-                {(domainFilter === 'all' || domainFilter === 'local') && (
+                {localSearched && (domainFilter === 'all' || domainFilter === 'local') && (
                   <div className="space-y-6">
                     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border)] pb-3">
                       <div className="flex items-center gap-2.5">
@@ -1545,6 +1670,7 @@ export default function SmartSearchPage() {
                                           {doc.snippet}
                                         </p>
                                         <TopicChips {...topicProps(doc.sourceId)} />
+                                        <AlsoInLinks refs={doc.alsoIn} />
                                       </div>
                                     </div>
                                   </motion.div>
@@ -1791,6 +1917,22 @@ export default function SmartSearchPage() {
                       </div>
                     )}
                   </div>
+                )}
+
+                {/* ═══════════════════════════════════════════════════════════════
+                    1b. LIBRARY CATALOGS (KOHA, DSPACE) WHEN SEARCHED
+                   ═══════════════════════════════════════════════════════════════ */}
+                {catalogsSearched.length > 0 && (domainFilter === 'all' || domainFilter === 'koha' || domainFilter === 'dspace') && (
+                  <CatalogResults
+                    records={catalogRecords}
+                    statuses={sourceStatuses}
+                    only={domainFilter === 'koha' || domainFilter === 'dspace' ? domainFilter : null}
+                    searching={searching}
+                    query={discoveryTrace?.catalogQuery}
+                    queryOrigin={discoveryTrace?.catalogQueryOrigin}
+                    selectedIds={selectedCatalogIds}
+                    onToggle={toggleCatalogItem}
+                  />
                 )}
 
                 {/* ═══════════════════════════════════════════════════════════════
@@ -2149,7 +2291,9 @@ export default function SmartSearchPage() {
                       {totalSelected} source{totalSelected === 1 ? "" : "s"} selected for AI
                     </p>
                     <p className="text-[11px] text-slate-400">
-                      {selectedLocalIds.size} from your files{internetSearched ? ` · ${selectedInternetIds.size} from the internet` : ''}
+                      {selectedLocalIds.size} from your files
+                      {catalogsSearched.length > 0 ? ` · ${chosenCatalogItems.length} from catalogs` : ''}
+                      {internetSearched ? ` · ${selectedInternetIds.size} from the internet` : ''}
                     </p>
                   </div>
                 </div>
@@ -2289,6 +2433,26 @@ function ResultLocation({ item, onFolder }: {
       ) : folder}
       {folder ? '/' : ''}{name}
     </span>
+  );
+}
+
+/** The same work found in a catalog: shown on the local file instead of as a second result. */
+function AlsoInLinks({ refs }: { refs?: AlsoInRef[] }) {
+  if (!refs?.length) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-[10px]" style={{ color: 'var(--text-muted)' }} onClick={(e) => e.stopPropagation()}>
+      <span>Also in:</span>
+      {refs.map((r) => {
+        const meta = r.source === 'koha' || r.source === 'dspace' ? CATALOG_META[r.source] : null;
+        return (
+          <a key={r.id} href={r.recordUrl} target="_blank" rel="noopener noreferrer" title={r.title}
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full font-semibold hover:underline"
+            style={{ background: meta?.bg ?? 'var(--bg-active)', color: meta?.color ?? 'var(--text-secondary)' }}>
+            {meta?.short ?? r.source} <ExternalLink className="w-2.5 h-2.5" aria-hidden />
+          </a>
+        );
+      })}
+    </div>
   );
 }
 
