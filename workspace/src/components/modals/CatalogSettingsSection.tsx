@@ -2,8 +2,11 @@
 // Library Integrations (admin only): the Koha catalog and DSpace repository that Smart Finder can
 // search next to the local libraries. Secrets are never sent back by the server; leaving the
 // field blank keeps the stored one.
+//
+// Each form has its own Save, and closing Settings (Done, ✕, Esc) saves whatever was left unsaved:
+// see saveCatalogChanges.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Library, Loader2, Server, Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import { apiErrorMessage, readJson } from '@/lib/utils/api';
@@ -22,6 +25,8 @@ interface CatalogConfig {
   authType?: 'none' | 'basic' | 'oauth2';
   username?: string;
   hasSecret?: boolean;
+  /** The public demo server searched until an admin gives their own URL */
+  demoUrl?: string;
   timeout: number;
   maxResults: number;
 }
@@ -40,6 +45,22 @@ const HELP: Record<CatalogId, { url: string; placeholder: string }> = {
   koha: { url: 'OPAC URL', placeholder: 'https://opac.library.example.org' },
   dspace: { url: 'REST API URL (ends in /server)', placeholder: 'https://repository.example.org/server' },
 };
+
+// The save of every form that has unsaved changes, so closing Settings can save them too
+const pendingSaves = new Map<CatalogId, () => Promise<boolean>>();
+
+/** Save the forms with unsaved changes. False when one could not be saved (its error is shown). */
+export async function saveCatalogChanges(): Promise<boolean> {
+  const results = await Promise.all([...pendingSaves.values()].map((save) => save()));
+  return results.every(Boolean);
+}
+
+const bodyOf = (c: CatalogConfig, secret: string) => ({
+  enabled: c.enabled, baseUrl: c.baseUrl.trim(), timeout: Number(c.timeout), maxResults: Number(c.maxResults),
+  ...(c.source === 'koha'
+    ? { apiUrl: (c.apiUrl ?? '').trim(), authType: c.authType ?? 'none', username: (c.username ?? '').trim(), secret }
+    : { uiUrl: (c.uiUrl ?? '').trim() }),
+});
 
 export default function CatalogSettingsSection() {
   const [configs, setConfigs] = useState<CatalogConfig[] | null>(null);
@@ -77,6 +98,7 @@ export default function CatalogSettingsSection() {
 
 function CatalogForm({ initial, onSaved }: { initial: CatalogConfig; onSaved: (c: CatalogConfig) => void }) {
   const [form, setForm] = useState({ ...initial });
+  const [saved, setSaved] = useState(initial);
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -85,14 +107,16 @@ function CatalogForm({ initial, onSaved }: { initial: CatalogConfig; onSaved: (c
   const isKoha = form.source === 'koha';
   const help = HELP[form.source];
 
-  const body = () => ({
-    enabled: form.enabled, baseUrl: form.baseUrl.trim(), timeout: Number(form.timeout), maxResults: Number(form.maxResults),
-    ...(isKoha
-      ? { apiUrl: (form.apiUrl ?? '').trim(), authType: form.authType ?? 'none', username: (form.username ?? '').trim(), secret }
-      : { uiUrl: (form.uiUrl ?? '').trim() }),
-  });
+  const body = () => bodyOf(form, secret);
+  const dirty = JSON.stringify(body()) !== JSON.stringify(bodyOf(saved, ''));
 
-  const save = async () => {
+  const setUrl = (url: string) => setForm((f) => ({
+    ...f, baseUrl: url,
+    // The first URL given to a source that was never set up switches it on: that is why it is typed
+    ...(!saved.baseUrl && !saved.enabled ? { enabled: url.trim() !== '' } : {}),
+  }));
+
+  const save = async (): Promise<boolean> => {
     setSaving(true);
     try {
       const res = await fetch(`/api/catalogs/settings/${form.source}`, {
@@ -101,16 +125,28 @@ function CatalogForm({ initial, onSaved }: { initial: CatalogConfig; onSaved: (c
       const data = await readJson<CatalogConfig>(res);
       if (!res.ok || !data) throw new Error(apiErrorMessage(data, 'Could not save'));
       setForm({ ...data });
+      setSaved(data);
       setSecret('');
       onSaved(data);
       useSearchSourcesStore.getState().load();
-      toast.success(`${data.label} ${data.available ? 'is searched with your files' : 'saved'}`);
+      toast.success(`${data.label} ${data.available ? 'saved: searched with your files' : data.baseUrl ? 'saved (switched off)' : 'saved'}`);
+      return true;
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Could not save');
+      toast.error(`${form.label}: ${e instanceof Error ? e.message : 'Could not save'}`);
+      return false;
     } finally {
       setSaving(false);
     }
   };
+
+  // While there are unsaved changes, closing Settings saves them (the latest form, via the ref)
+  const saveRef = useRef(save);
+  useEffect(() => { saveRef.current = save; });
+  useEffect(() => {
+    if (!dirty) return;
+    pendingSaves.set(form.source, () => saveRef.current());
+    return () => { pendingSaves.delete(form.source); };
+  }, [dirty, form.source]);
 
   const runTest = async () => {
     setTesting(true);
@@ -149,9 +185,12 @@ function CatalogForm({ initial, onSaved }: { initial: CatalogConfig; onSaved: (c
         <span className="text-[11px] text-[var(--text-secondary)]">{help.url}</span>
         <div className="flex items-center gap-2 px-3 rounded-xl border bg-[var(--bg-base)]" style={{ borderColor: 'var(--border)' }}>
           <Server className="w-3.5 h-3.5 text-[var(--text-muted)] flex-shrink-0" aria-hidden />
-          <input value={form.baseUrl} onChange={(e) => set('baseUrl', e.target.value)} placeholder={help.placeholder}
+          <input value={form.baseUrl} onChange={(e) => setUrl(e.target.value)} placeholder={help.placeholder}
             className="w-full bg-transparent py-2 outline-none text-xs font-mono" />
         </div>
+        {form.demoUrl && form.baseUrl.trim().replace(/\/+$/, '') === form.demoUrl && (
+          <span className="block text-[11px] text-amber-400">Public demo server with sample records (slow). Replace it with your library&apos;s URL.</span>
+        )}
       </label>
 
       {isKoha ? (
@@ -212,9 +251,9 @@ function CatalogForm({ initial, onSaved }: { initial: CatalogConfig; onSaved: (c
             {testing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-indigo-400" />}
             Test
           </button>
-          <button type="button" onClick={save} disabled={saving}
+          <button type="button" onClick={save} disabled={saving || !dirty}
             className="px-3 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50">
-            {saving ? 'Saving…' : 'Save'}
+            {saving ? 'Saving…' : dirty ? 'Save' : 'Saved'}
           </button>
         </div>
       </div>

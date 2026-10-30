@@ -118,6 +118,10 @@ def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg.settings, "ADMIN_EMAIL", TEST_ADMIN_EMAIL, raising=False)
     monkeypatch.setattr(cfg.settings, "ADMIN_PASSWORD", TEST_ADMIN_PASSWORD, raising=False)
     monkeypatch.setattr(cfg.settings, "DEMO_ADMIN_EMAIL", "", raising=False)
+    # Tests never reach the public Koha/DSpace demos: catalogs start blank and off
+    from app.search.catalogs import registry
+    monkeypatch.setattr(registry, "DEFAULTS", {
+        s: {**d, "enabled": False, "baseUrl": "", "timeout": 10} for s, d in registry.DEFAULTS.items()})
 
     from app.database.session import run_migrations
     run_migrations()

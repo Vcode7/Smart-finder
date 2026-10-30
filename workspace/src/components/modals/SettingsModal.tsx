@@ -26,7 +26,7 @@ import { useUIStore } from '@/store/ui';
 import { useAuthStore } from '@/store/auth';
 import { toast } from 'sonner';
 import { apiErrorMessage, readJson } from '@/lib/utils/api';
-import CatalogSettingsSection from '@/components/modals/CatalogSettingsSection';
+import CatalogSettingsSection, { saveCatalogChanges } from '@/components/modals/CatalogSettingsSection';
 
 interface OllamaModel {
   name: string;
@@ -154,7 +154,13 @@ export function SettingsModal() {
     return () => { current = false; };
   }, [settingsModalOpen, applyStatus]);
 
-  const close = useCallback(() => {
+  // Done, ✕ and Esc first save Library Integrations left unsaved; a failed save keeps Settings open
+  const [closing, setClosing] = useState(false);
+  const close = useCallback(async () => {
+    setClosing(true);
+    const saved = await saveCatalogChanges();
+    setClosing(false);
+    if (!saved) return;
     setSettingsModalOpen(false);
     setTestResult(null);
   }, [setSettingsModalOpen]);
@@ -660,9 +666,10 @@ export function SettingsModal() {
             </span>
             <button
               onClick={close}
-              className="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-all shadow-md"
+              disabled={closing}
+              className="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-all shadow-md disabled:opacity-60"
             >
-              Done
+              {closing ? 'Saving…' : 'Done'}
             </button>
           </div>
         </motion.div>

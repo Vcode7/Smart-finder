@@ -43,12 +43,31 @@ def _source(source: str) -> str:
 
 @router.get("/sources")
 async def list_sources(user: Dict[str, Any] = Depends(require_auth)):
-    """The library sources a search can use. Internet search is separate and not listed here."""
-    available = set(await asyncio.to_thread(registry.available_sources))
+    """
+    The library sources a search can use. Internet search is separate and not listed here.
+    `configured`: a URL is set, so an admin can switch the source on without opening Settings.
+    """
+    configs = {s: await asyncio.to_thread(registry.get_config, s) for s in registry.SOURCES}
     return {"sources": [
-        {"id": s, "label": registry.LABELS[s], "available": s == "local" or s in available}
+        {"id": s, "label": registry.LABELS[s],
+         "available": s == "local" or registry.is_available(configs[s]),
+         "configured": s == "local" or bool(configs[s]["baseUrl"])}
         for s in registry.ALL_SOURCES
     ]}
+
+
+@router.post("/sources/{source}/enabled")
+async def set_enabled(source: str, req: CatalogSettings, user: Dict[str, Any] = Depends(require_admin)):
+    """Switch a set-up source on or off for everyone (the search page's chips, for admins)."""
+    _source(source)
+    if req.enabled is None:
+        raise HTTPException(status_code=400, detail="Say enabled: true or false")
+    try:
+        await asyncio.to_thread(registry.save_config, source, {"enabled": req.enabled})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _files_cache.clear()
+    return {"success": True, **(await asyncio.to_thread(registry.public_config, source))}
 
 
 @router.get("/settings")

@@ -29,6 +29,7 @@ from app.search.catalogs.base import (
 
 ENRICH_MAX = 25           # hits filled in from MARC per search
 ENRICH_CONCURRENCY = 6
+ENRICH_SHARE = 0.8          # of the timeout, from the search's start: a slow API keeps the feed's records
 
 _BIBLIO_RE = re.compile(r"biblionumber=(\d+)")
 _YEAR_RE = re.compile(r"(1[5-9]\d\d|20\d\d)")
@@ -199,13 +200,14 @@ class KohaConnector:
             params = [("q", query)]
         params += [("format", "rss"), ("count", str(limit)), ("sort_by", "relevance")]
         url = f"{self.opac}/cgi-bin/koha/opac-search.pl?{urlencode(params)}"
+        deadline = time.monotonic() + self.timeout * ENRICH_SHARE
         async with self._client() as client:
             res = await client.get(url)
             if res.status_code != 200:
                 raise CatalogError(f"Koha search answered HTTP {res.status_code}")
             records, total = parse_rss(res.content, self.opac)
             records = records[:limit]
-            await self._enrich(client, records[:ENRICH_MAX])
+            await self._enrich(client, records[:ENRICH_MAX], deadline)
         return records, total
 
     async def _token(self, client: httpx.AsyncClient) -> Optional[str]:
@@ -221,8 +223,9 @@ class KohaConnector:
         _TOKENS[self.api] = (token, time.monotonic() + max(60, int(data.get("expires_in") or 3600)) - 30)
         return token
 
-    async def _enrich(self, client: httpx.AsyncClient, records: List[CatalogRecord]) -> None:
-        if not records:
+    async def _enrich(self, client: httpx.AsyncClient, records: List[CatalogRecord], deadline: float) -> None:
+        """Fill the records in from MARC until `deadline`; the rest keep what the feed said."""
+        if not records or time.monotonic() >= deadline:
             return
         headers = {"Accept": "application/marcxml+xml"}
         staff = self.auth_type in ("basic", "oauth2") and self.username
@@ -244,7 +247,12 @@ class KohaConnector:
                 except Exception as e:
                     print(f"[Koha] biblio {rec.nativeId} not filled in: {e}")
 
-        await asyncio.gather(*(one(r) for r in records))
+        try:
+            await asyncio.wait_for(asyncio.gather(*(one(r) for r in records)),
+                                   timeout=max(0.0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            filled = sum(1 for r in records if r.isbn or r.subjects or r.files)
+            print(f"[Koha] API slow: {filled} of {len(records)} records filled in from MARC")
 
     async def test(self) -> Dict[str, Any]:
         records, total = await self.search("library", 3)

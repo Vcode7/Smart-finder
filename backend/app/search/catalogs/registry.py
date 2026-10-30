@@ -4,9 +4,9 @@ app/search/catalogs/registry.py
 The external library sources SmartFinder can search next to the local libraries, their
 admin settings, and the fan-out that searches the enabled ones together.
 
-Settings live in app_settings as JSON (`catalog.koha`, `catalog.dspace`). A source is
-*available* once an admin has enabled it and given its URL; the search page shows a toggle for
-each available source.
+Settings live in app_settings as JSON (`catalog.koha`, `catalog.dspace`); until an admin saves
+some, the public demo servers are used (DEFAULTS). A source is *available* when it is enabled and
+has a URL; the search page shows a toggle for every source.
 
 Every catalog is searched with its own timeout. One that fails or is slow reports a status
 (shown above the results) and never fails the search. Answers are cached for a few minutes,
@@ -33,10 +33,13 @@ ALL_SOURCES = ("local",) + SOURCES
 LABELS = {"local": "Local Files", "koha": "Koha Catalog", "dspace": "DSpace Repository"}
 _NAMES = {"koha": "Koha", "dspace": "DSpace"}
 
+# Until an admin saves their own, the public demo servers of both projects are searched, so a
+# new install shows catalog results without setup. They are slow (10–25 s), hence the timeout.
+DEMO_URLS = {"koha": "https://demo.kohacatalog.com", "dspace": "https://demo.dspace.org/server"}
 DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "koha": {"enabled": False, "baseUrl": "", "apiUrl": "", "authType": "none", "username": "", "secret": "",
-             "timeout": 10, "maxResults": 25},
-    "dspace": {"enabled": False, "baseUrl": "", "uiUrl": "", "timeout": 10, "maxResults": 25},
+    "koha": {"enabled": True, "baseUrl": DEMO_URLS["koha"], "apiUrl": "", "authType": "none", "username": "",
+             "secret": "", "timeout": 30, "maxResults": 25},
+    "dspace": {"enabled": True, "baseUrl": DEMO_URLS["dspace"], "uiUrl": "", "timeout": 30, "maxResults": 25},
 }
 AUTH_TYPES = ("none", "basic", "oauth2")
 CACHE_TTL = 300
@@ -109,7 +112,8 @@ def public_config(source: str) -> Dict[str, Any]:
     out = {k: v for k, v in cfg.items() if k != "secret"}
     if "secret" in cfg:
         out["hasSecret"] = bool(cfg["secret"])
-    return {"source": source, "label": LABELS[source], "available": is_available(cfg), **out}
+    return {"source": source, "label": LABELS[source], "available": is_available(cfg),
+            "demoUrl": DEMO_URLS[source], **out}
 
 
 def is_available(cfg: Dict[str, Any]) -> bool:

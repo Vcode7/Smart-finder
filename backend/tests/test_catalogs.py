@@ -136,6 +136,25 @@ def test_koha_any_terms_uses_the_advanced_search_form(monkeypatch):
     assert params.get_list("q") == ["storm", "drainage"] and params.get_list("op") == ["or"]
 
 
+def test_a_slow_koha_api_keeps_the_feeds_records_within_the_timeout(monkeypatch):
+    import asyncio
+    import time
+    from app.search.catalogs import koha
+    monkeypatch.setattr(koha, "ENRICH_SHARE", 0.2)
+
+    async def handler(request: httpx.Request):
+        if request.url.path.endswith("opac-search.pl"):
+            return httpx.Response(200, content=KOHA_RSS)
+        await asyncio.sleep(5)          # the biblio API hangs
+        return httpx.Response(200, content=MARC_42)
+
+    _mock(monkeypatch, koha.KohaConnector, handler)
+    started = time.monotonic()
+    records, total = asyncio.run(koha.KohaConnector({"baseUrl": OPAC, "timeout": 2}).search("drainage", 10))
+    assert time.monotonic() - started < 2
+    assert total == 2 and records[0].title.startswith("Urban drainage design") and not records[0].subjects
+
+
 def test_koha_html_instead_of_a_feed_is_reported(monkeypatch):
     from app.search.catalogs.base import CatalogError
     from app.search.catalogs.koha import KohaConnector
@@ -250,6 +269,24 @@ def test_settings_are_admin_only_and_never_return_secrets(admin_client):
     assert c.post("/api/catalogs/settings/nope", json={}).status_code == 404
 
 
+def test_search_page_switch_turns_a_set_up_source_on_and_off(admin_client):
+    c = admin_client
+    sources = lambda: {s["id"]: s for s in c.get("/api/catalogs/sources").json()["sources"]}
+    assert not sources()["dspace"]["configured"]
+    # Nothing to switch on before the URL is given
+    assert c.post("/api/catalogs/sources/dspace/enabled", json={"enabled": True}).status_code == 400
+    c.post("/api/catalogs/settings/dspace", json={"baseUrl": DSPACE_API, "enabled": False})
+    assert sources()["dspace"]["configured"] and not sources()["dspace"]["available"]
+
+    on = c.post("/api/catalogs/sources/dspace/enabled", json={"enabled": True}).json()
+    assert on["enabled"] and on["baseUrl"] == DSPACE_API
+    assert sources()["dspace"]["available"]
+    c.post("/api/catalogs/sources/dspace/enabled", json={"enabled": False})
+    assert not sources()["dspace"]["available"] and sources()["dspace"]["configured"]
+    assert c.post("/api/catalogs/sources/dspace/enabled", json={}).status_code == 400
+    assert c.post("/api/catalogs/sources/nope/enabled", json={"enabled": True}).status_code == 404
+
+
 def _fake_catalogs(monkeypatch, koha=None, dspace=None):
     """Replace the connectors' search with canned answers (a list, or an exception to raise)."""
     from app.search.catalogs.dspace import DSpaceConnector
@@ -321,3 +358,10 @@ def test_image_upload_searches_catalogs_with_its_text(admin_client, monkeypatch)
     query, any_terms = asked["koha"][0]
     assert "DRAINAGE" in query and any_terms
     assert body["catalog"]["records"][0]["title"] == "Urban drainage handbook"
+
+
+def test_a_new_install_searches_the_public_demos():
+    from app.search.catalogs import registry
+    assert registry.DEFAULTS["koha"]["baseUrl"] == registry.DEMO_URLS["koha"] == "https://demo.kohacatalog.com"
+    assert registry.DEFAULTS["dspace"]["baseUrl"] == "https://demo.dspace.org/server"
+    assert all(d["enabled"] and d["timeout"] >= 30 for d in registry.DEFAULTS.values())
